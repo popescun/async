@@ -1,6 +1,6 @@
 # async
 
-*a mechanism to run queued callables in an asynchronous fashion*
+*c++ mechanism to run queued callables in an asynchronous fashion*
 
 The interface consists of one header file that expose a generic execution class. It is a wrapper of a list of callables that are invoked on other thread. The callables are pumped into the list by invoking an action from the caller thread.
 
