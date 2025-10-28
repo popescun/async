@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 4.1)
 
 project(deps NONE)
 
+# todo: use this config for googletest. `actuator` dependency is fetched as submodule.
 include(ExternalProject)
 ExternalProject_Add(actuator
   PREFIX "actuator"

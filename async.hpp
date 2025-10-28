@@ -10,7 +10,7 @@
 #include <atomic>
 #include <thread>
 
-#include <actuator.hpp>
+#include <actuator/actuator.hpp>
 
 namespace untangle
 {
