@@ -13,7 +13,7 @@ execute_process(COMMAND ${CMAKE_COMMAND} -G "${CMAKE_GENERATOR}" .
 if(result)
   message(FATAL_ERROR "CMake step for external dependencies failed: ${result}")
 endif()
-# The build step actually trigger cloning the repositories
+# The build step actually triggers cloning the repositories
 execute_process(COMMAND ${CMAKE_COMMAND} --build .
   RESULT_VARIABLE result
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/deps)

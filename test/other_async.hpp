@@ -1,6 +1,8 @@
-#include <async.hpp>
+# pragma once
 
 #include <string>
+
+#include <async.hpp>
 
 template<typename T>
 class other_async : public std::enable_shared_from_this<other_async<T>>
