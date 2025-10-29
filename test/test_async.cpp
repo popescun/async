@@ -84,7 +84,7 @@ int main()
   };
 
   // receive on finished by assigning the internal notifier
-  asyncexec3.onfinished = [&asyncexec3](){
+  asyncexec3.on_finished = [&asyncexec3](){
     std::cout << "on_finished thread " << std::this_thread::get_id() << std::endl;
     auto result = asyncexec3.result();
     std::cout << "result=" << result << std::endl;
@@ -107,7 +107,7 @@ int main()
   otherasync->run();
 
   // wait the polled executions to finish
-  while(untangle::async::execution_poll::get().isrunning())
+  while(untangle::async::execution_poll::get().is_running())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }

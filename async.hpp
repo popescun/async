@@ -24,10 +24,8 @@ namespace untangle
  }
 }
 
-namespace untangle
-{
-namespace async
-{
+namespace untangle {
+namespace async {
   /**
    *  @defgroup untangle_functions namespace untangle: functions
    */
@@ -39,20 +37,20 @@ namespace async
    * It creates an action as a binding to a class method(by \ref untangle::bind()), and returns a callable that passes this action to \ref execution::add_action()).
    *
    * @param obj - A std::shared_ptr that wraps the bound class object.
-   * @param classT::*method - Pointer to function member. It is specified as &<class type>::<function member>.
-   * @param asyncexec - An \ref execution object.
-   * @return actionT - A std::function(lambda) that adds the action to the execution object's actions list.
+   * @param method - Pointer to function member. It is specified as &<class type>::<function member>.
+   * @param async_exec - An \ref execution object.
+   * @return - A std::function<...>(lambda) that adds the action to the execution object's actions list.
    *
    * @ingroup untangle_functions
    */
   template <typename classT, typename T, typename actionT = std::function<T>>
-  actionT bind(const std::shared_ptr<classT>& obj, T classT::*method, execution<actionT>& asyncexec)
+  actionT bind(const std::shared_ptr<classT>& obj, T classT::* method, execution<actionT>& async_exec)
   {
     actionT async_action = untangle::bind(obj, method);
 
-    return [&asyncexec, async_action](auto... args) -> typename actionT::result_type
+    return [&async_exec, async_action](auto... args) -> typename actionT::result_type
     {
-      asyncexec.add_action(async_action, args...);
+      async_exec.add_action(async_action, args...);
       return typename actionT::result_type();
     };
   }
@@ -65,18 +63,18 @@ namespace async
    *
    *
    * @param Fn - A plain function.
-   * @param asyncexec - An \ref execution object.
-   * @return actionT - A std::function(lambda) that adds the action to the execution object's actions list.
+   * @param async_exec - An \ref execution object.
+   * @return - A std::function(lambda) that adds the action to the execution object's actions list.
    *
    * @ingroup untangle_functions
    */
   template <typename T, typename actionT = std::function<T>>
-  actionT bind(T& Fn, execution<actionT>& asyncexec)
+  actionT bind(T& Fn, execution<actionT>& async_exec)
   {
     actionT async_action = Fn;
-    return [&asyncexec, async_action](auto... args) -> typename actionT::result_type
+    return [&async_exec, async_action](auto... args) -> typename actionT::result_type
     {
-      asyncexec.add_action(async_action, args...);
+      async_exec.add_action(async_action, args...);
       return typename actionT::result_type();
     };
   }
@@ -97,18 +95,18 @@ namespace async
     /**
      * @brief Adds an \ref execution object to the poll
      *
-     * @param aysncexec An \ref execution object.
+     * @param async_exec An \ref execution object.
      */
     template<typename asyncexecT>
-    void add(asyncexecT& aysncexec)
+    void add(asyncexecT& async_exec)
     {
-      if (!actuator_isrunning.is_connected())
+      if (!actuator_is_running.is_connected())
       {
-        actuator_isrunning = untangle::connect(aysncexec.action_isrunning);
+        actuator_is_running = untangle::connect(async_exec.action_is_running);
       }
       else
       {
-        actuator_isrunning.add(&aysncexec.action_isrunning);
+        actuator_is_running.add(&async_exec.action_is_running);
       }
     }
 
@@ -117,12 +115,12 @@ namespace async
      *
      * @return true - if at least one \ref execution object in this poll is running.
      */
-    auto isrunning()
+    auto is_running()
     {
-      actuator_isrunning();
+      actuator_is_running();
 
       auto result = false;
-      for (const auto& ret : actuator_isrunning.results)
+      for (const auto& ret : actuator_is_running.results)
       {
         result |= ret;
       }
@@ -143,7 +141,7 @@ namespace async
     private:
       execution_poll() = default;
       ~execution_poll() = default;
-      untangle::actuator<std::function<bool(void)>> actuator_isrunning;
+      actuator<std::function<bool(void)>> actuator_is_running;
   };
 
   /**
@@ -152,7 +150,7 @@ namespace async
    * An async execution provides a mechanism to queue actions and execute them sequentially on a separate thread.
    * It may also attach another \ref execution object and trigger its actions. This way actions of different types may be executed on the same thread.
    *
-   * The mechanism relies on an "asynchornous binding" created by using \ref bind().
+   * The mechanism relies on an "asynchronous binding" created by using \ref bind().
    *
    * @actionT It represents the type of the action. It is specified as std::function<...> and should match the signature of the bound function or class method.
    */
@@ -169,9 +167,9 @@ namespace async
       other_this = this;
       action_execute = untangle::bind(other_this, &execution<actionT>::execute_actions);
       action_stop = untangle::bind(other_this, &execution<actionT>::stop);
-      action_isrunning = untangle::bind(other_this, &execution<actionT>::isrunning);
+      action_is_running = untangle::bind(other_this, &execution<actionT>::is_running);
     }
-    ~execution(){}
+    ~execution() = default;
 
     /**
      * @brief Binds asynchronously an external action to a class function member.
@@ -180,7 +178,7 @@ namespace async
      *
      * @param action [in,out] - An action of type std::function<...>.
      * @param obj - A std::shared_ptr that wraps the bound class object.
-     * @param classT::*method - Pointer to function member. It is specified as &<class type>::<function member>.
+     * @param method - Pointer to function member. It is specified as &<class type>::<function member>.
      */
     template<typename classT, typename T>
     void bind_action_and_method(actionT& action, const std::shared_ptr<classT>& obj, T classT::*method)
@@ -200,7 +198,7 @@ namespace async
      * @return true - The execution has not finished.
      * @return false - The execution has finished.
      */
-    bool isrunning()
+    bool is_running() const
     {
       return running.load();
     }
@@ -276,8 +274,8 @@ namespace async
 
     std::function<void(void)> action_execute;
     std::function<void(void)> action_stop;
-    std::function<bool(void)> action_isrunning;
-    std::function<void(void)> onfinished;
+    std::function<bool(void)> action_is_running;
+    std::function<void(void)> on_finished;
     std::string name;
 
   private:
@@ -288,7 +286,7 @@ namespace async
       action_list.front()();
     }
 
-    // SFINAE by return (non void)
+    // SFINAE by return (non-void)
     template<typename T = actionT>
     typename std::enable_if_t<!std::is_void<typename T::result_type>::value, typename T::result_type> select_execute_actions()
     {
@@ -316,9 +314,9 @@ namespace async
     {
       execute_actions();
 
-      if (onfinished)
+      if (on_finished)
       {
-        onfinished();
+        on_finished();
       }
 
       std::cout << "finishing thread" << std::endl;
@@ -347,8 +345,8 @@ namespace async
 
     std::list<std::function<typename actionT::result_type(void)>> action_list;
 
-    untangle::actuator<std::function<void(void)>> actuator_execute;
-    untangle::actuator<std::function<void(void)>> actuator_stop;
+    actuator<std::function<void(void)>> actuator_execute;
+    actuator<std::function<void(void)>> actuator_stop;
 
     // std::vector cannot hold void type; use an arbitrary type e.g. int
     using resultT = std::conditional<std::is_void<typename actionT::result_type>::value, int , typename actionT::result_type>;
