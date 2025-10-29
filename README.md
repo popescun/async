@@ -2,16 +2,19 @@
 
 *c++ mechanism to run queued callables in an asynchronous fashion*
 
-The interface consists of one header file that expose a generic execution class. It is a wrapper of a list of callables that are invoked on other thread. The callables are pumped into the list by invoking an action from the caller thread.
+The interface consists of one header file that exposes a generic execution class. It is a wrapper of a list of callables that are invoked on other thread. The callables are pumped into the list by invoking an action from the caller thread.
 
-There are provided two execution modes: one-off and continuous.
+The implementation is using the [actuator](https://github.com/popescun/actuator) callable, and therefore it exemplifies how a generic callable may 
+improve the code structure, by easily creating `interfaces` inside a class instead of using external ones.
+
+There are provided two execution modes: `one-off` and `continuous`.
 
 ## one-off execution
 ![alt text](res/oneoff.png)
 
 ### example: one-off execution of a plain function
 ```c++
-#include <async.h>
+#include <async.hpp>
 
 void f()
 {
@@ -47,7 +50,7 @@ int main()
 
 ### example: one-off execution of a class method
 ```c++
-#include <async.h>
+#include <async.hpp>
 
 class A
 {
@@ -91,7 +94,7 @@ int main()
 
 ### example: continuous execution of a plain function
 ```c++
-#include <async.h>
+#include <async.hpp>
 
 void f()
 {
