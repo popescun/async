@@ -1,2 +1,4 @@
 # ignore submodules
 # actuator
+
+.DS_Store
