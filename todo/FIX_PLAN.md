@@ -1,10 +1,10 @@
 # async.hpp — fix plan
 
-**Status (2026-09-10):** 10 of 27 steps done. Everything closed so far landed in one commit,
-`1c149bf` — the queue race and the worker lifetime, which were the four critical findings and
-two of the five high ones.
-**Tests:** 5/5 green — `ctest --test-dir test/build` (baseline was 2/5).
-ThreadSanitizer and AddressSanitizer clean over all four cases in one process; 100x repeat, no flakes.
+**Status (2026-09-10):** 11 of 27 steps done. Steps 1-10 landed in one commit — the queue race and
+the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
+landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests).
+**Tests:** 7/7 green — `ctest --test-dir test/build` (baseline was 2/5).
+ThreadSanitizer and AddressSanitizer clean over all cases in one process; 50x repeat, no flakes.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 31 pages (was 23).
 **Source:** audit of 2026-09-10 (4 critical, 5 high, 5 medium, 8 hygiene), findings 1, 2, 3 and 5
 reproduced under TSan/ASan. Items lettered A onwards were found while fixing, and are read from the
@@ -12,27 +12,28 @@ code unless marked otherwise.
 
 ## Progress
 
-Done — steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10. Step 4 is closed only in part; what it left behind is
-item A, now step 11.
+Done — steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11. Step 11 finished what step 4 left of the poll.
 
 | Commit | Step |
 |---|---|
-| `1c149bf` | 1 — mutex + condition variable on the action list |
-| `1c149bf` | 2 — a throwing action no longer calls std::terminate |
-| `1c149bf` | 3 — ~execution() waits for its worker |
-| `1c149bf` | 4 — execution_poll::remove(), called from ~execution() |
-| `1c149bf` | 5 — `started` set by start(), not by the worker |
-| `1c149bf` | 6 — stop() no longer spins on an empty check |
-| `1c149bf` | 7 — loop() waits instead of burning a core |
-| `1c149bf` | 8 — if constexpr replaces the SFINAE pair |
-| `1c149bf` | 9 — named constructor; `name` is read by the warnings |
-| `1c149bf` | 10 — four missing includes added *(partial — see step 22)* |
+| `60f7970` | 1 — mutex + condition variable on the action list |
+| `60f7970` | 2 — a throwing action no longer calls std::terminate |
+| `60f7970` | 3 — ~execution() waits for its worker |
+| `60f7970` | 4 — execution_poll::remove(), called from ~execution() |
+| `60f7970` | 5 — `started` set by start(), not by the worker |
+| `60f7970` | 6 — stop() no longer spins on an empty check |
+| `60f7970` | 7 — loop() waits instead of burning a core |
+| `60f7970` | 8 — if constexpr replaces the SFINAE pair |
+| `60f7970` | 9 — named constructor; `name` is read by the warnings |
+| `60f7970` | 10 — four missing includes added *(partial — see step 22)* |
+| `cfa245d` | 11 — a mutex on execution_poll: add(), remove() and is_running() |
 
-**NEXT: step 11** — item A, `execution_poll::add()` is neither idempotent nor thread safe
-(`:104-110`). Now that step 4 has given the poll a `remove()`, `add()` is the remaining half of
-the same problem: the singleton is still a shared mutable object with no lock.
+**NEXT: step 12** — item 8, `bind()` captures the execution by reference (`:53`, `:76`). Read the
+step first: the dangling-capture half is **blocked on an ownership decision**, because a `weak_ptr`
+capture requires `execution` to be held by `shared_ptr`. The by-value/double-copy half is separable
+and can land on its own.
 
-**Remaining: 17 steps.** Groups 2 to 8 below.
+**Remaining: 16 steps.** Groups 2 to 8 below.
 
 **Not planned:** the `attach()` design itself. Items 9, 12 and the bounded wait in step 7 all trace
 back to attached executions having their own list and no way to notify the attacher, but redesigning
@@ -65,7 +66,7 @@ of atomic.
 | 9 ✅ | hyg | `name` was never read by anything | `:186-191`, `:336` | read-only |
 | 10 ✅ | hyg | four headers used but not included | `:10-13` | read-only |
 | **Group 2 — dangling references** |
-| 11 | A | `execution_poll::add()` not idempotent, not thread safe | `:104-110`, `:145-149` | read-only |
+| 11 ✅ | A | `execution_poll` is a shared mutable singleton with no lock | `:104-137` | CONFIRMED |
 | 12 | 8 | `bind()` captures the execution by reference | `:53`, `:76` | read-only |
 | 13 | 9 | `attach()` stores pointers, has no inverse, no cycle check | `:314-326` | read-only |
 | **Group 3 — results** |
@@ -93,7 +94,7 @@ of atomic.
 
 ## Group 1 — the queue and the worker (closed)
 
-All ten steps landed in `1c149bf`. Recorded here so the findings stay traceable; no action.
+All ten steps landed in `60f7970`. Recorded here so the findings stay traceable; no action.
 
 ### Step 1 · item 1 — action list shared across threads unguarded — DONE
 `async.hpp:295-312`, `:340-382` · CONFIRMED under ThreadSanitizer
@@ -127,8 +128,8 @@ invoked the action with no `try`, and an exception leaving a thread function cal
 
 `add()` stored `&async_exec.action_is_running` and there was no way to take it back.
 
-> `execution_poll::remove()`, called from `~execution()`. **What remains is item A, step 11:**
-> `add()` is still not idempotent and the singleton is still not thread safe.
+> `execution_poll::remove()`, called from `~execution()`. The rest of the poll — locking `add()`,
+> `remove()` and `is_running()` against each other — is item A, closed by step 11.
 
 ### Step 5 · item 5 — stop() after start() wedged the worker — DONE
 `async.hpp:254-270` · CONFIRMED: 5 hangs out of 5
@@ -183,18 +184,46 @@ A public `std::string name` that nothing in the header read.
 The same shape as item 4, which step 4 closed: an object holds a raw pointer or reference to
 another with no way to learn it has died.
 
-### Step 11 · item A — `execution_poll::add()` is neither idempotent nor thread safe
-`async.hpp:104-110`, `:145-149`
+### Step 11 · item A — `execution_poll` is a shared mutable singleton with no lock — DONE
+`async.hpp:104-137` · CONFIRMED: wrong answers, and a SEGV, both in a plain Debug build
 
-Two problems in the half of the poll that step 4 did not touch. `add()` called twice on the same
-execution registers it twice, and `is_running()` then invokes it twice — harmless today, but
-`remove()` takes only one of the pair back out, so the second is exactly the dangling pointer step 4
-set out to eliminate. Separately the singleton is a shared mutable object: `add()`, `remove()` and
-`is_running()` mutate and walk the same actuator with no lock, and `is_running()` is meant to be
-called from any thread that is waiting.
+**This step's original description was wrong and is corrected here.** It claimed that `add()` being
+non-idempotent left a stale registration a single `remove()` could not undo. It does not:
+`actuator::remove()` uses `actions.remove_if(...)` (`actuator.hpp:208`), which removes *every*
+match, so a double add followed by one remove clears both. Verified under ASan — registered twice,
+destroyed, polled, clean. Idempotence is not a bug here.
 
-> Guard the poll with its own mutex, and make `add()` a no-op when the execution is already
-> registered. `get()` itself is fine — a function-local static is thread safe since C++11.
+What was real is thread safety, and it was worse than "read-only" suggested. Two defects, both
+reproducible without a sanitizer:
+
+- **`is_running()` returned wrong answers to concurrent waiters.** It invokes an actuator that
+  clears one shared `results` vector and refills it, so two callers walk over each other and the
+  loser iterates a vector the winner has just emptied — and reports idle for an execution that is
+  still running. One waiter: 0 wrong answers in 3.4M polls. Two waiters: 11.9% wrong at `-O0`,
+  0.0045% at `-O1`. The rate swings with optimisation because a slower `is_running()` leaves the
+  vector cleared for proportionally longer; the suite builds Debug, so it sees the high rate.
+- **`add()` and `remove()` crashed a concurrent waiter.** `add()` move-assigns the whole actuator
+  (`:106`, the `connect()` branch) out from under a thread walking its action list. SEGV 15/15.
+  Not an exotic path: `~execution()` calls `remove()` itself, so any execution going out of scope
+  on one thread while another waits on the poll hits it — and waiting on the poll is the documented
+  way to wait.
+
+`running` itself was never at fault; it is atomic and correct. Everything wrong happened above it,
+in the poll's aggregation.
+
+> One `mutable std::mutex actuator_mutex`, taken by `add()`, `remove()` and `is_running()`. No
+> deadlock risk today: `is_running()` invokes actions while holding it, but those actions are bound
+> to `execution::is_running()`, which only reads an atomic and never re-enters the poll. That stops
+> being true if `add()` ever accepts arbitrary callables.
+
+Tests: `execution_poll.does_not_report_idle_while_an_execution_runs` and
+`execution_poll.survives_executions_registering_while_another_thread_waits`. The first holds its
+action open so the execution provably cannot finish mid-measurement — otherwise a waiter that checks
+`exec.is_running()` and then asks the poll races itself, and the poll's "idle" is correct rather
+than wrong. That time-of-check to time-of-use reading can only happen once per waiter, so it never
+accounted for the counts above, but a test must not count it at all.
+
+**Left open:** `is_running()` could be `const` — the `mutable` on the mutex is already there for it.
 
 ### Step 12 · item 8 — `bind()` captures the execution by reference
 `async.hpp:53`, `:76`
@@ -291,7 +320,7 @@ these two predate it and do not.
 > letting the logger you have planned own this.
 
 ### Step 19 · item E — the smoke test races on `std::cout` between two workers
-`test/async_smoke_test.cpp:15`, `:24` · CONFIRMED under TSan, and present before `1c149bf`
+`test/async_smoke_test.cpp:15`, `:24` · CONFIRMED under TSan, and present before `60f7970`
 
 `A::f_with_arg` and `A::f_with_arg_and_return` print from two different workers concurrently. This
 is the single remaining TSan warning in the repo, and it is the test's own code, not the header's.
