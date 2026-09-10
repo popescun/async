@@ -1,3 +1,5 @@
+# Copyright (c) 2018 Nicolae Popescu. MIT License.
+
 cmake_minimum_required(VERSION 4.1)
 
 project(test_async)
@@ -21,6 +23,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #if(result)
 #  message(FATAL_ERROR "Build step for dependencies failed: ${result}")
 #endif()
+
+# enable_testing() creates the CTest targets, and writes the CTestTestfile.cmake that
+# `ctest --test-dir` needs. test_async is still a hand-driven demo with a main() rather
+# than a gtest suite, so nothing is registered yet and the suite is empty on purpose.
+enable_testing()
 
 #include headers directories
 include_directories(

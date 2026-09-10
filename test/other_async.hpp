@@ -1,23 +1,17 @@
-# pragma once
-
-#include <string>
+#pragma once
 
 #include <async.hpp>
+#include <string>
 
-template<typename T>
-class other_async : public std::enable_shared_from_this<other_async<T>>
-{
-public:
+template <typename T>
+class other_async : public std::enable_shared_from_this<other_async<T>> {
+ public:
   other_async() = default;
   ~other_async() = default;
 
-  void set(const T& text)
-  {
-    std::cout << text << std::endl;
-  }
+  void set(const T& text) { std::cout << text << std::endl; }
 
-  void run()
-  {
+  void run() {
     asyncexec.name = "other_async";
     sharedThis = this->shared_from_this();
     asyncexec.bind_action_and_method(async_action, sharedThis, &other_async<std::string>::set);
@@ -26,8 +20,8 @@ public:
     asyncexec.run();
   }
 
-  private:
-    std::shared_ptr<other_async<T>> sharedThis;
-    untangle::async::execution<std::function<void(const std::string&)>> asyncexec;
-    std::function<void(const std::string&)> async_action;
+ private:
+  std::shared_ptr<other_async<T>> sharedThis;
+  untangle::async::execution<std::function<void(const std::string&)>> asyncexec;
+  std::function<void(const std::string&)> async_action;
 };

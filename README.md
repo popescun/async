@@ -1,5 +1,7 @@
 # async
 
+[![ci](https://github.com/popescun/async/actions/workflows/ci.yml/badge.svg)](https://github.com/popescun/async/actions/workflows/ci.yml)
+
 *c++ mechanism to run queued callables in an asynchronous fashion*
 
 The interface consists of one header file that exposes a generic execution class. It is a wrapper of a list of callables that are invoked on other thread. The callables are pumped into the list by invoking an action from the caller thread.
@@ -39,7 +41,7 @@ int main()
   untangle::async::execution_poll::get().add(execution);
 
   // wait the polled executions to finish
-  while(untangle::async::execution_poll::get().isrunning())
+  while(untangle::async::execution_poll::get().is_running())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -80,7 +82,7 @@ int main()
   untangle::async::execution_poll::get().add(execution);
 
   // wait the polled executions to finish
-  while(untangle::async::execution_poll::get().isrunning())
+  while(untangle::async::execution_poll::get().is_running())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -122,7 +124,7 @@ int main()
   untangle::async::execution_poll::get().add(execution);
 
   // wait the polled executions to finish
-  while(untangle::async::execution_poll::get().isrunning())
+  while(untangle::async::execution_poll::get().is_running())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
