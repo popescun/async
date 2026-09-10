@@ -93,9 +93,10 @@ int main() {
   otherasync->run();
 
   // wait the polled executions to finish
-  while (untangle::async::execution_poll::get().is_running()) {
+  while (untangle::async::execution_poll::get().is_running()) {  // time of check
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 
+  // time of use: returning destroys every execution above
   return 0;
 }

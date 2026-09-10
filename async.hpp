@@ -102,6 +102,8 @@ class execution_poll {
    */
   template <typename asyncexecT>
   void add(asyncexecT& async_exec) {
+    std::lock_guard<std::mutex> lock(actuator_mutex);
+
     if (!actuator_is_running.is_connected()) {
       actuator_is_running = untangle::connect(async_exec.action_is_running);
     } else {
@@ -119,6 +121,8 @@ class execution_poll {
    */
   template <typename asyncexecT>
   void remove(asyncexecT& async_exec) {
+    std::lock_guard<std::mutex> lock(actuator_mutex);
+
     actuator_is_running.remove(&async_exec.action_is_running);
   }
 
@@ -128,6 +132,7 @@ class execution_poll {
    * @return true - if at least one \ref execution object in this poll is running.
    */
   auto is_running() {
+    std::lock_guard<std::mutex> lock(actuator_mutex);
     actuator_is_running();
 
     auto result = false;
@@ -151,6 +156,7 @@ class execution_poll {
   execution_poll() = default;
   ~execution_poll() = default;
   actuator<std::function<bool(void)>> actuator_is_running;
+  mutable std::mutex actuator_mutex;
 };
 
 /**
@@ -209,10 +215,12 @@ class execution {
 
     action_cv.notify_all();
 
-    while (running.load()) {
+    while (running.load()) {  // time of check
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
+    // time of use: this object is freed once the destructor returns, so the check above is only
+    // safe because running is the last thing the worker touches
     execution_poll::get().remove(*this);
   }
 

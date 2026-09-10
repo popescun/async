@@ -70,6 +70,8 @@ struct sink {
  * @return true - the poll reported idle before the limit elapsed.
  */
 bool wait_until_poll_idle(std::chrono::milliseconds limit) {
+  // time of check; the time of use is the caller's next statement, and for every caller here that
+  // is letting the execution go out of scope
   return wait_for([] { return !untangle::async::execution_poll::get().is_running(); }, limit);
 }
 
@@ -179,4 +181,107 @@ TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
   if (stopped) {
     delete exec;
   }
+}
+
+/**
+ * @brief The poll does not report idle while an execution is still running.
+ *
+ * execution_poll is a singleton, and waiting on it is what the interface offers in place of a join,
+ * so more than one thread waits on it as a matter of course. is_running() invokes its actuator,
+ * which clears one shared results vector and refills it. Two callers therefore walk over each
+ * other, and the loser iterates a vector the winner has just emptied and reports idle.
+ *
+ * The action is held open for the whole measurement, so the execution provably cannot finish while
+ * the poll is being asked. That matters: a waiter that checks exec.is_running() and then asks the
+ * poll has a time-of-check to time-of-use gap of its own, and an execution that finishes inside it
+ * makes the poll's "idle" correct rather than wrong. Such a reading is legitimate and this test
+ * must not count it, so the possibility is removed rather than tolerated. It can only ever happen
+ * once per waiter in any case - the loop would exit straight after - which is why it never
+ * accounted for the counts seen here.
+ *
+ * One waiter is the control, and reports 0. Two waiters report roughly 15% wrong in a Debug build,
+ * where is_running() is slow enough to leave the results vector cleared for longer, and about
+ * 0.005% at -O1. The rate is build dependent; the count is not, so the assertion is on the count.
+ */
+TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
+  std::atomic_bool action_started = {false};
+  std::atomic_bool release_action = {false};
+
+  auto hold_until_released = [&action_started, &release_action] {
+    action_started = true;
+    while (!release_action) {
+      std::this_thread::yield();
+    }
+  };
+
+  untangle::async::execution<std::function<void(void)>> exec{"held_open"};
+  std::function<void(void)> action;
+  exec.bind_action_and_function(action, hold_until_released);
+
+  action();
+  untangle::async::execution_poll::get().add(exec);
+  exec.run();
+
+  // Past this point the action is mid-flight and cannot return, so the execution is running for
+  // every poll below and there is no check-then-use gap left to explain a wrong answer away.
+  while (!action_started) {
+    std::this_thread::yield();
+  }
+
+  constexpr auto polls_per_waiter = 200000;
+  std::atomic_int idle_reports = {0};
+
+  auto wait_on_the_poll = [&exec, &idle_reports] {
+    for (auto i = 0; i < polls_per_waiter; ++i) {
+      assert(exec.is_running()); //  time of check
+      if (!untangle::async::execution_poll::get().is_running()) { // time of use
+        idle_reports.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  };
+
+  std::thread first(wait_on_the_poll);
+  std::thread second(wait_on_the_poll);
+  first.join();
+  second.join();
+
+  // Read before releasing: if this is ever false the action returned early and the measurement
+  // above means nothing.
+  const auto was_running_throughout = exec.is_running();
+  release_action = true;
+
+  ASSERT_TRUE(was_running_throughout) << "the action finished early; the measurement is void";
+  EXPECT_EQ(idle_reports.load(), 0)
+      << "the poll reported idle " << idle_reports.load() << " times in " << 2 * polls_per_waiter
+      << " polls, while the execution was running";
+}
+
+/**
+ * @brief The poll survives executions registering and withdrawing while another thread waits on it.
+ *
+ * Every execution adds itself to the poll and withdraws in its destructor, and waiting on the poll
+ * is what a caller does in the meantime. Neither side takes a lock, and add() move-assigns the
+ * actuator whenever the poll was empty - out from under a thread walking its action list.
+ *
+ * This one does not return a wrong answer, it crashes: the walking thread follows a pointer into a
+ * list that has just been replaced.
+ */
+TEST(execution_poll, survives_executions_registering_while_another_thread_waits) {
+  std::atomic_bool done = {false};
+
+  std::thread waiter([&done] {
+    while (!done) {
+      untangle::async::execution_poll::get().is_running();
+    }
+  });
+
+  for (int i = 0; i < 200; ++i) {
+    untangle::async::execution<std::function<void(void)>> exec{"churn"};
+    untangle::async::execution_poll::get().add(exec);
+  }
+
+  done = true;
+  waiter.join();
+
+  SUCCEED() << "the poll was walked while executions registered and withdrew";
 }
