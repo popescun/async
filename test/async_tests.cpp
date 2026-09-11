@@ -20,10 +20,16 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <vector>
 
 namespace {
 
 using namespace std::chrono_literals;
+
+// The action types under test, named once: bind_action_and_*() are static, so every call has to
+// qualify the execution type, and the full specialisation does not fit in a line.
+using int_execution = untangle::async::execution<std::function<void(int)>>;
+using void_execution = untangle::async::execution<std::function<void(void)>>;
 
 /**
  * @brief Waits for a predicate to hold, so a defect is reported as a failure rather than a hang.
@@ -85,12 +91,12 @@ bool wait_until_poll_idle(std::chrono::milliseconds limit) {
  */
 TEST(execution_queue, runs_an_action_queued_before_the_worker_starts) {
   auto s = std::make_shared<sink>();
-  untangle::async::execution<std::function<void(int)>> exec{"queued_before_start"};
-  exec.bind_action_and_method(s->action, s, &sink::count);
-  untangle::async::execution_poll::get().add(exec);
+  auto exec = int_execution::create_instance("queued_before_start");
+  int_execution::bind_action_and_method(s->action, s, &sink::count, exec);
+  untangle::async::execution_poll::get().add(*exec);
 
   s->action(1);
-  exec.run();
+  exec->run();
 
   EXPECT_TRUE(wait_for([&s] { return s->calls.load() == 1; }, 2000ms));
   EXPECT_EQ(s->calls.load(), 1);
@@ -115,11 +121,11 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
   constexpr int queued = 1000;
 
   auto s = std::make_shared<sink>();
-  untangle::async::execution<std::function<void(int)>> exec{"queued_while_draining"};
-  exec.bind_action_and_method(s->action, s, &sink::count);
-  untangle::async::execution_poll::get().add(exec);
+  auto exec = int_execution::create_instance("queued_while_draining");
+  int_execution::bind_action_and_method(s->action, s, &sink::count, exec);
+  untangle::async::execution_poll::get().add(*exec);
 
-  exec.start();
+  exec->start();
   for (int i = 0; i < queued; ++i) {
     s->action(i);
   }
@@ -127,7 +133,7 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
   EXPECT_TRUE(wait_for([&s] { return s->calls.load() == queued; }, 2000ms));
   EXPECT_EQ(s->calls.load(), queued) << "actions were dropped between push_back and pop_front";
 
-  exec.stop();
+  exec->stop();
   ASSERT_TRUE(wait_until_poll_idle(5000ms))
       << "the worker was still running 5s after stop(); the object cannot be destroyed safely";
 }
@@ -141,15 +147,15 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
  */
 TEST(execution_queue, refuses_an_action_queued_after_the_worker_stops) {
   auto s = std::make_shared<sink>();
-  untangle::async::execution<std::function<void(int)>> exec{"queued_after_stop"};
-  exec.bind_action_and_method(s->action, s, &sink::count);
-  untangle::async::execution_poll::get().add(exec);
+  auto exec = int_execution::create_instance("queued_after_stop");
+  int_execution::bind_action_and_method(s->action, s, &sink::count, exec);
+  untangle::async::execution_poll::get().add(*exec);
 
-  exec.start();
+  exec->start();
   s->action(1);
   ASSERT_TRUE(wait_for([&s] { return s->calls.load() == 1; }, 2000ms)) << "the first action ran";
 
-  exec.stop();
+  exec->stop();
   s->action(2);
 
   ASSERT_TRUE(wait_until_poll_idle(5000ms))
@@ -167,9 +173,13 @@ TEST(execution_queue, refuses_an_action_queued_after_the_worker_stops) {
  * forever at 100% of a core.
  */
 TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
-  // Heap allocated and deliberately leaked when it wedges: the worker is detached and still holds
-  // this pointer, so destroying the object would turn a reported failure into a use-after-free.
-  auto* exec = new untangle::async::execution<std::function<void(void)>>{"stop_after_start"};
+  // Deliberately leaked when it wedges: the worker is detached and still holds this object, so
+  // destroying it would turn a reported failure into a use-after-free. The execution is
+  // shared-owned like every other, so leaking means keeping an owner alive for the rest of the
+  // process rather than dropping a raw pointer on the floor.
+  static std::vector<std::shared_ptr<void_execution>> wedged;
+
+  auto exec = void_execution::create_instance("stop_after_start");
   untangle::async::execution_poll::get().add(*exec);
 
   exec->start();
@@ -178,8 +188,8 @@ TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
   const auto stopped = wait_until_poll_idle(2000ms);
   EXPECT_TRUE(stopped) << "the worker was still spinning 2s after stop()";
 
-  if (stopped) {
-    delete exec;
+  if (!stopped) {
+    wedged.push_back(std::move(exec));
   }
 }
 
@@ -192,7 +202,7 @@ TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
  * other, and the loser iterates a vector the winner has just emptied and reports idle.
  *
  * The action is held open for the whole measurement, so the execution provably cannot finish while
- * the poll is being asked. That matters: a waiter that checks exec.is_running() and then asks the
+ * the poll is being asked. That matters: a waiter that checks exec->is_running() and then asks the
  * poll has a time-of-check to time-of-use gap of its own, and an execution that finishes inside it
  * makes the poll's "idle" correct rather than wrong. Such a reading is legitimate and this test
  * must not count it, so the possibility is removed rather than tolerated. It can only ever happen
@@ -214,13 +224,13 @@ TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
     }
   };
 
-  untangle::async::execution<std::function<void(void)>> exec{"held_open"};
+  auto exec = void_execution::create_instance("held_open");
   std::function<void(void)> action;
-  exec.bind_action_and_function(action, hold_until_released);
+  void_execution::bind_action_and_function(action, hold_until_released, exec);
 
   action();
-  untangle::async::execution_poll::get().add(exec);
-  exec.run();
+  untangle::async::execution_poll::get().add(*exec);
+  exec->run();
 
   // Past this point the action is mid-flight and cannot return, so the execution is running for
   // every poll below and there is no check-then-use gap left to explain a wrong answer away.
@@ -233,8 +243,8 @@ TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
 
   auto wait_on_the_poll = [&exec, &idle_reports] {
     for (auto i = 0; i < polls_per_waiter; ++i) {
-      assert(exec.is_running()); //  time of check
-      if (!untangle::async::execution_poll::get().is_running()) { // time of use
+      assert(exec->is_running());                                  //  time of check
+      if (!untangle::async::execution_poll::get().is_running()) {  // time of use
         idle_reports.fetch_add(1, std::memory_order_relaxed);
       }
     }
@@ -247,7 +257,7 @@ TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
 
   // Read before releasing: if this is ever false the action returned early and the measurement
   // above means nothing.
-  const auto was_running_throughout = exec.is_running();
+  const auto was_running_throughout = exec->is_running();
   release_action = true;
 
   ASSERT_TRUE(was_running_throughout) << "the action finished early; the measurement is void";
@@ -276,12 +286,70 @@ TEST(execution_poll, survives_executions_registering_while_another_thread_waits)
   });
 
   for (int i = 0; i < 200; ++i) {
-    untangle::async::execution<std::function<void(void)>> exec{"churn"};
-    untangle::async::execution_poll::get().add(exec);
+    auto exec = void_execution::create_instance("churn");
+    untangle::async::execution_poll::get().add(*exec);
   }
 
   done = true;
   waiter.join();
 
   SUCCEED() << "the poll was walked while executions registered and withdrew";
+}
+
+/**
+ * @brief An action does not reach an execution that has been destroyed.
+ *
+ * Both bind() overloads hand the caller a lambda to store - here on the sink, whose lifetime has
+ * nothing to do with the execution's. The sink outliving the execution is the ordinary shape rather
+ * than a contrived one: an action is a member of the bound object, and the execution is typically a
+ * local or a member somewhere else.
+ *
+ * The contract asserted here is the one actuator::bind already follows: the binding holds weak
+ * ownership, and invoking it after its target has gone throws untangle::invalid_action rather than
+ * touching freed memory. execute_actions() catches exactly that exception, so an action that comes
+ * in late through the worker is dropped with a warning instead of ending the process.
+ *
+ * @remark The throw is asserted, not just the absence of a side effect. EXPECT_EQ(calls, 0) alone
+ * would also pass against a broken header that pushed onto a destroyed list, because a queue no
+ * worker is draining never runs anything either.
+ */
+TEST(execution_binding, an_action_does_not_reach_a_destroyed_execution) {
+  auto s = std::make_shared<sink>();
+
+  {
+    auto exec = int_execution::create_instance("short_lived");
+    int_execution::bind_action_and_method(s->action, s, &sink::count, exec);
+  }  // the execution is gone; s->action still holds a binding to it
+
+  EXPECT_THROW(s->action(1), untangle::invalid_action)
+      << "an action outliving its execution must report a dead binding, not follow it";
+
+  EXPECT_EQ(s->calls.load(), 0) << "an action bound to a destroyed execution appeared to run";
+}
+
+/**
+ * @brief The plain-function overload holds the same reference, and must not follow it either.
+ *
+ * bind(T& Fn, execution&) holds the execution exactly as the method overload does, so a function
+ * action outliving its execution must report the same way. Kept as its own case because the two
+ * overloads are separate code paths: a fix applied to one and not the other would leave the header
+ * half repaired and this suite still green.
+ *
+ * The action is declared outside the scope so that it, rather than the execution, is what survives.
+ */
+TEST(execution_binding, a_function_action_does_not_reach_a_destroyed_execution) {
+  std::atomic_int calls = {0};
+  auto count_a_call = [&calls] { calls.fetch_add(1, std::memory_order_relaxed); };
+
+  std::function<void(void)> action;
+
+  {
+    auto exec = void_execution::create_instance("short_lived_function");
+    void_execution::bind_action_and_function(action, count_a_call, exec);
+  }  // the execution is gone; action still holds a binding to it
+
+  EXPECT_THROW(action(), untangle::invalid_action)
+      << "an action outliving its execution must report a dead binding, not follow it";
+
+  EXPECT_EQ(calls.load(), 0) << "an action bound to a destroyed execution appeared to run";
 }

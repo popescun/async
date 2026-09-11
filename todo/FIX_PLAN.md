@@ -67,7 +67,7 @@ of atomic.
 | 10 ✅ | hyg | four headers used but not included | `:10-13` | read-only |
 | **Group 2 — dangling references** |
 | 11 ✅ | A | `execution_poll` is a shared mutable singleton with no lock | `:104-137` | CONFIRMED |
-| 12 | 8 | `bind()` captures the execution by reference | `:53`, `:76` | read-only |
+| 12 | 8 | `bind()` captures the execution by reference | `:53`, `:76` | CONFIRMED (5/5; ASan via probe) |
 | 13 | 9 | `attach()` stores pointers, has no inverse, no cycle check | `:314-326` | read-only |
 | **Group 3 — results** |
 | 14 | 7 | `_result` read uninitialised, written unsynchronised | `:447`, `:328`, `:348` | read-only |
@@ -239,10 +239,71 @@ again, so a `const std::string&` parameter is copied twice and a move-only argum
 compile; and the lambda returns a default-constructed result, so an async call to an `int`-returning
 method silently yields 0.
 
-> No safe capture exists while `execution` is a bare object — this needs the execution to be held by
-> `shared_ptr` and captured as `weak_ptr`, which is an API change. **Decide the ownership model
-> before writing this step;** the thread-pool work may settle it. The by-value/double-copy part is
-> separable and can land first as `auto&&... args` with perfect forwarding.
+**Empirically, 2026-09-11.** Both cases fail 5/5 in a Debug build and 5/5 again with
+`-DASYNC_SANITIZE=address`, as `std::system_error: mutex lock failed: Invalid argument` thrown out of
+the action — `add_action()` takes `action_mutex` before it touches anything else, so the destroyed
+mutex is the first thing hit. googletest catches it and reports a failure, so the binary does not
+abort and the rest of the suite still runs: 6 of 8 pass, these two are the only red.
+
+**ASan does see the dangling execution — but not through the production path.** Probed three ways
+in the same toolchain (Apple clang 21, `-fsanitize=address`, runtime confirmed linked into
+`async_tests`):
+
+| probe | access | ASan |
+|---|---|---|
+| execution `new`ed, `delete`d, then `is_running()` | instrumented load, `async.hpp:254` | `heap-use-after-free` |
+| execution in an inner scope, then `is_running()` via a saved pointer (the tests' shape) | instrumented load, same line | `stack-use-after-scope` |
+| the action invoked after the execution died (what the tests do) | `pthread_mutex_lock`, libsystem | **nothing** |
+
+The memory is poisoned and the sanitizer would name it; what preempts the report is the ordering
+inside `add_action()`, whose first statement is `std::lock_guard(action_mutex)`. That first touch
+happens inside uninstrumented libsystem_pthread, whose own validation sees the destroyed mutex and
+returns `EINVAL`, so libc++ throws `std::system_error` before any instrumented load executes. TSan,
+which does intercept `pthread_mutex_lock`, reports nothing either — same exception, 5/5.
+
+**Worth remembering for later steps:** the step-1 mutex now sits in front of every access to the
+queue, so any future dangling-execution defect will surface as `mutex lock failed` and mask the
+sanitizer report. Reach for a direct instrumented read (`is_running()` through a saved pointer) when
+a use-after-free needs naming, rather than concluding the sanitizer is silent.
+
+**Consequence for the tests:** assert the dead-binding *signal* rather than the absence of a side
+effect. `EXPECT_EQ(calls, 0)` passes in the silent-success case too, because a push onto a destroyed
+list still never runs. `EXPECT_THROW(action(...), untangle::invalid_action)` is a checked reason in
+both directions, and it matches the convention already in the header — `actuator::bind` throws
+`invalid_action` for a dead object, and `execute_actions()` catches exactly that (`:376-383`). It
+does presuppose that a dead execution's action throws rather than drops silently, which is part of
+the ownership decision below.
+
+**Ownership model chosen: the binding holds the execution weakly, the way `actuator::bind` does.**
+The two free `bind()` overloads are gone; their bodies moved into `bind_action_and_method()` and
+`bind_action_and_function()`, which became static and take the execution as
+`const std::shared_ptr<execution>&`. Each captures a plain `std::weak_ptr` built from that argument -
+no `enable_shared_from_this` anywhere - `lock()`s it and holds the `shared_ptr` across `add_action()`,
+and throws `untangle::invalid_action` when the lock fails, the exception `execute_actions()` already
+catches.
+
+Taking the `shared_ptr` as a parameter is what makes this better than capturing `weak_from_this()`:
+**binding an execution that no `shared_ptr` owns does not compile**, instead of compiling and throwing
+on first invocation. Verified - `bind_action_and_function(action, f, stack_exec)` fails with "no
+matching function", while a shared-owned execution destroyed before its action fires throws
+`invalid_action`. Shared ownership is now required exactly where it is needed, at bind time: a stack
+execution is still perfectly usable through `add_action()` directly.
+
+`create_instance()` stays as the variadic factory, though it is now convenience rather than
+load-bearing - `std::make_shared<execution<actionT>>(...)` does the same. The explicit copy deletions
+were dropped as redundant: the `mutex`, `condition_variable`, `thread` and `atomic_bool` members
+already make `execution` non-copyable, confirmed by static_assert.
+
+Verified after the change: Debug, ASan and TSan all 8/8, smoke test clean under Debug and ASan.
+
+One consequence to keep in mind: an action invocation is a temporary co-owner, so releasing the last
+caller-held `shared_ptr` while an action is in flight runs `~execution()` - which waits on the worker -
+on whichever thread drops the temporary.
+
+> Still open in this step: the by-value/double-copy half, separable and not done here — `auto...
+> args` takes by value and `std::bind` copies again, so a move-only argument will not compile; and
+> the lambda returns a default-constructed result, so an async call to an `int`-returning method
+> yields 0. Lands as `auto&&... args` with perfect forwarding.
 
 ### Step 13 · item 9 — `attach()` stores pointers, has no inverse, no cycle check
 `async.hpp:314-326`

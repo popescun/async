@@ -8,6 +8,7 @@
 #include <actuator/actuator.hpp>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <print>
 #include <string>
@@ -28,56 +29,6 @@ namespace async {
 /**
  *  @defgroup untangle_functions namespace untangle: functions
  */
-
-/**
- * @brief Asynchronous binding to a class function member.
- *
- * It uses an \ref execution object to execute the bound class function member on other thread.
- * It creates an action as a binding to a class method (by untangle::bind()), and returns a
- * callable that passes this action to \ref execution::add_action()).
- *
- * @param obj - A std::shared_ptr that wraps the bound class object.
- * @param method - Pointer to function member. It is specified as &\<class type\>::\<function
- * member\>.
- * @param async_exec - An \ref execution object.
- * @return - A std::function<...>(lambda) that adds the action to the execution object's actions
- * list.
- *
- * @ingroup untangle_functions
- */
-template <typename classT, typename T, typename actionT = std::function<T>>
-actionT bind(const std::shared_ptr<classT>& obj, T classT::* method,
-             execution<actionT>& async_exec) {
-  actionT async_action = untangle::bind(obj, method);
-
-  return [&async_exec, async_action](auto... args) -> typename actionT::result_type {
-    async_exec.add_action(async_action, args...);
-    return typename actionT::result_type();
-  };
-}
-
-/**
- * @brief Asynchronous binding to a plain function.
- *
- * It uses an \ref execution object to execute the bound function on other thread.
- * It creates an action as std::function that wraps the function, and returns a callable that passes
- * this action to \ref execution::add_action()).
- *
- *
- * @param Fn - A plain function.
- * @param async_exec - An \ref execution object.
- * @return - A std::function(lambda) that adds the action to the execution object's actions list.
- *
- * @ingroup untangle_functions
- */
-template <typename T, typename actionT = std::function<T>>
-actionT bind(T& Fn, execution<actionT>& async_exec) {
-  actionT async_action = Fn;
-  return [&async_exec, async_action](auto... args) -> typename actionT::result_type {
-    async_exec.add_action(async_action, args...);
-    return typename actionT::result_type();
-  };
-}
 
 /**
  * @brief Execution poll class.
@@ -166,7 +117,8 @@ class execution_poll {
  * separate thread. It may also attach another \ref execution object and trigger its actions. This
  * way actions of different types may be executed on the same thread.
  *
- * The mechanism relies on an "asynchronous binding" created by using \ref bind().
+ * The mechanism relies on an "asynchronous binding" created by \ref bind_action_and_method() or
+ * \ref bind_action_and_function().
  *
  * @tparam actionT It represents the type of the action. It is specified as std::function<...> and
  * should match the signature of the bound function or class method.
@@ -175,26 +127,52 @@ template <typename actionT>
 class execution {
  public:
   /**
-   * @brief Constructs a new execution object.
+   * @brief Creates an execution owned by a std::shared_ptr, which is what binding to it requires.
    *
+   * \ref bind_action_and_method() and \ref bind_action_and_function() take the execution as a
+   * std::shared_ptr and hold it weakly, so an execution that is to be bound has to be created this
+   * way. One built on the stack, as a data member, or through a bare new is still a usable
+   * execution
+   * - actions can be handed to \ref add_action() directly - it simply cannot be bound, and the
+   * attempt does not compile.
+   *
+   * The arguments are forwarded to a constructor, so this factory does not have to be revisited
+   * when one is added.
+   *
+   * @param args - Constructor arguments: a name, or nothing for the default name.
+   * @return - A std::shared_ptr owning the new execution.
    */
-  execution() {
+  template <typename... Args>
+  static std::shared_ptr<execution> create_instance(Args&&... args) {
+    return std::make_shared<execution>(std::forward<Args>(args)...);
+  }
+
+  /**
+   * @brief Constructs a new execution object with the default name. Call \ref create_instance()
+   * instead.
+   *
+   * The name identifies an execution in the warnings it reports, and is otherwise unused. An
+   * execution built without one keeps the default name rather than an empty one, so a warning
+   * always names something.
+   */
+  execution() : execution(std::string(default_name)) {}
+
+  /**
+   * @brief Constructs a new named execution object.
+   *
+   * An execution constructed directly cannot be bound to - \ref bind_action_and_method() and
+   * \ref bind_action_and_function() require a std::shared_ptr. Use \ref create_instance() for one
+   * that is going to carry bound actions.
+   *
+   * @param exec_name - A name for this execution.
+   */
+  explicit execution(std::string exec_name) : name(std::move(exec_name)) {
     other_this = this;
     action_execute = untangle::bind(other_this, &execution<actionT>::execute_actions);
     action_stop = untangle::bind(other_this, &execution<actionT>::stop);
     action_is_running = untangle::bind(other_this, &execution<actionT>::is_running);
   }
 
-  /**
-   * @brief Constructs a new named execution object.
-   *
-   * The name identifies this execution in the warnings it reports, and is otherwise unused. An
-   * execution built by the default constructor keeps the default name rather than an empty one, so
-   * a warning always names something.
-   *
-   * @param exec_name - A name for this execution.
-   */
-  explicit execution(std::string exec_name) : execution() { name = std::move(exec_name); }
   /**
    * @brief Destroys the execution object, once its worker has left.
    *
@@ -227,22 +205,66 @@ class execution {
   /**
    * @brief Binds asynchronously an external action to a class function member.
    *
-   * The binding is done by using a \ref bind().
+   * It creates an action as a binding to a class method (by untangle::bind()), and assigns to
+   * \p action a callable that passes it to \ref add_action(). The execution is taken as a
+   * std::shared_ptr and held as a std::weak_ptr, exactly as untangle::bind() holds the bound
+   * object: the action can therefore outlive the execution and report a dead binding rather than
+   * following a dangling reference.
+   *
+   * @attention Invoking \p action after the execution has been destroyed throws
+   * untangle::invalid_action. \ref execute_actions() catches it, so such an action is dropped with
+   * a warning rather than ending the worker thread.
    *
    * @param action [in,out] - An action of type std::function<...>.
    * @param obj - A std::shared_ptr that wraps the bound class object.
    * @param method - Pointer to function member. It is specified as &\<class type\>::\<function
    * member\>.
+   * @param async_exec - A std::shared_ptr owning the execution the action is queued on. Requiring
+   * it here is what keeps an execution that no shared_ptr owns from being bound at all.
    */
   template <typename classT, typename T>
-  void bind_action_and_method(actionT& action, const std::shared_ptr<classT>& obj,
-                              T classT::* method) {
-    action = bind(obj, method, *this);
+  static void bind_action_and_method(actionT& action, const std::shared_ptr<classT>& obj,
+                                     T classT::* method,
+                                     const std::shared_ptr<execution>& async_exec) {
+    actionT async_action = untangle::bind(obj, method);
+
+    action = [wp = std::weak_ptr<execution>(async_exec),
+              async_action](auto... args) -> actionT::result_type {
+      // lock() also keeps the execution alive for the duration of the call
+      const auto exec = wp.lock();
+      if (!exec) {
+        throw invalid_action("bind: invalid execution");
+      }
+      exec->add_action(async_action, args...);
+      return typename actionT::result_type();
+    };
   }
 
+  /**
+   * @brief Binds asynchronously an external action to a plain function.
+   *
+   * It wraps \p Fn in an action and assigns to \p action a callable that passes it to \ref
+   * add_action(). The execution is held weakly, for the reason given on \ref
+   * bind_action_and_method().
+   *
+   * @param action [in,out] - An action of type std::function<...>.
+   * @param Fn - A plain function.
+   * @param async_exec - A std::shared_ptr owning the execution the action is queued on.
+   */
   template <typename T>
-  void bind_action_and_function(actionT& action, const T& Fn) {
-    action = bind(Fn, *this);
+  static void bind_action_and_function(actionT& action, const T& Fn,
+                                       const std::shared_ptr<execution>& async_exec) {
+    actionT async_action = Fn;
+
+    action = [wp = std::weak_ptr<execution>(async_exec),
+              async_action](auto... args) -> actionT::result_type {
+      const auto exec = wp.lock();
+      if (!exec) {
+        throw invalid_action("bind: invalid execution");
+      }
+      exec->add_action(async_action, args...);
+      return typename actionT::result_type();
+    };
   }
 
   /**
@@ -335,7 +357,7 @@ class execution {
 
   auto result() { return _result; }
 
-  static constexpr auto default_name = "unnamed";  //!< Name of an execution built unnamed.
+  static constexpr auto default_name = "default_name";  //!< Name of an execution built unnamed.
 
   std::function<void(void)> action_execute;
   std::function<void(void)> action_stop;
@@ -378,7 +400,7 @@ class execution {
       // it; the actuator drops such an action, and so does this.
       try {
         execute_action(action);
-      } catch (const untangle::invalid_action& ia) {
+      } catch (const invalid_action& ia) {
         std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
                      ia.what());
       }
@@ -452,9 +474,9 @@ class execution {
   // std::vector cannot hold void type; use an arbitrary type e.g. int
   using resultT = std::conditional<std::is_void<typename actionT::result_type>::value, int,
                                    typename actionT::result_type>;
-  typename resultT::type _result;
+  resultT::type _result;
 
-  execution<actionT>* other_this;
+  execution* other_this;
 };
 }  // namespace async
 }  // namespace untangle

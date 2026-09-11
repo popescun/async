@@ -32,19 +32,22 @@ int main()
 {
   std::cout << "main thread " << std::this_thread::get_id() << std::endl;
 
-  // declare an execution specialized for an action type
+  // declare an execution specialized for an action type; it must be held by a shared pointer,
+  // because an async binding keeps only weak ownership of it
   // the name is optional, and identifies the execution in the warnings it reports
-  untangle::async::execution<std::function<void(void)>> execution{"oneoff"};
+  using void_execution = untangle::async::execution<std::function<void(void)>>;
+  auto execution = void_execution::create_instance("oneoff");
   std::function<void(void)> action;
-  // create async binding between the action and f
-  execution.bind_action_and_function(action, f);
+  // create async binding between the action and f; the execution is passed as a shared pointer,
+  // which the binding holds weakly - that is what lets the action outlive it safely
+  void_execution::bind_action_and_function(action, f, execution);
   // whenever the action is invoked, a new callable wrapping f will be added to the execution's action list
   action();
   // run the execution
-  execution.run();
+  execution->run();
 
   // add the execution object to the running poll
-  untangle::async::execution_poll::get().add(execution);
+  untangle::async::execution_poll::get().add(*execution);
 
   // wait the polled executions to finish
   while(untangle::async::execution_poll::get().is_running())
@@ -76,16 +79,18 @@ int main()
 
   auto a = std::make_shared<A>();
 
-  // declare an execution specialized for an action type
-  untangle::async::execution<std::function<void(int)>> execution{"oneoff_method"};
-  execution.bind_action_and_method(a->action, a, &A::f); // note the bound object must be a shared pointer
+  // declare an execution specialized for an action type; it must be held by a shared pointer
+  using int_execution = untangle::async::execution<std::function<void(int)>>;
+  auto execution = int_execution::create_instance("oneoff_method");
+  // note both the bound object and the execution must be shared pointers
+  int_execution::bind_action_and_method(a->action, a, &A::f, execution);
   // whenever the action is invoked, a new callable wrapping f will be added to the execution's action list
   a->action(10);
   // run the execution
-  execution.run();
+  execution->run();
 
   // add the execution object to the running poll
-  untangle::async::execution_poll::get().add(execution);
+  untangle::async::execution_poll::get().add(*execution);
 
   // wait the polled executions to finish
   while(untangle::async::execution_poll::get().is_running())
@@ -113,21 +118,22 @@ int main()
 {
   std::cout << "main thread " << std::this_thread::get_id() << std::endl;
 
-  // declare an execution specialized for an action type
-  untangle::async::execution<std::function<void(void)>> execution{"continuous"};
+  // declare an execution specialized for an action type; it must be held by a shared pointer
+  using void_execution = untangle::async::execution<std::function<void(void)>>;
+  auto execution = void_execution::create_instance("continuous");
   std::function<void(void)> action;
   // create async binding between the action and f
-  execution.bind_action_and_function(action, f);
+  void_execution::bind_action_and_function(action, f, execution);
 
   // run the execution
-  execution.start();
+  execution->start();
   // add f to the execution's queue (three times)
   action();action();action();
   // stop the execution
-  execution.stop();
+  execution->stop();
 
   // add the execution object to the running poll
-  untangle::async::execution_poll::get().add(execution);
+  untangle::async::execution_poll::get().add(*execution);
 
   // wait the polled executions to finish
   while(untangle::async::execution_poll::get().is_running())
