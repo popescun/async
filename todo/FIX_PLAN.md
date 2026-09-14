@@ -1,10 +1,11 @@
 # async.hpp — fix plan
 
-**Status (2026-09-14):** 13 of 27 steps done, the last of them uncommitted. Steps 1-10 landed in one
-commit — the queue race and the worker lifetime, which were the four critical findings and two of
-the five high ones. Step 11 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new
-tests). Step 12 landed in `c4843cd` (`bind()` now holds the execution weakly; two new tests).
-**Step 13 is applied and green in the working tree, not yet committed**, and closes group 2.
+**Status (2026-09-14):** 14 of 27 steps done. Steps 1-10 landed in one commit — the queue race and
+the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
+landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
+`c4843cd` (`bind()` now holds the execution weakly; two new tests).
+Step 13 landed in `2e3a8d0` (`attach()` takes a `shared_ptr`, gains `detach()` and refuses cycles;
+seven new tests), closing group 2. Step 27 landed in `f251acf`, closing group 8.
 **Tests:** 16/16 green — `ctest --test-dir test/build` (baseline was 2/5). AddressSanitizer 16/16;
 ThreadSanitizer 15/16, the one failure being `async_smoke_test`'s own `std::cout` race, which is
 step 19 and predates all of this. 30x repeat of the whole suite, no flakes.
@@ -16,9 +17,10 @@ code unless marked otherwise.
 
 ## Progress
 
-Done — steps 1 to 13. Step 11 finished what step 4 left of the poll, step 12 closed the dangling
-`bind()` capture, and step 13 closed `attach()`. **Group 2 is complete**: every place the header
-held a raw pointer into another object now learns when that object dies.
+Done — steps 1 to 13, and step 27 out of order. Step 11 finished what step 4 left of the poll,
+step 12 closed the dangling `bind()` capture, and step 13 closed `attach()`. **Group 2 is complete**:
+every place the header held a raw pointer into another object now learns when that object dies.
+**Group 8 is complete** too, forced early by a red CI run.
 
 | Commit | Step |
 |---|---|
@@ -34,7 +36,8 @@ held a raw pointer into another object now learns when that object dies.
 | `60f7970` | 10 — four missing includes added *(partial — see step 22)* |
 | `cfa245d` | 11 — a mutex on execution_poll: add(), remove() and is_running() |
 | `c4843cd` | 12 — `bind()` holds the execution weakly, through a `shared_ptr` parameter |
-| *(uncommitted)* | 13 — `attach()` takes a `shared_ptr`, gains `detach()`, refuses cycles |
+| `2e3a8d0` | 13 — `attach()` takes a `shared_ptr`, gains `detach()`, refuses cycles |
+| `f251acf` | 27 — CI pins GCC 14 on Linux, which is where `<print>` arrived |
 
 **NEXT: step 14** — item 7, `_result` is read uninitialised and written unsynchronised (`:447`,
 `:328`, `:348`). Decide it together with step 15, which replaces the single `_result` with a results
@@ -46,7 +49,10 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 14 steps.** Groups 3 to 8 below.
+**Remaining: 13 steps.** Groups 3 to 7 below; group 8 is closed.
+
+**Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
+the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
 
 **Not planned:** the `attach()` design itself. Items 9, 12 and the bounded wait in step 7 all trace
 back to attached executions having their own list and no way to notify the attacher, but redesigning
@@ -100,8 +106,8 @@ of atomic.
 | 24 | hyg | `other_this = this` is pointless indirection | `:176`, `:449` | read-only |
 | 25 | hyg | `add_action` copies the action and every argument twice | `:295-307` | read-only |
 | 26 | hyg | `result \|= ret` on a bool | `:135` | read-only |
-| **Group 8 — build** |
-| 27 | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | UNVERIFIED |
+| **Group 8 — build (closed)** |
+| 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 
 ---
 
@@ -564,17 +570,35 @@ Bitwise-or on a bool in `execution_poll::is_running()`, where logical-or is mean
 
 ---
 
-## Group 8 — build
+## Group 8 — build (closed)
 
-### Step 27 · item F — C++23 raises the toolchain floor; CI may not clear it
-`test/CMakeLists.txt:7` · UNVERIFIED — local builds only
+### Step 27 · item F — C++23 raises the toolchain floor; CI may not clear it — DONE
+`test/CMakeLists.txt:7` · CONFIRMED by a CI run, 2026-09-14
 
 `std::println` moved the project from C++20 to C++23. Locally that is fine (Apple clang 21). The CI
 matrix is `macos-latest`, `windows-latest`, `ubuntu-latest` on default compilers, and `ubuntu-latest`
-ships GCC 13 by default while libstdc++ got `<print>` in GCC 14. That job is expected to fail.
+ships GCC 13 by default while libstdc++ got `<print>` in GCC 14.
 
-Not verified from here — it needs a CI run.
+It failed exactly as predicted, on the ubuntu job:
 
-> Either pin a newer compiler in the workflow, or guard the include:
-> `#if __has_include(<print>)` with the two call sites behind `__cpp_lib_print`. The guard is also
-> the natural seam for the logger that is planned, which would remove the dependency entirely.
+```
+async.hpp:15:10: fatal error: print: No such file or directory
+   15 | #include <print>
+```
+
+Note what the failure is not: `-std=c++23` is accepted by GCC 13, so nothing complains about the
+standard. Only the include fails, which is why this surfaces as a missing header rather than as a
+"C++23 not supported" diagnostic.
+
+> The compiler is pinned in the workflow rather than the header guarded: a `Use GCC 14 on Linux`
+> step installs `g++-14` and exports `CC`/`CXX`, conditioned on `runner.os == 'Linux'`. macOS
+> (libc++ 18+) and Windows (MSVC 17.9+) already ship `<print>`, so this is a Linux-only gap and
+> guarding the include would spread `#if` through the header to fix one runner.
+
+Taken from `fluxcpp`, which hit the same wall and solved it this way; the step is copied verbatim,
+comment included, so the two projects do not drift. Note that `actuator` is **not** a precedent here
+— it never included `<print>` at all and reports through `std::cout`, which is why its CI was always
+green on GCC 13.
+
+**Left open:** the same guard question returns if the planned logger replaces `std::println`, and
+step 18 still wants the two remaining `std::cout` calls routed through it.
