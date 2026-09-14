@@ -68,6 +68,18 @@ jobs:
           cmake --version | head -1
           git ls-files '*.hpp' '*.cpp' | wc -l | sed 's/^/tracked sources: /'
 
+      # ubuntu-latest still defaults to GCC 13. Its libstdc++ has <format> but not <print> -
+      # std::println only arrived in GCC 14 - so -std=c++23 is accepted and the include then
+      # fails. Select the newer compiler rather than rewriting the header: macOS (libc++ 18+)
+      # and Windows (MSVC 17.9+) already provide <print>, so this is a Linux-only gap.
+      - name: Use GCC 14 on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
       - name: Configure
         run: cmake -S test -B test/build -DCMAKE_BUILD_TYPE=Release
 
