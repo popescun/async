@@ -173,3 +173,37 @@ running blocks until the worker is finished rather than leaving it reading freed
 **The poll holds a pointer to each execution added to it**, so an execution withdraws itself in its
 destructor. `execution_poll::remove()` is available for withdrawing one earlier; calling it is not
 required.
+
+## building the tests
+
+```sh
+cmake -S test -B test/build
+cmake --build test/build
+ctest --test-dir test/build
+```
+
+`test/CMakeLists.txt` fetches googletest at configure time, so the first configure needs network
+access. The `actuator` submodule has to be present: `git submodule update --init`.
+
+### sanitizers
+
+`ASYNC_SANITIZE` builds the tests under a sanitizer. It is off by default, because a sanitized build
+is several times slower and ThreadSanitizer does not ship for every toolchain.
+
+```sh
+cmake -S test -B test/build-asan -DASYNC_SANITIZE=address
+cmake --build test/build-asan
+ctest --test-dir test/build-asan
+```
+
+Accepted values are `address`, `thread`, `undefined`, or empty. Anything else is refused at
+configure time rather than passed through to the compiler.
+
+**Use a separate build directory per sanitizer.** `address` and `thread` instrument the same
+accesses in incompatible ways and cannot be combined, so one build directory is one sanitizer.
+
+The two answer different questions. ThreadSanitizer names both sides of a data race, which is how
+the queue's races were diagnosed. AddressSanitizer reports a use-after-free, which is how the
+dangling attachment was. Neither sees everything: a defect reached through a destroyed
+`std::mutex` throws `std::system_error` from inside libsystem before any instrumented load runs, so
+both sanitizers stay silent. Reach for a direct instrumented read when that happens.

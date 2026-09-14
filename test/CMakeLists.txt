@@ -49,7 +49,29 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
 # only observe a queue that has already gone wrong, while -fsanitize=thread names the two racing
 # accesses. Off by default - a sanitized build is several times slower, and TSan does not ship for
 # every toolchain the CI matrix covers.
-set(ASYNC_SANITIZE "" CACHE STRING "Build the tests with a sanitizer: thread, address, or empty")
+set(ASYNC_SANITIZE "" CACHE STRING "Build the tests with a sanitizer: address, thread, undefined, or empty")
+
+# Offered to cmake-gui and ccmake as a drop-down rather than a free-text field.
+set_property(CACHE ASYNC_SANITIZE PROPERTY STRINGS "" address thread undefined)
+
+# Without this, a typo goes straight through as -fsanitize=adress and the compiler reports it a
+# hundred lines later, in terms of a flag the caller never typed.
+set(ASYNC_KNOWN_SANITIZERS address thread undefined)
+if (ASYNC_SANITIZE AND NOT ASYNC_SANITIZE IN_LIST ASYNC_KNOWN_SANITIZERS)
+  message(FATAL_ERROR
+    "ASYNC_SANITIZE is '${ASYNC_SANITIZE}'; expected one of ${ASYNC_KNOWN_SANITIZERS}, or empty.")
+endif()
+
+# address and thread instrument the same accesses in incompatible ways and cannot be combined; one
+# configuration is one sanitizer, so build them in separate directories.
+if (ASYNC_SANITIZE)
+  if (MSVC)
+    message(FATAL_ERROR "ASYNC_SANITIZE uses -fsanitize=, which MSVC does not accept.")
+  endif()
+  message(STATUS "Sanitizer: ${ASYNC_SANITIZE}")
+else()
+  message(STATUS "Sanitizer: none (configure with -DASYNC_SANITIZE=address|thread|undefined)")
+endif()
 
 # async_smoke_test drives the interface by hand and prints what happened; it asserts nothing and
 # only fails by crashing. async_tests is the googletest suite that states expectations.
