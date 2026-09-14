@@ -18,8 +18,9 @@ code unless marked otherwise.
 ## Progress
 
 Done — steps 1 to 13, and step 27 out of order. Step 11 finished what step 4 left of the poll,
-step 12 closed the dangling `bind()` capture, and step 13 closed `attach()`. **Group 2 is complete**:
-every place the header held a raw pointer into another object now learns when that object dies.
+step 12 closed the dangling `bind()` capture, and step 13 closed `attach()`. **Group 2 is
+complete**: every place the header held a raw pointer into another object now learns when that
+object dies.
 **Group 8 is complete** too, forced early by a red CI run.
 
 | Commit | Step |
