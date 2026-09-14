@@ -51,17 +51,17 @@ struct invalid_attachment : std::exception {
    *
    * @param text - A message text, describing the reason of this exception.
    */
-  explicit invalid_attachment(std::string text) : message(std::move(text)) {}
+  explicit invalid_attachment(std::string text) : message_(std::move(text)) {}
 
   /**
    * @brief The message text describing the reason of this exception.
    *
    * @return const char* - The message text.
    */
-  const char* what() const noexcept override { return message.c_str(); }
+  const char* what() const noexcept override { return message_.c_str(); }
 
  private:
-  std::string message;  //!< It holds the message text.
+  std::string message_;  //!< It holds the message text.
 };
 
 /**
@@ -104,12 +104,12 @@ class execution_poll {
    */
   template <typename asyncexecT>
   void add(asyncexecT& async_exec) {
-    std::lock_guard<std::mutex> lock(actuator_mutex);
+    std::lock_guard<std::mutex> lock(actuator_mutex_);
 
-    if (!actuator_is_running.is_connected()) {
-      actuator_is_running = untangle::connect(async_exec.action_is_running);
+    if (!actuator_is_running_.is_connected()) {
+      actuator_is_running_ = untangle::connect(async_exec.action_is_running);
     } else {
-      actuator_is_running.add(&async_exec.action_is_running);
+      actuator_is_running_.add(&async_exec.action_is_running);
     }
   }
 
@@ -123,9 +123,9 @@ class execution_poll {
    */
   template <typename asyncexecT>
   void remove(asyncexecT& async_exec) {
-    std::lock_guard<std::mutex> lock(actuator_mutex);
+    std::lock_guard<std::mutex> lock(actuator_mutex_);
 
-    actuator_is_running.remove(&async_exec.action_is_running);
+    actuator_is_running_.remove(&async_exec.action_is_running);
   }
 
   /**
@@ -134,11 +134,11 @@ class execution_poll {
    * @return true - if at least one \ref execution object in this poll is running.
    */
   auto is_running() {
-    std::lock_guard<std::mutex> lock(actuator_mutex);
-    actuator_is_running();
+    std::lock_guard<std::mutex> lock(actuator_mutex_);
+    actuator_is_running_();
 
     auto result = false;
-    for (const auto& ret : actuator_is_running.results) {
+    for (const auto& ret : actuator_is_running_.results) {
       result |= ret;
     }
     return result;
@@ -157,8 +157,8 @@ class execution_poll {
  private:
   execution_poll() = default;
   ~execution_poll() = default;
-  actuator<std::function<bool(void)>> actuator_is_running;
-  mutable std::mutex actuator_mutex;
+  actuator<std::function<bool(void)>> actuator_is_running_;
+  mutable std::mutex actuator_mutex_;
 };
 
 /**
@@ -179,7 +179,7 @@ class execution {
   // An execution may attach one of a different specialisation - the smoke test attaches an
   // execution<function<void(int)>> to an execution<function<void(void)>> - and that is a different
   // class with no access to this one's members. attach() and detach() need to read and write
-  // attachment_lifetime on it.
+  // attachment_lifetime_ on it.
   template <typename otherActionT>
   friend class execution;
 
@@ -225,10 +225,10 @@ class execution {
    * @param exec_name - A name for this execution.
    */
   explicit execution(std::string exec_name) : name(std::move(exec_name)) {
-    other_this = this;
-    action_execute = untangle::bind(other_this, &execution<actionT>::execute_actions);
-    action_stop = untangle::bind(other_this, &execution<actionT>::stop);
-    action_is_running = untangle::bind(other_this, &execution<actionT>::is_running);
+    other_this_ = this;
+    action_execute = untangle::bind(other_this_, &execution<actionT>::execute_actions);
+    action_stop = untangle::bind(other_this_, &execution<actionT>::stop);
+    action_is_running = untangle::bind(other_this_, &execution<actionT>::is_running);
   }
 
   /**
@@ -241,32 +241,32 @@ class execution {
    * @remark It first takes this execution out of whatever attached it, which is the inverse of
    * \ref attach() and the counterpart of the execution_poll::remove() below.
    *
-   * @remark This is safe only because running is cleared as the very last thing the worker does.
+   * @remark This is safe only because running_ is cleared as the very last thing the worker does.
    * Nothing may be added after it in execute() or loop(): the object can be freed the moment it
    * reads false.
    */
   ~execution() {
     // Out of the attacher first, before the worker is even asked to stop: from here on nothing
     // may reach this object, and the actions about to be destroyed are the ones it holds.
-    if (!attachment_lifetime->attacher.expired()) {
-      attacher_execute->remove(&action_execute);
-      attacher_stop->remove(&action_stop);
+    if (!attachment_lifetime_->attacher.expired()) {
+      attacher_execute_->remove(&action_execute);
+      attacher_stop_->remove(&action_stop);
     }
 
     {
-      std::lock_guard<std::mutex> lock(action_mutex);
-      started = false;
-      stopped = true;
+      std::lock_guard<std::mutex> lock(action_mutex_);
+      started_ = false;
+      stopped_ = true;
     }
 
-    action_cv.notify_all();
+    action_cv_.notify_all();
 
-    while (running.load()) {  // time of check
+    while (running_.load()) {  // time of check
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     // time of use: this object is freed once the destructor returns, so the check above is only
-    // safe because running is the last thing the worker touches
+    // safe because running_ is the last thing the worker touches
     execution_poll::get().remove(*this);
   }
 
@@ -344,13 +344,13 @@ class execution {
   /**
    * @brief Is this execution still working?
    *
-   * False from the moment the worker starts reporting itself finished, which is before `running` is
-   * cleared - the two answer different questions. This one is for callers, and says whether there
-   * is still work going on; `running` is the handshake ~execution() waits on, and says whether the
-   * worker is still touching this object. They were the same answer until the notification needed
-   * to be told the truth about itself.
+   * False from the moment the worker starts reporting itself finished, which is before `running_`
+   * is cleared - the two answer different questions. This one is for callers, and says whether
+   * there is still work going on; `running_` is the handshake ~execution() waits on, and says
+   * whether the worker is still touching this object. They were the same answer until the
+   * notification needed to be told the truth about itself.
    */
-  bool is_running() const { return running.load() && !finishing.load(); }
+  bool is_running() const { return running_.load() && !finishing_.load(); }
 
   /**
    * @brief Is this execution working through its action list?
@@ -373,30 +373,30 @@ class execution {
    * @return true - actions are queued, or one is running.
    */
   bool is_busy() const {
-    std::lock_guard<std::mutex> lock(action_mutex);
-    return !action_list.empty() || executing_action.load();
+    std::lock_guard<std::mutex> lock(action_mutex_);
+    return !action_list_.empty() || executing_action_.load();
   }
 
   void run() {
-    running = true;
-    finishing = false;
-    collecting_results = true;
-    this_thread = std::thread(&execution::execute, this);
-    this_thread.detach();
+    running_ = true;
+    finishing_ = false;
+    collecting_results_ = true;
+    this_thread_ = std::thread(&execution::execute, this);
+    this_thread_.detach();
   }
 
   void start() {
-    running = true;
-    finishing = false;
-    collecting_results = false;
+    running_ = true;
+    finishing_ = false;
+    collecting_results_ = false;
     {
-      std::lock_guard<std::mutex> lock(action_mutex);
-      started = true;
-      stopped = false;
+      std::lock_guard<std::mutex> lock(action_mutex_);
+      started_ = true;
+      stopped_ = false;
     }
 
-    this_thread = std::thread(&execution::loop, this);
-    this_thread.detach();
+    this_thread_ = std::thread(&execution::loop, this);
+    this_thread_.detach();
   }
 
   /**
@@ -407,17 +407,17 @@ class execution {
    */
   void stop() {
     {
-      std::lock_guard<std::mutex> lock(action_mutex);
-      started = false;
-      stopped = true;
+      std::lock_guard<std::mutex> lock(action_mutex_);
+      started_ = false;
+      stopped_ = true;
     }
 
     // The worker drains what is already queued before it leaves loop(), so stop() does not have to
     // spin on the list; waking it is enough.
-    action_cv.notify_all();
+    action_cv_.notify_all();
 
-    if (actuator_stop.is_connected()) {
-      actuator_stop();
+    if (actuator_stop_.is_connected()) {
+      actuator_stop_();
     }
   }
 
@@ -431,19 +431,19 @@ class execution {
   template <typename... Args>
   void add_action(actionT action, Args... args) {
     {
-      std::lock_guard<std::mutex> lock(action_mutex);
+      std::lock_guard<std::mutex> lock(action_mutex_);
 
       // Once stopped, the worker is on its way out and would never reach this action; dropping it
       // here is what keeps it from sitting in the list looking as though it were pending.
-      if (stopped) {
-        std::println(stderr, "warning: execution '{}' is stopped, action not added", name);
+      if (stopped_) {
+        std::println(stderr, "warning: execution '{}' is stopped_, action not added", name);
         return;
       }
 
-      action_list.push_back(std::bind(action, args...));
+      action_list_.push_back(std::bind(action, args...));
     }
 
-    action_cv.notify_one();
+    action_cv_.notify_one();
   }
 
   /**
@@ -477,36 +477,36 @@ class execution {
       throw invalid_attachment("attach: an execution cannot be attached to itself");
     }
 
-    if (!other->attachment_lifetime->attacher.expired()) {
+    if (!other->attachment_lifetime_->attacher.expired()) {
       throw invalid_attachment("attach: that execution is attached already");
     }
 
     // Refusing an execution that has an attacher already leaves every execution with at most one,
     // so the graph is a forest and this new edge closes a cycle exactly when other is somewhere up
     // this execution's own chain of attachers. Walking it is the whole check.
-    for (auto link = attachment_lifetime->attacher.lock(); link; link = link->attacher.lock()) {
-      if (link == other->attachment_lifetime) {
+    for (auto link = attachment_lifetime_->attacher.lock(); link; link = link->attacher.lock()) {
+      if (link == other->attachment_lifetime_) {
         throw invalid_attachment("attach: the attachment would close a cycle");
       }
     }
 
-    if (!actuator_execute.is_connected()) {
-      actuator_execute = untangle::connect(other->action_execute);
+    if (!actuator_execute_.is_connected()) {
+      actuator_execute_ = untangle::connect(other->action_execute);
     } else {
-      actuator_execute.add(&other->action_execute);
+      actuator_execute_.add(&other->action_execute);
     }
 
-    if (!actuator_stop.is_connected()) {
-      actuator_stop = untangle::connect(other->action_stop);
+    if (!actuator_stop_.is_connected()) {
+      actuator_stop_ = untangle::connect(other->action_stop);
     } else {
-      actuator_stop.add(&other->action_stop);
+      actuator_stop_.add(&other->action_stop);
     }
 
     // What ~execution() needs to take itself back out of these actuators: the link proves this
     // attacher is still there, and the two pointers are only ever followed while it does.
-    other->attachment_lifetime->attacher = attachment_lifetime;
-    other->attacher_execute = &actuator_execute;
-    other->attacher_stop = &actuator_stop;
+    other->attachment_lifetime_->attacher = attachment_lifetime_;
+    other->attacher_execute_ = &actuator_execute_;
+    other->attacher_stop_ = &actuator_stop_;
   }
 
   /**
@@ -525,17 +525,17 @@ class execution {
   bool detach(otherT& other) {
     // The actuator's own action list is the record of what is attached; nothing else has to keep
     // one. An action is stored as a pointer, so the attachment is found by identity.
-    const auto& actions = actuator_execute.actions;
+    const auto& actions = actuator_execute_.actions;
     if (std::find(actions.begin(), actions.end(), &other.action_execute) == actions.end()) {
       return false;
     }
 
-    actuator_execute.remove(&other.action_execute);
-    actuator_stop.remove(&other.action_stop);
+    actuator_execute_.remove(&other.action_execute);
+    actuator_stop_.remove(&other.action_stop);
 
-    other.attachment_lifetime->attacher.reset();
-    other.attacher_execute = nullptr;
-    other.attacher_stop = nullptr;
+    other.attachment_lifetime_->attacher.reset();
+    other.attacher_execute_ = nullptr;
+    other.attacher_stop_ = nullptr;
 
     return true;
   }
@@ -546,7 +546,7 @@ class execution {
    * Read it from on_finished, which fires once the queue has drained and before the execution
    * reports itself finished, so the results are complete by the time the callback can see them.
    *
-   * Returned by value, under results_mutex - the worker appends to the vector as it goes, so
+   * Returned by value, under results_mutex_ - the worker appends to the vector as it goes, so
    * handing out a reference would hand out something being written.
    *
    * @remark Only run() fills this. The continuous worker started by start() does not:
@@ -556,7 +556,7 @@ class execution {
    * @return The results of the most recent run, or empty if none has produced any.
    */
   auto results() const {
-    std::lock_guard<std::mutex> lock(results_mutex);
+    std::lock_guard<std::mutex> lock(results_mutex_);
     return results_;
   }
 
@@ -574,9 +574,10 @@ class execution {
   /**
    * @brief Runs one action, keeping its return value when the action type has one.
    *
-   * The value is kept only while collecting_results is set, which run() does and start() clears.
-   * The worker invokes actions with action_mutex released, and takes results_mutex only here, after
-   * the action has returned - so an action that calls add_action() never meets this lock held.
+   * The value is kept only while collecting_results_ is set, which run() does and start() clears.
+   * The worker invokes actions with action_mutex_ released, and takes results_mutex_ only here,
+   * after the action has returned - so an action that calls add_action() never meets this lock
+   * held.
    */
   void execute_action(queued_action_t& action) {
     if constexpr (std::is_void_v<typename actionT::result_type>) {
@@ -584,8 +585,8 @@ class execution {
     } else {
       auto value = action();
 
-      if (collecting_results) {
-        std::lock_guard<std::mutex> lock(results_mutex);
+      if (collecting_results_) {
+        std::lock_guard<std::mutex> lock(results_mutex_);
         results_.push_back(std::move(value));
       }
     }
@@ -609,18 +610,18 @@ class execution {
       queued_action_t action;
 
       {
-        std::lock_guard<std::mutex> lock(action_mutex);
-        if (action_list.empty()) {
+        std::lock_guard<std::mutex> lock(action_mutex_);
+        if (action_list_.empty()) {
           break;
         }
 
-        action = std::move(action_list.front());
-        action_list.pop_front();
+        action = std::move(action_list_.front());
+        action_list_.pop_front();
 
         // Set here, under the lock that emptied the list, so that there is no instant in which the
         // list reads empty while this action has not yet run. is_busy() takes the same lock, so it
         // sees the pop and this together or neither.
-        executing_action = true;
+        executing_action_ = true;
       }
 
       // An action bound to an object that has since died throws invalid_action. Letting it leave a
@@ -633,15 +634,15 @@ class execution {
                      ia.what());
       }
 
-      executing_action = false;
+      executing_action_ = false;
 
       // Counted whether or not it reported a dead binding: it came off the queue and the queue is
       // what the notification is about.
       ++actions_run;
     }
 
-    if (actuator_execute.is_connected()) {
-      actuator_execute();
+    if (actuator_execute_.is_connected()) {
+      actuator_execute_();
     }
 
     return actions_run;
@@ -661,8 +662,8 @@ class execution {
     {
       // An action may queue another, so a pass that drained can leave more behind it. That is the
       // next batch, not the end of this one.
-      std::lock_guard<std::mutex> lock(action_mutex);
-      if (!action_list.empty()) {
+      std::lock_guard<std::mutex> lock(action_mutex_);
+      if (!action_list_.empty()) {
         return;
       }
     }
@@ -674,38 +675,38 @@ class execution {
     // The results belong to this run: an execution that is run twice reports the second run's
     // results, not both runs' appended together.
     {
-      std::lock_guard<std::mutex> lock(results_mutex);
+      std::lock_guard<std::mutex> lock(results_mutex_);
       results_.clear();
     }
 
     const auto actions_run = execute_actions();
 
     // Set before the callback, not after: the run is over by the time it is told so, and a callback
-    // that asks is_running() has to be told the truth. `running` cannot be cleared here instead -
+    // that asks is_running() has to be told the truth. `running_` cannot be cleared here instead -
     // ~execution() waits on it and may free this object the moment it reads false, so it has to
     // stay the last thing this worker touches.
-    finishing = true;
+    finishing_ = true;
 
-    // Before running is cleared, so a caller waiting on the poll cannot see the execution finish
+    // Before running_ is cleared, so a caller waiting on the poll cannot see the execution finish
     // and read the results before this has filled them.
     notify_finished(actions_run);
 
-    std::cout << "finishing thread" << std::endl;
+    std::cout << "finishing_ thread" << std::endl;
 
-    running = false;
+    running_ = false;
   }
 
   void loop() {
     for (;;) {
       {
-        std::unique_lock<std::mutex> lock(action_mutex);
+        std::unique_lock<std::mutex> lock(action_mutex_);
 
         // A bounded wait rather than a plain one: an attached execution has its own list and no way
         // to notify this condition variable, so the worker still has to look in on it periodically.
-        action_cv.wait_for(lock, std::chrono::milliseconds(10),
-                           [this] { return !action_list.empty() || !started; });
+        action_cv_.wait_for(lock, std::chrono::milliseconds(10),
+                            [this] { return !action_list_.empty() || !started_; });
 
-        if (!started && action_list.empty()) {
+        if (!started_ && action_list_.empty()) {
           break;
         }
       }
@@ -722,43 +723,44 @@ class execution {
     std::cout << "thread finished" << std::endl;
 
     // Must stay last: ~execution() may free this object the moment it reads false.
-    running = false;
+    running_ = false;
   }
 
-  std::thread this_thread;
+  std::thread this_thread_;
 
-  std::atomic_bool started = {false};
-  std::atomic_bool running = {false};
+  std::atomic_bool started_ = {false};
+  std::atomic_bool running_ = {false};
 
   // Set by stop(), and the difference between "not started yet" and "finished for good": actions
   // may be queued before run()/start(), but not after stop().
-  std::atomic_bool stopped = {false};
+  std::atomic_bool stopped_ = {false};
 
-  // action_list, started and stopped are written by every thread that calls add_action() or stop()
-  // and read by the worker; nothing touches them outside this mutex. action_cv is what replaced the
+  // action_list_, started_ and stopped_ are written by every thread that calls add_action() or
+  // stop() and read by the worker; nothing touches them outside this mutex. action_cv_ is what
+  // replaced the
   // spin in loop() and in stop().
-  mutable std::mutex action_mutex;
-  std::condition_variable action_cv;
+  mutable std::mutex action_mutex_;
+  std::condition_variable action_cv_;
 
-  std::list<std::function<typename actionT::result_type(void)>> action_list;
+  std::list<std::function<typename actionT::result_type(void)>> action_list_;
 
   /**
    * @brief The actuator type used for attachments.
    *
    * Named because it is the one type here that does not depend on actionT: \ref action_execute and
    * \ref action_stop are std::function<void(void)> whatever this execution's action type is. That
-   * is what lets \ref attacher_execute and \ref attacher_stop point at an attacher of any
+   * is what lets \ref attacher_execute_ and \ref attacher_stop_ point at an attacher of any
    * specialisation.
    */
   using void_actuator = actuator<std::function<void(void)>>;
 
-  void_actuator actuator_execute;
-  void_actuator actuator_stop;
+  void_actuator actuator_execute_;
+  void_actuator actuator_stop_;
 
   /**
    * @brief This execution's link in the attachment graph, and its liveness token.
    *
-   * Two jobs in one object. `attachment_lifetime->attacher` is the execution that attached this
+   * Two jobs in one object. `attachment_lifetime_->attacher` is the execution that attached this
    * one, which \ref attach() walks up to find a cycle and ~execution() reads to know whether it is
    * still attached to anything. And because it dies with this execution, the std::weak_ptr an
    * attacher holds to it expires exactly then - an execution cannot take a std::weak_ptr to itself,
@@ -768,7 +770,7 @@ class execution {
    * It also serves as this execution's identity when comparing links, which is why it is never
    * null: it is created with the execution and never reset.
    */
-  std::shared_ptr<attachment> attachment_lifetime = std::make_shared<attachment>();
+  std::shared_ptr<attachment> attachment_lifetime_ = std::make_shared<attachment>();
 
   /**
    * @brief The attacher's own actuators, the ones holding this execution's two actions.
@@ -780,11 +782,11 @@ class execution {
    * to name an attacher of any kind.
    *
    * Raw, and safe only in company: they are followed just once, by ~execution(), and only while
-   * `attachment_lifetime->attacher` has not expired - which is exactly while the attacher, and
+   * `attachment_lifetime_->attacher` has not expired - which is exactly while the attacher, and
    * therefore the actuators that are its members, are still there.
    */
-  void_actuator* attacher_execute = nullptr;
-  void_actuator* attacher_stop = nullptr;
+  void_actuator* attacher_execute_ = nullptr;
+  void_actuator* attacher_stop_ = nullptr;
 
   // std::vector cannot hold void type; use an arbitrary type e.g. int
   using resultT = std::conditional<std::is_void<typename actionT::result_type>::value, int,
@@ -803,41 +805,41 @@ class execution {
   /**
    * @brief Guards results_, and only that.
    *
-   * Separate from action_mutex on purpose: the queue and the results are two different things, and
+   * Separate from action_mutex_ on purpose: the queue and the results are two different things, and
    * the worker holds this one only for the push, after an action has returned.
    */
-  mutable std::mutex results_mutex;
+  mutable std::mutex results_mutex_;
 
   /**
    * @brief Whether the worker keeps what the actions return.
    *
-   * Set by run() and cleared by start(), rather than inferred from `started`: which
+   * Set by run() and cleared by start(), rather than inferred from `started_`: which
    * worker is running is not the same question as whether a run is going to hand anything back, and
    * reading one as the other would be a trap for whoever changes the other next.
    */
-  std::atomic_bool collecting_results = {false};
+  std::atomic_bool collecting_results_ = {false};
 
   /**
    * @brief Set by the worker once it is reporting itself finished, and read only by is_running().
    *
-   * It exists because the worker cannot clear `running` before the callback - ~execution() waits on
-   * that and may free the object the moment it reads false - and yet the callback must not be told
-   * the execution is still working. Splitting the two answers is what lets the notification fire
-   * while the object is still guaranteed to be there.
+   * It exists because the worker cannot clear `running_` before the callback - ~execution() waits
+   * on that and may free the object the moment it reads false - and yet the callback must not be
+   * told the execution is still working. Splitting the two answers is what lets the notification
+   * fire while the object is still guaranteed to be there.
    */
-  std::atomic_bool finishing = {false};
+  std::atomic_bool finishing_ = {false};
 
   /**
    * @brief Whether an action that has already left the list is still running.
    *
-   * The worker pops an action under action_mutex and then runs it with the lock released, because
+   * The worker pops an action under action_mutex_ and then runs it with the lock released, because
    * an action is caller code that may take a while and may itself queue more. That leaves a window
    * in which the list is empty and the execution is anything but idle, and this is what closes it
    * for is_busy().
    */
-  std::atomic_bool executing_action = {false};
+  std::atomic_bool executing_action_ = {false};
 
-  execution* other_this;
+  execution* other_this_;
 };
 }  // namespace async
 }  // namespace untangle
