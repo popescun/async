@@ -1,13 +1,14 @@
 # async.hpp — fix plan
 
-**Status (2026-09-14):** 14 of 27 steps done. Steps 1-10 landed in one commit — the queue race and
-the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
+**Status (2026-09-14):** 16 of 27 steps done, the last two uncommitted. Steps 1-10 landed in one
+commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
 `c4843cd` (`bind()` now holds the execution weakly; two new tests).
 Step 13 landed in `2e3a8d0` (`attach()` takes a `shared_ptr`, gains `detach()` and refuses cycles;
-seven new tests), closing group 2. Step 27 landed in `f251acf`, closing group 8.
-**Tests:** 16/16 green — `ctest --test-dir test/build` (baseline was 2/5). AddressSanitizer 16/16;
-ThreadSanitizer 15/16, the one failure being `async_smoke_test`'s own `std::cout` race, which is
+seven new tests), closing group 2. Step 27 landed in `f251acf`, closing group 8. **Steps 14 and 15
+are applied and green in the working tree, not yet committed**, closing group 3.
+**Tests:** 21/21 green — `ctest --test-dir test/build` (baseline was 2/5). AddressSanitizer 21/21, UndefinedBehaviorSanitizer 21/21;
+ThreadSanitizer 20/21, the one failure being `async_smoke_test`'s own `std::cout` race, which is
 step 19 and predates all of this. 30x repeat of the whole suite, no flakes.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 37 pages (was 31), rebuilt with
 `tools/make_doc.sh`.
@@ -17,11 +18,11 @@ code unless marked otherwise.
 
 ## Progress
 
-Done — steps 1 to 13, and step 27 out of order. Step 11 finished what step 4 left of the poll,
+Done — steps 1 to 15, and step 27 out of order. Step 11 finished what step 4 left of the poll,
 step 12 closed the dangling `bind()` capture, and step 13 closed `attach()`. **Group 2 is
 complete**: every place the header held a raw pointer into another object now learns when that
 object dies.
-**Group 8 is complete** too, forced early by a red CI run.
+**Group 8 is complete** too, forced early by a red CI run, and **group 3** with steps 14 and 15.
 
 | Commit | Step |
 |---|---|
@@ -39,10 +40,11 @@ object dies.
 | `c4843cd` | 12 — `bind()` holds the execution weakly, through a `shared_ptr` parameter |
 | `2e3a8d0` | 13 — `attach()` takes a `shared_ptr`, gains `detach()`, refuses cycles |
 | `f251acf` | 27 — CI pins GCC 14 on Linux, which is where `<print>` arrived |
+| *(uncommitted)* | 14, 15 — `_result` becomes a `results` vector, filled by `run()` only |
 
-**NEXT: step 14** — item 7, `_result` is read uninitialised and written unsynchronised (`:447`,
-`:328`, `:348`). Decide it together with step 15, which replaces the single `_result` with a results
-vector and makes half of step 14 moot.
+**NEXT: step 16** — item 11, `on_finished` never fires in continuous mode. Read the step first: it
+and step 20 both press on the ordering convention step 3 introduced, where nothing may touch the
+object after `running = false`. Settle that once, for both.
 
 **Carried forward from step 12, not done there:** the by-value/double-copy half of item 8. The
 `bind()` lambdas still take `auto... args` by value and `std::bind` copies again, so a move-only
@@ -50,7 +52,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 13 steps.** Groups 3 to 7 below; group 8 is closed.
+**Remaining: 11 steps.** Groups 4 to 7 below; groups 1, 2, 3 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -89,9 +91,9 @@ of atomic.
 | 11 ✅ | A | `execution_poll` is a shared mutable singleton with no lock | `:104-137` | CONFIRMED |
 | 12 ✅ | 8 | `bind()` captures the execution by reference | `:53`, `:76` | CONFIRMED (5/5; ASan via probe) |
 | 13 ✅ | 9 | `attach()` stores pointers, has no inverse, no cycle check | `:314-326` | CONFIRMED (ASan; SIGSEGV) |
-| **Group 3 — results** |
-| 14 | 7 | `_result` read uninitialised, written unsynchronised | `:447`, `:328`, `:348` | read-only |
-| 15 | 13 | only the last action's return value survives | `:328`, `:348`, `:447` | read-only |
+| **Group 3 — results (closed)** |
+| 14 ✅ | 7 | `_result` read uninitialised, written unsynchronised | `:447`, `:328`, `:348` | CONFIRMED (0xabababab; TSan) |
+| 15 ✅ | 13 | only the last action's return value survives | `:328`, `:348`, `:447` | CONFIRMED |
 | **Group 4 — notifications** |
 | 16 | 11 | `on_finished` never fires in continuous mode | `:387-388` vs `:396-421` | read-only |
 | 17 | 12 | attached executions report idle while running | `:314-326`, `:379-380` | read-only |
@@ -419,27 +421,65 @@ rebuilt — it is fixed here rather than carried, because it was blocking, not c
 
 ---
 
-## Group 3 — results
+## Group 3 — results (closed)
 
-### Step 14 · item 7 — `_result` read uninitialised, written unsynchronised
-`async.hpp:447` (declaration), `:328` (`result()`), `:348` (write)
+### Step 14 · item 7 — `_result` read uninitialised, written unsynchronised — DONE
+### Step 15 · item 13 — only the last action's return value survives — DONE
+`async.hpp:447` (declaration), `:328` (`result()`), `:348` (write) · CONFIRMED
 
-`typename resultT::type _result;` has no initialiser and no constructor touches it, so `result()`
-before any action has run is undefined behaviour for the `int` substitute and any scalar result
-type. Separately the worker writes it while any thread may read it — the queue is now guarded, but
-this is not.
+**Taken as one step**, as the plan said they should be: step 15 replaces the single `_result` with a
+vector, which removes two of step 14's three defects outright rather than fixing them. Splitting
+would have meant touching the same three lines twice.
 
-> `= {}` on the declaration closes the read. The write needs the same treatment as the queue: either
-> take `action_mutex` around it, or make the whole results question moot with step 15.
+**Empirically, 2026-09-14.** Three defects, each reproduced first:
 
-### Step 15 · item 13 — only the last action's return value survives
-`async.hpp:328`, `:348`, `:447`
+| defect | how it showed |
+|---|---|
+| `_result` indeterminate before any action ran | a stack execution read back `0xabababab`, the pattern written there beforehand, 3/3 |
+| only the last return value survived | 1, 2, 3 queued left `result()` reporting 3 |
+| the write raced the read | TSan: write at `async.hpp:524` (`execute_action`) against read at `:504` (`result()`) |
 
-`_result` is one value that each action overwrites. Queue three actions and two return values are
-lost. `actuator` solves this next door with a `results` vector.
+The first is worth recording. On the heap `_result` read 0 and looked perfectly innocent; it took a
+stack-allocated execution, over memory dirtied on purpose, to show the value was never there. An
+execution may be built on the stack — only `bind()` and `attach()` require shared ownership — so
+that is an ordinary shape, not a contrivance.
 
-> Follow `actuator`: a `results` vector, cleared per run. Supersedes half of step 14, so decide the
-> two together.
+**The fix.** `_result` becomes `std::vector<typename resultT::type> results_`, and `result()`
+becomes `results()`, returning a copy. The uninitialised read stops existing rather than being
+patched: an empty vector has no value to read. The lost return values stop existing too.
+
+**Filled by `run()` only.** The continuous worker started by `start()` does not collect. This is the
+user's decision and deliberate: `loop()` has no point at which a run is over, so there is nothing to
+hand back and nowhere to clear, and collecting there would grow without bound. Deferred until a use
+case wants it. `run()` sets `collecting_results`, `start()` clears it — set explicitly rather than
+inferred from `started`, because which worker is running is not the same question as whether a run
+will hand anything back.
+
+`execute()` clears the vector at the start of a run, so a run reports its own results and not the
+previous run's, and `on_finished` fires after the queue has drained and before `running` is cleared
+— which is what makes the callback the place to read them.
+
+> **A separate `results_mutex`**, not `action_mutex`. The queue and the results are two different
+> things, and the worker takes this one only for the push, after an action has returned — so an
+> action that calls `add_action()` never meets it held. Re-probing the race that TSan found is
+> clean: 2000 actions appended by the worker while another thread read `results()` in a loop, no
+> report.
+
+**Tests**, five cases under `execution_results`: empty before any action runs; every action's result
+kept, in order; available to `on_finished`; cleared between runs; and not filled by the continuous
+worker. The last one pins the deferral, so collecting in `loop()` would have to be a deliberate
+change rather than a drift. Three of the five were red against the stub.
+
+The `on_finished` case asserts on what the callback read, not on what is readable afterwards, since
+that is the contract. The cleared-between-runs case is stated separately because an implementation
+that only ever appends passes the others and fails that one.
+
+**Callers updated:** `async_smoke_test.cpp` read `asyncexec3->result()` in two `on_finished`
+callbacks; both now print the whole vector.
+
+Verified: Debug 21/21, ASan 21/21, UBSan 21/21, TSan 20/21 — the one failure being step 19's
+pre-existing `std::cout` race in `async_smoke_test`. 30x repeat, no flakes. clang-format clean,
+0 doxygen warnings, `doc/refman.pdf` rebuilt.
 
 ---
 

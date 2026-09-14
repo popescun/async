@@ -73,15 +73,23 @@ int main() {
   std::function<void(void)> action_on_finished;
   auto on_finished = [&asyncexec3]() {
     std::cout << "on_finished thread " << std::this_thread::get_id() << std::endl;
-    auto result = asyncexec3->result();
-    std::cout << "result=" << result << std::endl;
+    auto results = asyncexec3->results();
+    std::cout << "results=" << results.size() << " value(s)";
+    for (const auto& value : results) {
+      std::cout << " " << value;
+    }
+    std::cout << std::endl;
   };
 
   // receive on finished by assigning the internal notifier
   asyncexec3->on_finished = [&asyncexec3]() {
     std::cout << "on_finished thread " << std::this_thread::get_id() << std::endl;
-    auto result = asyncexec3->result();
-    std::cout << "result=" << result << std::endl;
+    auto results = asyncexec3->results();
+    std::cout << "results=" << results.size() << " value(s)";
+    for (const auto& value : results) {
+      std::cout << " " << value;
+    }
+    std::cout << std::endl;
   };
 
   auto asyncexec5 = void_exec::create_instance("asyncexec5");

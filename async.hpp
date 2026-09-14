@@ -15,6 +15,7 @@
 #include <print>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace untangle {
 template <typename actionT>
@@ -344,12 +345,14 @@ class execution {
 
   void run() {
     running = true;
+    collecting_results = true;
     this_thread = std::thread(&execution::execute, this);
     this_thread.detach();
   }
 
   void start() {
     running = true;
+    collecting_results = false;
     {
       std::lock_guard<std::mutex> lock(action_mutex);
       started = true;
@@ -501,7 +504,25 @@ class execution {
     return true;
   }
 
-  auto result() { return _result; }
+  /**
+   * @brief The return values of the actions run by run(), in the order they ran.
+   *
+   * Read it from on_finished, which fires once the queue has drained and before the execution
+   * reports itself finished, so the results are complete by the time the callback can see them.
+   *
+   * Returned by value, under results_mutex - the worker appends to the vector as it goes, so
+   * handing out a reference would hand out something being written.
+   *
+   * @remark Only run() fills this. The continuous worker started by start() does not:
+   * it has no point at which a run is over, so there is nothing to hand back and nowhere to clear,
+   * and filling it would grow without bound. Deferred until there is a use case that wants it.
+   *
+   * @return The results of the most recent run, or empty if none has produced any.
+   */
+  auto results() const {
+    std::lock_guard<std::mutex> lock(results_mutex);
+    return results_;
+  }
 
   static constexpr auto default_name = "default_name";  //!< Name of an execution built unnamed.
 
@@ -516,12 +537,21 @@ class execution {
 
   /**
    * @brief Runs one action, keeping its return value when the action type has one.
+   *
+   * The value is kept only while collecting_results is set, which run() does and start() clears.
+   * The worker invokes actions with action_mutex released, and takes results_mutex only here, after
+   * the action has returned - so an action that calls add_action() never meets this lock held.
    */
   void execute_action(queued_action_t& action) {
     if constexpr (std::is_void_v<typename actionT::result_type>) {
       action();
     } else {
-      _result = action();
+      auto value = action();
+
+      if (collecting_results) {
+        std::lock_guard<std::mutex> lock(results_mutex);
+        results_.push_back(std::move(value));
+      }
     }
   }
 
@@ -558,8 +588,17 @@ class execution {
   }
 
   void execute() {
+    // The results belong to this run: an execution that is run twice reports the second run's
+    // results, not both runs' appended together.
+    {
+      std::lock_guard<std::mutex> lock(results_mutex);
+      results_.clear();
+    }
+
     execute_actions();
 
+    // Before running is cleared, so a caller waiting on the poll cannot see the execution finish
+    // and read the results before this has filled them.
     if (on_finished) {
       on_finished();
     }
@@ -661,7 +700,33 @@ class execution {
   // std::vector cannot hold void type; use an arbitrary type e.g. int
   using resultT = std::conditional<std::is_void<typename actionT::result_type>::value, int,
                                    typename actionT::result_type>;
-  resultT::type _result;
+
+  /**
+   * @brief The return values of the current run, in the order the actions ran.
+   *
+   * A vector rather than the single value this used to be: one value meant each action overwrote
+   * the one before it, so a run of three actions reported one result and lost two. It also has no
+   * uninitialised state to read - the single value had no initialiser, and reading it before any
+   * action had run was undefined behaviour for every scalar result type.
+   */
+  std::vector<typename resultT::type> results_;
+
+  /**
+   * @brief Guards results_, and only that.
+   *
+   * Separate from action_mutex on purpose: the queue and the results are two different things, and
+   * the worker holds this one only for the push, after an action has returned.
+   */
+  mutable std::mutex results_mutex;
+
+  /**
+   * @brief Whether the worker keeps what the actions return.
+   *
+   * Set by run() and cleared by start(), rather than inferred from `started`: which
+   * worker is running is not the same question as whether a run is going to hand anything back, and
+   * reading one as the other would be a trap for whoever changes the other next.
+   */
+  std::atomic_bool collecting_results = {false};
 
   execution* other_this;
 };

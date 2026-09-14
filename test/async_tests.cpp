@@ -31,6 +31,7 @@ using namespace std::chrono_literals;
 // qualify the execution type, and the full specialisation does not fit in a line.
 using int_execution = untangle::async::execution<std::function<void(int)>>;
 using void_execution = untangle::async::execution<std::function<void(void)>>;
+using int_ret_execution = untangle::async::execution<std::function<int(int)>>;
 
 /**
  * @brief Waits for a predicate to hold, so a defect is reported as a failure rather than a hang.
@@ -587,4 +588,119 @@ TEST(execution_attach, refuses_a_cycle_that_closes_through_a_third_execution) {
   a->action_execute();
 
   EXPECT_EQ(c_ran.load(), 1) << "a refused attach disturbed an attachment that was already there";
+}
+
+/**
+ * @brief A fresh execution has no results, rather than one indeterminate value.
+ *
+ * `_result` was a bare `typename resultT::type` with no initialiser, and no constructor touched it,
+ * so reading it before any action had run was undefined behaviour for every scalar result type -
+ * and for the `int` that stands in when the action returns void. On the heap it read 0 and looked
+ * innocent; built on a stack that had been written over first, it read back 0xabababab, 3 times out
+ * of 3. An execution may be built on the stack: only bind() and attach() require shared ownership.
+ *
+ * A vector of results has no such state to read. That is the point of this case - not that the
+ * value is now zero, but that there is no value until an action has produced one.
+ */
+TEST(execution_results, are_empty_before_any_action_runs) {
+  const auto exec = int_ret_execution::create_instance("fresh");
+
+  EXPECT_TRUE(exec->results().empty()) << "a fresh execution reported a result no action produced";
+}
+
+/**
+ * @brief Every action's return value is kept, not just the last one.
+ *
+ * `_result` was a single value that each action overwrote, so queueing three actions lost two
+ * return values: 1, 2 and 3 queued left `result()` reporting 3. This is the case that fails against
+ * that header, and it is why the single value becomes a vector rather than gaining a lock.
+ *
+ * The actions are queued before run(), so the worker drains all three in one pass and the run is
+ * over when it reports itself finished.
+ */
+TEST(execution_results, keep_every_action_result) {
+  const auto exec = int_ret_execution::create_instance("three_actions");
+
+  exec->add_action([](int value) { return value; }, 1);
+  exec->add_action([](int value) { return value; }, 2);
+  exec->add_action([](int value) { return value; }, 3);
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(exec->results(), (std::vector<int>{1, 2, 3}))
+      << "the results of a run must be every action's, in the order they ran";
+}
+
+/**
+ * @brief on_finished is where a caller reads the results of a run.
+ *
+ * That is the contract this step is written to: run() collects, on_finished hands over. It fires
+ * after the queue has drained and before the execution reports itself finished, so the results are
+ * complete by the time the callback can see them - the assertion is on what the callback read, not
+ * on what is readable afterwards.
+ */
+TEST(execution_results, are_available_to_on_finished) {
+  const auto exec = int_ret_execution::create_instance("notifying");
+
+  std::vector<int> seen_by_the_callback;
+  exec->on_finished = [&exec, &seen_by_the_callback] { seen_by_the_callback = exec->results(); };
+
+  exec->add_action([](int value) { return value; }, 7);
+  exec->add_action([](int value) { return value; }, 8);
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(seen_by_the_callback, (std::vector<int>{7, 8}))
+      << "on_finished saw the wrong results, or none";
+}
+
+/**
+ * @brief A run reports its own results, not those of the run before it.
+ *
+ * The results belong to one run, so the second run has to start from empty. Stated separately
+ * because an implementation that only ever appends passes the case above and fails this one.
+ */
+TEST(execution_results, are_cleared_between_runs) {
+  const auto exec = int_ret_execution::create_instance("twice");
+
+  exec->add_action([](int value) { return value; }, 1);
+  exec->run();
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the first run did not finish";
+
+  exec->add_action([](int value) { return value; }, 2);
+  exec->run();
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the second run did not finish";
+
+  EXPECT_EQ(exec->results(), (std::vector<int>{2}))
+      << "a run reported a result carried over from the run before it";
+}
+
+/**
+ * @brief The continuous worker does not collect results, deliberately.
+ *
+ * start() has no point at which a run is over, so there is nothing to hand back and nowhere to
+ * clear; collecting there would grow without bound. This is a decision rather than an oversight,
+ * and it is pinned here so that it is changed on purpose if a use case ever wants it.
+ */
+TEST(execution_results, are_not_filled_by_the_continuous_worker) {
+  const auto exec = int_ret_execution::create_instance("continuous");
+
+  exec->start();
+  exec->add_action([](int value) { return value; }, 1);
+  exec->add_action([](int value) { return value; }, 2);
+  exec->stop();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+
+  EXPECT_TRUE(exec->results().empty())
+      << "the continuous worker collected results; that is deferred until something wants them";
 }
