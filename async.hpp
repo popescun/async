@@ -352,6 +352,31 @@ class execution {
    */
   bool is_running() const { return running.load() && !finishing.load(); }
 
+  /**
+   * @brief Is this execution working through its action list?
+   *
+   * True while anything is queued, and while an action taken off the queue is still running - the
+   * gap between those two is why this is not simply a test for an empty list. An execution is busy
+   * from the moment an action is added until the last one has returned.
+   *
+   * Distinct from is_running(), which is about the worker thread. A continuous worker started by
+   * start() is running for its whole life whether or not it has anything to do, so is_running()
+   * cannot answer "has this one got room for more work"; this can. A one-shot run() is both.
+   *
+   * @remark Answers for this execution's own actions. An execution that is triggering others
+   * through attach() reports on its own list, not on theirs - see item 12.
+   *
+   * @remark A true answer is a fact about the instant it was taken, and the execution may drain the
+   * moment after. A false answer is durable only if the caller is the one adding the actions, which
+   * is the case this is written for: asking whether a worker has room before handing it more.
+   *
+   * @return true - actions are queued, or one is running.
+   */
+  bool is_busy() const {
+    std::lock_guard<std::mutex> lock(action_mutex);
+    return !action_list.empty() || executing_action.load();
+  }
+
   void run() {
     running = true;
     finishing = false;
@@ -591,6 +616,11 @@ class execution {
 
         action = std::move(action_list.front());
         action_list.pop_front();
+
+        // Set here, under the lock that emptied the list, so that there is no instant in which the
+        // list reads empty while this action has not yet run. is_busy() takes the same lock, so it
+        // sees the pop and this together or neither.
+        executing_action = true;
       }
 
       // An action bound to an object that has since died throws invalid_action. Letting it leave a
@@ -602,6 +632,8 @@ class execution {
         std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
                      ia.what());
       }
+
+      executing_action = false;
 
       // Counted whether or not it reported a dead binding: it came off the queue and the queue is
       // what the notification is about.
@@ -794,6 +826,16 @@ class execution {
    * while the object is still guaranteed to be there.
    */
   std::atomic_bool finishing = {false};
+
+  /**
+   * @brief Whether an action that has already left the list is still running.
+   *
+   * The worker pops an action under action_mutex and then runs it with the lock released, because
+   * an action is caller code that may take a while and may itself queue more. That leaves a window
+   * in which the list is empty and the execution is anything but idle, and this is what closes it
+   * for is_busy().
+   */
+  std::atomic_bool executing_action = {false};
 
   execution* other_this;
 };

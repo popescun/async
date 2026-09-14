@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-14):** 17 of 27 steps done, the last one uncommitted. Steps 1-10 landed in one
+**Status (2026-09-14):** 17 of 28 steps done, the last one uncommitted. Steps 1-10 landed in one
 commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
 `c4843cd` (`bind()` now holds the execution weakly; two new tests).
@@ -53,7 +53,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 10 steps.** Groups 4 to 7 below; groups 1, 2, 3 and 8 are closed.
+**Remaining: 11 steps.** Groups 4 to 7 below; groups 1, 2, 3 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -62,9 +62,11 @@ the ubuntu job could not compile `<print>` at all, so nothing else could be veri
 back to attached executions having their own list and no way to notify the attacher, but redesigning
 that is a feature decision, not a fix. It is called out where it bites and left alone otherwise.
 
-27 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
+28 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
 one. The audit's numbering is preserved so items stay traceable; findings added while fixing are
-lettered.
+lettered. Step 28 was added on 2026-09-14, after the others. The letter D is unused and skipped:
+nothing in this file or in the history ever claimed it, and reusing a letter that may have meant
+something in the original audit would cost more than the gap does.
 
 **Granularity rule:** steps split by *concern*, not by *edit count*. Where one concern touches
 several sites — item 8's two `bind` overloads, item 14's two `std::cout` calls — it stays one step.
@@ -104,6 +106,7 @@ of atomic.
 | **Group 6 — API contract** |
 | 20 | B | `~execution()` suppressed the implicit moves | `:203` | read-only |
 | 21 | C | a refused action is reported but not returned | `:295-312` | read-only |
+| 28 | G | an action that throws anything but `invalid_action` terminates | `:598-604` | CONFIRMED (terminate) |
 | **Group 7 — hygiene** |
 | 22 | hyg | six more headers used but not included | `:8-14` | read-only |
 | 23 | hyg | `actuator` forward-declared after its own `#include` | `:16-23` | read-only |
@@ -607,6 +610,36 @@ on stderr is better than silence, and less than telling.
 
 > `bool add_action(...)`, threaded back through the `bind()` lambdas. Touches the same two lambdas
 > as step 12, so land them together or accept two passes over the same lines.
+
+### Step 28 · item G — an action that throws anything but `invalid_action` terminates
+`async.hpp:598-604` · CONFIRMED: `libc++abi: terminating due to uncaught exception`
+
+Found on 2026-09-14 while prototyping a thread pool on top of `execution` — see
+`prototypes/README.md`.
+
+`execute_actions()` wraps each action in a `try` that catches `invalid_action` and nothing else, so
+any other exception leaves the detached worker thread and calls `std::terminate`. Probed with a task
+throwing `std::runtime_error`: the process dies, and it dies whatever else was queued.
+
+This is the other half of step 2. That step stopped a *dead binding* from killing the process, which
+was the failure the header could produce by itself, and it was the right fix for what was in front
+of it. What it did not cover is an action whose own body throws — and that is the caller's code, not
+the header's, so nothing constrains what comes out of it.
+
+It has stayed harmless because every action in tree is a binding the header made, and those throw
+`invalid_action` or nothing. It stops being harmless the moment an execution runs arbitrary caller
+code: a pool cannot ship on a worker that dies with the first task that throws, and neither can any
+caller who queues work they did not write.
+
+> Catch `...` around the action, not just `invalid_action`, and keep the worker alive. Then decide
+> what the caller is told, which is the same question step 21 asks about a refused action: the
+> submitter of a task that threw has no more way to learn about it than the submitter of an action
+> that was dropped. **Settle the two together** — one answer for "what happened to the action I
+> gave you", rather than a warning on stderr for one case and a different mechanism for the other.
+
+A warning naming the execution, as step 2 already prints for a dead binding, is the floor. Anything
+better means the results question from steps 14 and 15 reappears for failures, so keep this cheap
+unless there is a use case pushing it.
 
 ---
 

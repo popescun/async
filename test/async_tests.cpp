@@ -852,3 +852,116 @@ TEST(execution_notification, a_drained_batch_does_not_claim_the_worker_stopped) 
   ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
       << "the worker did not finish";
 }
+
+/**
+ * @brief A fresh execution has nothing to do.
+ */
+TEST(execution_busy, a_fresh_execution_is_not_busy) {
+  const auto exec = void_execution::create_instance("fresh");
+
+  EXPECT_FALSE(exec->is_busy()) << "an execution with nothing queued reported itself busy";
+}
+
+/**
+ * @brief A queued action makes an execution busy before any worker has touched it.
+ *
+ * add_action() can be called before run() or start(), so "busy" cannot mean "a worker is running".
+ * It means there is work outstanding.
+ */
+TEST(execution_busy, a_queued_action_makes_an_execution_busy) {
+  const auto exec = void_execution::create_instance("queued");
+
+  exec->add_action([] {});
+
+  EXPECT_TRUE(exec->is_busy()) << "an execution with an action queued reported itself idle";
+}
+
+/**
+ * @brief An execution is busy while an action is running, not only while one is queued.
+ *
+ * This is the case that makes is_busy() more than a test for an empty list. The worker pops an
+ * action under the lock and runs it with the lock released, so between those two the list is empty
+ * and the execution is anything but idle. An implementation that only asked whether the list was
+ * empty would report this execution free and invite a caller to hand it more work.
+ *
+ * The action is held open until the assertion has been made, so the reading cannot be a race
+ * against the action finishing early.
+ */
+TEST(execution_busy, an_execution_is_busy_while_its_last_action_runs) {
+  const auto exec = void_execution::create_instance("running");
+
+  std::atomic_bool action_started = {false};
+  std::atomic_bool may_finish = {false};
+
+  exec->add_action([&action_started, &may_finish] {
+    action_started = true;
+    while (!may_finish.load()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+
+  exec->start();
+
+  ASSERT_TRUE(wait_for([&action_started] { return action_started.load(); }, 2000ms))
+      << "the action never started";
+
+  // The list is empty by now - the worker took the only action off it - and the action is still
+  // running, which is exactly the window under test.
+  EXPECT_TRUE(exec->is_busy()) << "an execution running its last action reported itself idle";
+
+  may_finish = true;
+  exec->stop();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+}
+
+/**
+ * @brief An execution that has drained is free again.
+ *
+ * The counterpart of the case above: busy has to become false on its own, or a caller asking
+ * whether a worker has room would never be told yes twice.
+ */
+TEST(execution_busy, an_execution_is_not_busy_once_its_actions_have_run) {
+  const auto exec = void_execution::create_instance("drained");
+
+  std::atomic_int ran = {0};
+  exec->add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+
+  exec->start();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_busy(); }, 2000ms))
+      << "an execution stayed busy after its actions had run";
+
+  EXPECT_EQ(ran.load(), 1) << "the action did not run";
+
+  exec->stop();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+}
+
+/**
+ * @brief A continuous worker is running whether or not it is busy.
+ *
+ * The two are different questions, and this is the case that says so. is_running() is about the
+ * worker thread and stays true from start() until after stop(); is_busy() is about the work. An
+ * execution that conflated them could not be asked whether it had room for more, which is the
+ * question a pool of executions has to ask.
+ */
+TEST(execution_busy, a_continuous_worker_runs_while_idle) {
+  const auto exec = void_execution::create_instance("idle_but_running");
+
+  exec->start();
+
+  ASSERT_TRUE(wait_for([&exec] { return exec->is_running(); }, 2000ms))
+      << "the worker never started";
+
+  EXPECT_FALSE(exec->is_busy()) << "a worker with nothing queued reported itself busy";
+  EXPECT_TRUE(exec->is_running()) << "a started worker reported itself not running";
+
+  exec->stop();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+}

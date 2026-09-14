@@ -49,8 +49,8 @@ class executor {
       worker next;
       next.exec = worker_execution::create_instance("pool_worker_" + std::to_string(index));
 
-      // The only signal an execution gives that it has run out of work. There is no "ask" - see
-      // the note on free_workers_ below - so the pool has to be told, and this is the telling.
+      // How a worker learns there is more waiting for it. is_busy() answers whether a worker has
+      // room; this is what tells the pool the moment one frees up, without anybody polling.
       next.exec->on_finished = [this, index] { take_next_task(index); };
 
       workers_.push_back(std::move(next));
@@ -65,7 +65,7 @@ class executor {
     {
       std::unique_lock<std::mutex> lock(mutex_);
       accepting_ = false;
-      drained_cv_.wait(lock, [this] { return pending_.empty() && busy_count_ == 0; });
+      drained_cv_.wait(lock, [this] { return pending_.empty() && nothing_running(); });
     }
 
     // Outside the lock: stop() wakes each worker, and a worker waking up runs on_finished, which
@@ -94,7 +94,7 @@ class executor {
     // waiting does not get to overtake them just because a worker happens to be free.
     if (pending_.empty()) {
       for (std::size_t index = 0; index < workers_.size(); ++index) {
-        if (!workers_[index].busy) {
+        if (!workers_[index].exec->is_busy()) {
           give_to_worker(index, std::move(task));
           return true;
         }
@@ -118,25 +118,15 @@ class executor {
 
   struct worker {
     std::shared_ptr<worker_execution> exec;
-
-    /**
-     * @brief Whether this worker has been given a task it has not reported finishing.
-     *
-     * The pool keeps this because an execution cannot be asked. is_running() reports the worker
-     * thread, which in continuous mode is true from start() until after stop() whether or not
-     * there is anything to do, and the action list is private with no accessor. So "free" is a
-     * fact about the pool's dispatching, not a fact read back from the execution.
-     */
-    bool busy = false;
   };
 
   /**
-   * @brief Hands one task to a worker and books it as busy. Call with the mutex held.
+   * @brief Hands one task to a worker. Call with the mutex held.
+   *
+   * The worker is busy from the moment add_action() returns - it says so itself - so nothing has to
+   * be booked here.
    */
   void give_to_worker(std::size_t index, task_t task) {
-    workers_[index].busy = true;
-    ++busy_count_;
-
     // add_action() takes the execution's own action_mutex while this holds mutex_. That is only
     // safe in one direction, and it holds: a worker calls on_finished with action_mutex released,
     // so it never takes mutex_ while holding action_mutex, and the two never form a cycle.
@@ -149,9 +139,6 @@ class executor {
   void take_next_task(std::size_t index) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    workers_[index].busy = false;
-    --busy_count_;
-
     if (!pending_.empty()) {
       task_t next = std::move(pending_.front());
       pending_.pop_front();
@@ -159,9 +146,25 @@ class executor {
       return;
     }
 
-    if (busy_count_ == 0) {
+    if (nothing_running()) {
       drained_cv_.notify_all();
     }
+  }
+
+  /**
+   * @brief Is every worker idle? Call with the mutex held.
+   *
+   * Asked of the workers rather than counted here. A tally of what the pool dispatched would be the
+   * pool's belief about the workers; this is the workers' own answer, and it cannot drift.
+   */
+  bool nothing_running() const {
+    for (const auto& one : workers_) {
+      if (one.exec->is_busy()) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   mutable std::mutex mutex_;
@@ -169,7 +172,6 @@ class executor {
 
   std::deque<task_t> pending_;  //!< Tasks waiting for a worker, in the order submitted.
   std::vector<worker> workers_;
-  std::size_t busy_count_ = 0;
   bool accepting_ = true;
 };
 

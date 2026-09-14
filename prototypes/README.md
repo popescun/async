@@ -16,11 +16,12 @@ clang++ -std=c++23 -g -O0 -I. -Iprototypes prototypes/executor_demo.cpp -o /tmp/
 **Question:** can `execution` serve as the worker in a pool, with a shared queue feeding whichever
 worker frees up next?
 
-**Answer: yes, and the prototype works.** 200 tasks over 4 workers all ran exactly once, spread
+**Answer: yes, and the prototype works** — with one addition to the header, `is_busy()`, which
+came out of this exercise and is described under gap 3. 200 tasks over 4 workers all ran exactly once, spread
 100/100/100/100; submission order is preserved; 4×150ms tasks on 4 workers finish in 156ms against
 ~600ms serial; 400 tasks submitted from 4 threads at once all ran. Clean under AddressSanitizer.
 
-Four gaps turned up, and one of them is a blocker.
+Four gaps turned up. One is now closed, and one of the rest is a blocker.
 
 ### The design
 
@@ -54,23 +55,25 @@ the header's.
 
 With one or two executions this is a latent nuisance. With a pool it is guaranteed.
 
-### Gap 3 — an execution cannot say whether it is free
+### Gap 3 — an execution could not say whether it was free *(closed: `is_busy()`)*
 
-There is no way to ask. `is_running()` reports the *worker thread*, which in continuous mode is true
-from `start()` until after `stop()` whether or not there is anything to do, and `action_list` is
-private with no accessor. So "free" has to be a fact the pool keeps about its own dispatching rather
-than one it reads back.
+There was no way to ask. `is_running()` reports the *worker thread*, which in continuous mode is
+true from `start()` until after `stop()` whether or not there is anything to do, and `action_list`
+is private. So the first version of this pool kept a `busy` flag per worker and a `busy_count_`,
+booked at dispatch and cleared in the callback — the pool's belief about its workers rather than
+anything read back from them.
 
-`on_finished` firing per drained batch — step 16 — is what makes that bookkeeping possible at all.
-Before it, a pool could not have been written this way.
+`execution::is_busy()` replaced all of it. The flag, the count and the bookkeeping are gone; the
+pool asks, and the answer cannot drift from the truth.
 
-The bookkeeping is sound as it stands: `notify_finished()` checks the queue empty under
-`action_mutex`, releases it, then calls `on_finished`, and in that window nothing else can dispatch
-to the worker, because the pool only dispatches to a worker it has marked free and the worker is not
-marked free until the callback runs. That argument depends on the pool being the only thing adding
-actions to its workers, which is worth stating out loud.
+It is not simply a test for an empty list, which is what makes it worth having in the header rather
+than approximated here. The worker pops an action under `action_mutex` and runs it with the lock
+released, so there is a window in which the list is empty and the execution is anything but idle. A
+list-only check reports such a worker free and invites the pool to pile more on it. `is_busy()`
+covers the window with `executing_action`, set under the same lock that empties the list.
 
-A cheap `pending()` on `execution` would remove the need for the argument.
+`on_finished` firing per drained batch — step 16 — is still what tells the pool *the moment* a
+worker frees up, so nothing has to poll.
 
 ### Gap 4 — a refused action is lost silently *(step 21)*
 
