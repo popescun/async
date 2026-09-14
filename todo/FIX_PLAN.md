@@ -1,10 +1,12 @@
 # async.hpp — fix plan
 
-**Status (2026-09-10):** 11 of 27 steps done. Steps 1-10 landed in one commit — the queue race and
+**Status (2026-09-14):** 12 of 27 steps done. Steps 1-10 landed in one commit — the queue race and
 the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
-landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests).
-**Tests:** 7/7 green — `ctest --test-dir test/build` (baseline was 2/5).
-ThreadSanitizer and AddressSanitizer clean over all cases in one process; 50x repeat, no flakes.
+landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
+`c4843cd` (`bind()` now holds the execution weakly; two new tests), closing group 2's second item.
+**Tests:** 9/9 green — `ctest --test-dir test/build`, re-run 2026-09-14 (baseline was 2/5).
+ThreadSanitizer and AddressSanitizer clean over all cases in one process at `c4843cd`; 50x repeat,
+no flakes.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 31 pages (was 23).
 **Source:** audit of 2026-09-10 (4 critical, 5 high, 5 medium, 8 hygiene), findings 1, 2, 3 and 5
 reproduced under TSan/ASan. Items lettered A onwards were found while fixing, and are read from the
@@ -12,7 +14,8 @@ code unless marked otherwise.
 
 ## Progress
 
-Done — steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11. Step 11 finished what step 4 left of the poll.
+Done — steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12. Step 11 finished what step 4 left of the poll;
+step 12 closed the dangling `bind()` capture, leaving group 2 one step from done.
 
 | Commit | Step |
 |---|---|
@@ -27,13 +30,19 @@ Done — steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11. Step 11 finished what step 4 l
 | `60f7970` | 9 — named constructor; `name` is read by the warnings |
 | `60f7970` | 10 — four missing includes added *(partial — see step 22)* |
 | `cfa245d` | 11 — a mutex on execution_poll: add(), remove() and is_running() |
+| `c4843cd` | 12 — `bind()` holds the execution weakly, through a `shared_ptr` parameter |
 
-**NEXT: step 12** — item 8, `bind()` captures the execution by reference (`:53`, `:76`). Read the
-step first: the dangling-capture half is **blocked on an ownership decision**, because a `weak_ptr`
-capture requires `execution` to be held by `shared_ptr`. The by-value/double-copy half is separable
-and can land on its own.
+**NEXT: step 13** — item 9, `attach()` stores pointers, has no inverse and no cycle check
+(`:314-326`). The last of group 2, and the same shape as items 4 and 8 that steps 4 and 12 closed:
+an object holds a raw pointer into another with no way to learn it has died.
 
-**Remaining: 16 steps.** Groups 2 to 8 below.
+**Carried forward from step 12, not done there:** the by-value/double-copy half of item 8. The
+`bind()` lambdas still take `auto... args` by value and `std::bind` copies again, so a move-only
+argument will not compile, and they return a default-constructed result, so an async call to an
+`int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
+together, or accept three passes over the same two lambdas.
+
+**Remaining: 15 steps.** Groups 2 to 8 below.
 
 **Not planned:** the `attach()` design itself. Items 9, 12 and the bounded wait in step 7 all trace
 back to attached executions having their own list and no way to notify the attacher, but redesigning
@@ -67,7 +76,7 @@ of atomic.
 | 10 ✅ | hyg | four headers used but not included | `:10-13` | read-only |
 | **Group 2 — dangling references** |
 | 11 ✅ | A | `execution_poll` is a shared mutable singleton with no lock | `:104-137` | CONFIRMED |
-| 12 | 8 | `bind()` captures the execution by reference | `:53`, `:76` | CONFIRMED (5/5; ASan via probe) |
+| 12 ✅ | 8 | `bind()` captures the execution by reference | `:53`, `:76` | CONFIRMED (5/5; ASan via probe) |
 | 13 | 9 | `attach()` stores pointers, has no inverse, no cycle check | `:314-326` | read-only |
 | **Group 3 — results** |
 | 14 | 7 | `_result` read uninitialised, written unsynchronised | `:447`, `:328`, `:348` | read-only |
@@ -225,8 +234,8 @@ accounted for the counts above, but a test must not count it at all.
 
 **Left open:** `is_running()` could be `const` — the `mutable` on the mutex is already there for it.
 
-### Step 12 · item 8 — `bind()` captures the execution by reference
-`async.hpp:53`, `:76`
+### Step 12 · item 8 — `bind()` captures the execution by reference — DONE
+`async.hpp:53`, `:76` · CONFIRMED: 5/5 in Debug and under ASan; sanitizer named it via probe
 
 Both free `bind()` overloads return `[&async_exec, async_action](auto... args)`. The returned
 `std::function` is typically stored on the bound object, which has no relationship to the
