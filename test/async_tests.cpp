@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -352,4 +353,238 @@ TEST(execution_binding, a_function_action_does_not_reach_a_destroyed_execution) 
       << "an action outliving its execution must report a dead binding, not follow it";
 
   EXPECT_EQ(calls.load(), 0) << "an action bound to a destroyed execution appeared to run";
+}
+
+/**
+ * @brief An attacher does not reach into an attached execution that has been destroyed.
+ *
+ * attach() hands the attacher's actuator a raw `&other.action_execute` - a pointer into the
+ * attached object. There is no detach(), and ~execution() withdraws from execution_poll but not
+ * from anything that attached it, so the attacher goes on holding that pointer after the target
+ * is gone. Driving the attacher then dereferences it: actuator::operator() reads `*action` to test
+ * the std::function for emptiness before invoking it, and that read lands in freed memory.
+ *
+ * The contract asserted here is the one step 4 applied to execution_poll and step 12 to bind():
+ * an object that holds a pointer into another must learn when that other dies. A destroyed
+ * attached execution must simply drop out of its attacher, leaving the rest of the attachment
+ * list working.
+ *
+ * @attention Measured 2026-09-14. Under -DASYNC_SANITIZE=address this case fails 3/3, exit 134,
+ * as `heap-use-after-free` - a READ of size 8 at actuator.hpp:134, the `!*action` emptiness test,
+ * reached from execution::execute_actions() (async.hpp:410). That is the reproduction, and it is
+ * deterministic.
+ *
+ * In a plain Debug build the same read is undefined rather than diagnosed, and it behaves like it:
+ * 5 runs gave SIGSEGV, SIGBUS, clean, SIGBUS, clean. So this case does fail without a sanitizer,
+ * but only about three times in five and as a crashed process rather than a reported expectation.
+ * Configure with the sanitizer to see it named. The two expectations below are what must hold once
+ * the dead entry is dropped; neither of them is what fails today.
+ */
+TEST(execution_attach, does_not_reach_an_attached_execution_that_has_been_destroyed) {
+  auto attacher = void_execution::create_instance("attacher");
+  auto survivor = void_execution::create_instance("survivor");
+
+  // Held by shared_ptr so the counter outlives the execution whose action increments it; the
+  // action must not run, and reading the count must not itself be a use-after-free.
+  auto short_lived_ran = std::make_shared<std::atomic_int>(0);
+  std::atomic_int survivor_ran = {0};
+
+  {
+    auto short_lived = void_execution::create_instance("short_lived");
+    short_lived->add_action(
+        [short_lived_ran] { short_lived_ran->fetch_add(1, std::memory_order_relaxed); });
+
+    // Attached first, so it is the first entry the actuator walks: the dead entry has to be
+    // stepped over for the survivor behind it to run at all.
+    attacher->attach(short_lived);
+  }  // short_lived is gone; attacher still points at its action_execute
+
+  survivor->add_action([&survivor_ran] { survivor_ran.fetch_add(1, std::memory_order_relaxed); });
+  attacher->attach(survivor);
+
+  // action_execute is the public seam onto execute_actions(), which is what triggers the attached
+  // executions. Driving it directly keeps the case synchronous - no worker, no waiting, and the
+  // dangling read happens on this thread where the sanitizer attributes it to this line.
+  attacher->action_execute();
+
+  EXPECT_EQ(short_lived_ran->load(), 0)
+      << "an action pending on a destroyed attached execution appeared to run";
+
+  EXPECT_EQ(survivor_ran.load(), 1)
+      << "a live attached execution must still be triggered past a destroyed one";
+}
+
+/**
+ * @brief attach() refuses an attachment that would close a cycle.
+ *
+ * `a.attach(b); b.attach(a);` is accepted today, and driving either one recurses until the stack
+ * is gone: execute_actions() triggers the attached action_execute, which is execute_actions() on
+ * the other object, which triggers this one. Probed 2026-09-14 - SIGSEGV, exit 139 in a plain
+ * Debug build, and `stack-overflow` under AddressSanitizer. Self-attachment is the same defect
+ * with one object and fails the same way, exit 139.
+ *
+ * A cycle is a caller error at attach() time, not a run-time condition to be survived, so the
+ * contract asserted is that attach() rejects it there - where the caller still has a stack to be
+ * told on - rather than that the recursion is somehow bounded later.
+ *
+ * @remark The cycle is deliberately never driven. Today both calls succeed, so on failure this
+ * case leaves two mutually attached executions behind; letting the worker or a direct
+ * action_execute() reach them would replace a reported failure with a crashed test process.
+ * ~execution() does not trigger the attachment, so returning from here is safe.
+ *
+ * @remark untangle::async::invalid_attachment is the type asserted, deliberately not
+ * untangle::invalid_action: that one reports a binding whose target has died, and
+ * execute_actions() swallows it by design. A cycle is a caller error and must not be swallowed.
+ */
+TEST(execution_attach, refuses_an_attach_that_would_close_a_cycle) {
+  auto a = void_execution::create_instance("a");
+  auto b = void_execution::create_instance("b");
+
+  a->attach(b);  // the first direction is legitimate and must keep working
+
+  EXPECT_THROW(b->attach(a), untangle::async::invalid_attachment)
+      << "attaching a to b and b to a closes a cycle that recurses until the stack is gone";
+
+  auto self = void_execution::create_instance("self");
+
+  EXPECT_THROW(self->attach(self), untangle::async::invalid_attachment)
+      << "an execution attached to itself is the same cycle with one object";
+}
+
+/**
+ * @brief detach() is attach()'s inverse: a detached execution stops being triggered.
+ *
+ * attach() had no inverse at all, which is half of why a destroyed attached execution could not
+ * get out of its attacher. An explicit detach() is the other half of that fix, and is the contract
+ * a caller needs in its own right - an attachment that can only ever be added is a leak of
+ * behaviour, not just of memory.
+ *
+ * The action is queued on the attached execution and never drained by a worker of its own, so the
+ * only thing that can run it is the attacher reaching in. That makes the count a direct reading of
+ * whether the attachment is still live.
+ */
+TEST(execution_attach, detach_stops_an_attached_execution_from_being_triggered) {
+  auto attacher = void_execution::create_instance("attacher");
+  auto attached = void_execution::create_instance("attached");
+
+  std::atomic_int attached_ran = {0};
+  attached->add_action([&attached_ran] { attached_ran.fetch_add(1, std::memory_order_relaxed); });
+
+  attacher->attach(attached);
+
+  EXPECT_TRUE(attacher->detach(*attached))
+      << "detach() must report that it removed an attachment this execution actually held";
+
+  attacher->action_execute();
+
+  EXPECT_EQ(attached_ran.load(), 0) << "a detached execution was still triggered by its attacher";
+}
+
+/**
+ * @brief detach() unwires the stop path too, not only the execute path.
+ *
+ * attach() wires two actuators - actuator_execute and actuator_stop - so an inverse that forgot
+ * the second would leave the attacher still able to stop an execution it no longer drives. That
+ * is observable without reaching into the header: stop() is final for an execution, because
+ * add_action() refuses everything once stopped is set. So an execution that still accepts and runs
+ * an action after its former attacher has stopped is one the stop did not reach.
+ */
+TEST(execution_attach, detach_unwires_the_stop_path_as_well) {
+  auto attacher = void_execution::create_instance("attacher");
+  auto attached = void_execution::create_instance("attached");
+
+  attacher->attach(attached);
+  attacher->detach(*attached);
+
+  attacher->stop();  // would propagate to attached while the attachment stood
+
+  std::atomic_int attached_ran = {0};
+  attached->add_action([&attached_ran] { attached_ran.fetch_add(1, std::memory_order_relaxed); });
+  attached->action_execute();
+
+  EXPECT_EQ(attached_ran.load(), 1)
+      << "a detached execution was stopped by its former attacher, so it refused the action";
+}
+
+/**
+ * @brief Detaching an execution that was never attached is answered, not an error.
+ *
+ * The caller gets false rather than an exception: asking to remove an attachment that is not there
+ * leaves exactly the state the caller wanted, so there is nothing to report as a failure. Stated
+ * as its own case because it is the boundary an implementation is most likely to get wrong once
+ * detach() starts erasing from the actuator's list.
+ *
+ * @remark This case passes against the stub, which returns false for everything. It is here to
+ * pin the contract, not to reproduce the defect.
+ */
+TEST(execution_attach, detaching_an_execution_that_was_never_attached_reports_false) {
+  auto attacher = void_execution::create_instance("attacher");
+  auto stranger = void_execution::create_instance("stranger");
+
+  EXPECT_FALSE(attacher->detach(*stranger))
+      << "detach() claimed to have removed an attachment that was never made";
+}
+
+/**
+ * @brief A chain of attachments is legitimate, and the whole of it runs.
+ *
+ * a -> b -> c is not a cycle and must keep working: nothing in the cycle check may refuse it, and
+ * driving the head has to reach all the way down. execute_actions() runs this execution's own
+ * actions and then triggers whatever is attached, so each link in turn drains its own queue - which
+ * is what the two counts below read.
+ *
+ * This is the case the cycle check has to leave alone, so it is stated on its own rather than as a
+ * setup step inside the refusal case.
+ */
+TEST(execution_attach, allows_a_chain_of_attached_executions) {
+  auto a = void_execution::create_instance("a");
+  auto b = void_execution::create_instance("b");
+  auto c = void_execution::create_instance("c");
+
+  a->attach(b);
+  b->attach(c);
+
+  std::atomic_int b_ran = {0};
+  std::atomic_int c_ran = {0};
+  b->add_action([&b_ran] { b_ran.fetch_add(1, std::memory_order_relaxed); });
+  c->add_action([&c_ran] { c_ran.fetch_add(1, std::memory_order_relaxed); });
+
+  a->action_execute();  // the head of the chain, driven once
+
+  EXPECT_EQ(b_ran.load(), 1) << "the attached execution was not triggered by its attacher";
+  EXPECT_EQ(c_ran.load(), 1) << "the chain stopped at the first link instead of running through";
+}
+
+/**
+ * @brief Closing that chain into a cycle is refused.
+ *
+ * The two-object case is the one that is easy to spot by eye, and it was the only one caught while
+ * attach() compared an execution against its own attacher and stopped there. A chain that comes
+ * back round is the same defect and recurses the same way.
+ *
+ * Refusing an execution that already has an attacher leaves every execution with at most one, so
+ * the attachment graph is a forest and the only cycle that can be built is one that attaches the
+ * root of its own chain - every other ancestor is refused as attached already. attach() therefore
+ * walks up the chain of attachers rather than looking one step back.
+ *
+ * @remark Three deep on purpose. With a -> b -> c, `c` attaching `a` has to walk past `b` to find
+ * it, which a one-step check cannot do.
+ */
+TEST(execution_attach, refuses_a_cycle_that_closes_through_a_third_execution) {
+  auto a = void_execution::create_instance("a");
+  auto b = void_execution::create_instance("b");
+  auto c = void_execution::create_instance("c");
+
+  a->attach(b);
+  b->attach(c);  // a -> b -> c, the chain the case above shows is legitimate
+
+  EXPECT_THROW(c->attach(a), untangle::async::invalid_attachment)
+      << "a -> b -> c -> a closes a cycle just as surely as a -> b -> a";
+
+  // The chain itself must survive the refusal: a rejected attach may not leave anything half done.
+  std::atomic_int c_ran = {0};
+  c->add_action([&c_ran] { c_ran.fetch_add(1, std::memory_order_relaxed); });
+  a->action_execute();
+
+  EXPECT_EQ(c_ran.load(), 1) << "a refused attach disturbed an attachment that was already there";
 }

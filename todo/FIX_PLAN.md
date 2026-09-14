@@ -1,21 +1,24 @@
 # async.hpp — fix plan
 
-**Status (2026-09-14):** 12 of 27 steps done. Steps 1-10 landed in one commit — the queue race and
-the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
-landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
-`c4843cd` (`bind()` now holds the execution weakly; two new tests), closing group 2's second item.
-**Tests:** 9/9 green — `ctest --test-dir test/build`, re-run 2026-09-14 (baseline was 2/5).
-ThreadSanitizer and AddressSanitizer clean over all cases in one process at `c4843cd`; 50x repeat,
-no flakes.
-**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 31 pages (was 23).
+**Status (2026-09-14):** 13 of 27 steps done, the last of them uncommitted. Steps 1-10 landed in one
+commit — the queue race and the worker lifetime, which were the four critical findings and two of
+the five high ones. Step 11 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new
+tests). Step 12 landed in `c4843cd` (`bind()` now holds the execution weakly; two new tests).
+**Step 13 is applied and green in the working tree, not yet committed**, and closes group 2.
+**Tests:** 16/16 green — `ctest --test-dir test/build` (baseline was 2/5). AddressSanitizer 16/16;
+ThreadSanitizer 15/16, the one failure being `async_smoke_test`'s own `std::cout` race, which is
+step 19 and predates all of this. 30x repeat of the whole suite, no flakes.
+**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 37 pages (was 31), rebuilt with
+`tools/make_doc.sh`.
 **Source:** audit of 2026-09-10 (4 critical, 5 high, 5 medium, 8 hygiene), findings 1, 2, 3 and 5
 reproduced under TSan/ASan. Items lettered A onwards were found while fixing, and are read from the
 code unless marked otherwise.
 
 ## Progress
 
-Done — steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12. Step 11 finished what step 4 left of the poll;
-step 12 closed the dangling `bind()` capture, leaving group 2 one step from done.
+Done — steps 1 to 13. Step 11 finished what step 4 left of the poll, step 12 closed the dangling
+`bind()` capture, and step 13 closed `attach()`. **Group 2 is complete**: every place the header
+held a raw pointer into another object now learns when that object dies.
 
 | Commit | Step |
 |---|---|
@@ -31,10 +34,11 @@ step 12 closed the dangling `bind()` capture, leaving group 2 one step from done
 | `60f7970` | 10 — four missing includes added *(partial — see step 22)* |
 | `cfa245d` | 11 — a mutex on execution_poll: add(), remove() and is_running() |
 | `c4843cd` | 12 — `bind()` holds the execution weakly, through a `shared_ptr` parameter |
+| *(uncommitted)* | 13 — `attach()` takes a `shared_ptr`, gains `detach()`, refuses cycles |
 
-**NEXT: step 13** — item 9, `attach()` stores pointers, has no inverse and no cycle check
-(`:314-326`). The last of group 2, and the same shape as items 4 and 8 that steps 4 and 12 closed:
-an object holds a raw pointer into another with no way to learn it has died.
+**NEXT: step 14** — item 7, `_result` is read uninitialised and written unsynchronised (`:447`,
+`:328`, `:348`). Decide it together with step 15, which replaces the single `_result` with a results
+vector and makes half of step 14 moot.
 
 **Carried forward from step 12, not done there:** the by-value/double-copy half of item 8. The
 `bind()` lambdas still take `auto... args` by value and `std::bind` copies again, so a move-only
@@ -42,7 +46,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 15 steps.** Groups 2 to 8 below.
+**Remaining: 14 steps.** Groups 3 to 8 below.
 
 **Not planned:** the `attach()` design itself. Items 9, 12 and the bounded wait in step 7 all trace
 back to attached executions having their own list and no way to notify the attacher, but redesigning
@@ -74,10 +78,10 @@ of atomic.
 | 8 ✅ | hyg | SFINAE pair required default-constructible | `:340-352` | read-only |
 | 9 ✅ | hyg | `name` was never read by anything | `:186-191`, `:336` | read-only |
 | 10 ✅ | hyg | four headers used but not included | `:10-13` | read-only |
-| **Group 2 — dangling references** |
+| **Group 2 — dangling references (closed)** |
 | 11 ✅ | A | `execution_poll` is a shared mutable singleton with no lock | `:104-137` | CONFIRMED |
 | 12 ✅ | 8 | `bind()` captures the execution by reference | `:53`, `:76` | CONFIRMED (5/5; ASan via probe) |
-| 13 | 9 | `attach()` stores pointers, has no inverse, no cycle check | `:314-326` | read-only |
+| 13 ✅ | 9 | `attach()` stores pointers, has no inverse, no cycle check | `:314-326` | CONFIRMED (ASan; SIGSEGV) |
 | **Group 3 — results** |
 | 14 | 7 | `_result` read uninitialised, written unsynchronised | `:447`, `:328`, `:348` | read-only |
 | 15 | 13 | only the last action's return value survives | `:328`, `:348`, `:447` | read-only |
@@ -314,15 +318,97 @@ on whichever thread drops the temporary.
 > the lambda returns a default-constructed result, so an async call to an `int`-returning method
 > yields 0. Lands as `auto&&... args` with perfect forwarding.
 
-### Step 13 · item 9 — `attach()` stores pointers, has no inverse, no cycle check
-`async.hpp:314-326`
+### Step 13 · item 9 — `attach()` stores pointers, has no inverse, no cycle check — DONE
+`async.hpp:314-326` · CONFIRMED: ASan `heap-use-after-free`; SIGSEGV for the cycle
 
-`attach()` stores `&other.action_execute` and `&other.action_stop`. There is no `detach()`, no
-notification when the attached object dies, and no cycle check: `a.attach(b); b.attach(a);` compiles
-and recurses until the stack is gone.
+`attach()` stored `&other.action_execute` and `&other.action_stop` — pointers into the attached
+object. There was no `detach()`, no notification when the attached object died, and no cycle check.
 
-> `detach()`, plus deregistration from `~execution()` — the same fix as step 4, applied to the other
-> place the header holds pointers into another object. Reject an attach that would close a cycle.
+**Empirically, 2026-09-14.** Three separate defects, each reproduced before anything was written:
+
+| defect | how it showed |
+|---|---|
+| attacher outlives the execution it attached | ASan `heap-use-after-free`, READ of size 8 at `actuator.hpp:134` from `execute_actions()` (`async.hpp:410`) |
+| `a.attach(b); b.attach(a);` then driven | SIGSEGV, exit 139; ASan `stack-overflow` |
+| `a.attach(a)` then driven | SIGSEGV, exit 139 |
+
+The dangling read is the `!*action` emptiness test inside `actuator::operator()`, which dereferences
+the stored pointer before invoking it. Unlike step 12 this one is an instrumented load, so ASan names
+it directly rather than being preempted by `pthread_mutex_lock` — the masking effect noted there does
+not apply here. **In a plain Debug build it is nondeterministic**: five runs gave SIGSEGV, SIGBUS,
+clean, SIGBUS, clean. Configure with `-DASYNC_SANITIZE=address` to see it named, where it is 3/3.
+
+**The fix, in `attach()` and `detach()` only.** `attach()` takes the execution as
+`const std::shared_ptr<otherT>&`, the same trade step 12 made for binding: an execution that no
+`shared_ptr` owns cannot be attached at all. The actuators are still given `&other->action_execute`
+and `&other->action_stop`; what makes that safe is the record left on the other side. The attached
+execution is told which actuators hold it, and `~execution()` takes itself back out of them.
+
+Four members carry that, all on the attached side:
+
+- `attachment_lifetime`, a `std::shared_ptr<attachment>` created with the execution and never reset.
+  `struct attachment` holds one `std::weak_ptr<attachment> attacher` and lives at **namespace scope,
+  not nested in `execution`** — nested would make it one type per specialisation, and heterogeneous
+  attach is load-bearing (the smoke test attaches an `execution<void(int)>` to an
+  `execution<void()>`). It is identity, liveness token and parent link in one object.
+- `attacher_execute` and `attacher_stop`, raw `void_actuator*` to the attacher's two actuators.
+  Raw, and safe only in company: followed once, by `~execution()`, and only while
+  `attachment_lifetime->attacher` has not expired — which is exactly while the attacher, and
+  therefore the actuator members inside it, are still there. They cannot be collapsed into a single
+  `execution*`: that would mean `execution<actionT>*`, the same specialisation, and it fails to
+  compile against the smoke test's heterogeneous attaches. An `actuator<std::function<void(void)>>`
+  is the same type whatever `actionT` is, which is why two pointers work where one does not.
+
+`detach()` needs no record of its own. `untangle::actuator` is a `struct` with no `private:`, so its
+`actions` list — of `action_t*` — is the record of what is attached, and an attachment is found in it
+by identity with `std::find`.
+
+**Cycle rules.** Refused: attaching an execution to itself, attaching one that already has a live
+attacher, and attaching one that is anywhere up this execution's own chain of attachers. The
+once-only rule is what makes the last check a walk rather than a search — every execution has at most
+one attacher, so the graph is a forest. It also narrows the problem more than it first appears: in a
+chain `a→b→c→d`, every ancestor of `d` except the root is already refused as *attached already*, so
+the only cycle that could ever be built is one attaching the root of its own chain. Probed four deep.
+
+> An earlier round caught only the two-object case, because the check compared an execution against
+> its own attacher and stopped there. Walking the chain needed the parent link that
+> `struct attachment` now carries; before it, `attachment_lifetime` was a `shared_ptr` to a bare
+> `char` and the actuator pointers led nowhere useful. Adding the link **removed** a member — the
+> separate `attacher_lifetime` became `attachment_lifetime->attacher` — and removed a rule, the
+> one-step attach-back check being the loop's first iteration.
+
+**Designs tried and dropped**, both green before they were rejected as too much structure:
+
+1. A non-template `attachable` base holding the attachment state, with lists kept symmetric from both
+   ends and a hook in `~execution()`.
+2. The attacher owning weakly-bound lambdas in two `std::map`s keyed by target address, so nothing
+   pointed into the other object and `~execution()` needed no hook at all. Dropped because the
+   actuator's own action list already records what is attached.
+3. A single `attachment_point` struct bundling pointers to the attacher's two actuators — replaced by
+   naming the two actuators directly.
+
+**Tests**, seven cases under `execution_attach`: the dangling attachment; the two-object cycle and
+self-attach; `detach()` unwiring the execute path and, separately, the stop path; detaching something
+never attached; a legitimate `a→b→c` chain running end to end; and that chain refusing to close into
+`a→b→c→a`. The stop-path case is worth its own entry — `stop()` is final for an execution, because
+`add_action()` refuses everything once stopped, so an execution that still accepts an action after
+its former attacher stopped is one the stop did not reach.
+
+> The transitive-cycle case was written after its fix rather than before it. The walk was mutated to
+> a single step to confirm the case has teeth: it fails, while the chain case still passes.
+
+**Left open, deliberately:** `attach()` still has no thread safety, and neither did what it replaced.
+`attach()`, `detach()` and the withdrawal in `~execution()` all assume the attachment graph is edited
+from one thread while the worker only reads it through the actuators.
+
+Verified after the change: Debug 16/16, ASan 16/16, TSan 15/16 — the one failure being step 19's
+pre-existing `std::cout` race in `async_smoke_test`, confirmed by stashing to be present on a clean
+tree. 30x repeat of the whole suite, no flakes. clang-format clean.
+
+`tools/make_doc.sh` fails the build on any documentation warning, so the unresolved
+`\ref execute_actions()` that step 12 left at `async.hpp:282` had to go before the PDF could be
+rebuilt — it is fixed here rather than carried, because it was blocking, not cosmetic.
+`doc/refman.pdf` is regenerated: 37 pages, 0 warnings.
 
 ---
 

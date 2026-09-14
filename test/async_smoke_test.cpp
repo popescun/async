@@ -56,12 +56,12 @@ int main() {
   // attach other async execution that will run in the same thread
   auto asyncexec1 = int_exec::create_instance("asyncexec1");
   int_exec::bind_action_and_method(a->async_f_with_arg, a, &A::f_with_arg, asyncexec1);
-  asyncexec->attach(*asyncexec1);
+  asyncexec->attach(asyncexec1);
   a->async_f_with_arg(10);
 
   auto asyncexec2 = int_int_exec::create_instance("asyncexec2");
   int_int_exec::bind_action_and_method(a->async_f_with_arg_2, a, &A::f_with_arg_2, asyncexec2);
-  asyncexec->attach(*asyncexec2);
+  asyncexec->attach(asyncexec2);
   a->async_f_with_arg_2(20, 30);
 
   auto asyncexec3 = int_ret_exec::create_instance("asyncexec3");
@@ -86,7 +86,7 @@ int main() {
 
   auto asyncexec5 = void_exec::create_instance("asyncexec5");
   void_exec::bind_action_and_function(action_on_finished, on_finished, asyncexec5);
-  asyncexec3->attach(*asyncexec5);
+  asyncexec3->attach(asyncexec5);
   action_on_finished();
 
   untangle::async::execution_poll::get().add(*asyncexec);
