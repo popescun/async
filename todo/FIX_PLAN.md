@@ -1,14 +1,15 @@
 # async.hpp — fix plan
 
-**Status (2026-09-14):** 16 of 27 steps done, the last two uncommitted. Steps 1-10 landed in one
+**Status (2026-09-14):** 17 of 27 steps done, the last one uncommitted. Steps 1-10 landed in one
 commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
 `c4843cd` (`bind()` now holds the execution weakly; two new tests).
 Step 13 landed in `2e3a8d0` (`attach()` takes a `shared_ptr`, gains `detach()` and refuses cycles;
-seven new tests), closing group 2. Step 27 landed in `f251acf`, closing group 8. **Steps 14 and 15
-are applied and green in the working tree, not yet committed**, closing group 3.
-**Tests:** 21/21 green — `ctest --test-dir test/build` (baseline was 2/5). AddressSanitizer 21/21, UndefinedBehaviorSanitizer 21/21;
-ThreadSanitizer 20/21, the one failure being `async_smoke_test`'s own `std::cout` race, which is
+seven new tests), closing group 2. Step 27 landed in `f251acf`, closing group 8. Steps 14 and 15 landed in
+`f37ee83` (a `results` vector filled by `run()`; five new tests), closing group 3. **Step 16 is
+applied and green in the working tree, not yet committed.**
+**Tests:** 26/26 green — `ctest --test-dir test/build` (baseline was 2/5). AddressSanitizer 26/26;
+ThreadSanitizer 25/26, the one failure being `async_smoke_test`'s own `std::cout` race, which is
 step 19 and predates all of this. 30x repeat of the whole suite, no flakes.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 37 pages (was 31), rebuilt with
 `tools/make_doc.sh`.
@@ -18,7 +19,7 @@ code unless marked otherwise.
 
 ## Progress
 
-Done — steps 1 to 15, and step 27 out of order. Step 11 finished what step 4 left of the poll,
+Done — steps 1 to 16, and step 27 out of order. Step 11 finished what step 4 left of the poll,
 step 12 closed the dangling `bind()` capture, and step 13 closed `attach()`. **Group 2 is
 complete**: every place the header held a raw pointer into another object now learns when that
 object dies.
@@ -40,11 +41,11 @@ object dies.
 | `c4843cd` | 12 — `bind()` holds the execution weakly, through a `shared_ptr` parameter |
 | `2e3a8d0` | 13 — `attach()` takes a `shared_ptr`, gains `detach()`, refuses cycles |
 | `f251acf` | 27 — CI pins GCC 14 on Linux, which is where `<print>` arrived |
-| *(uncommitted)* | 14, 15 — `_result` becomes a `results` vector, filled by `run()` only |
+| `f37ee83` | 14, 15 — `_result` becomes a `results` vector, filled by `run()` only |
+| *(uncommitted)* | 16 — `on_finished` fires per drained batch, and is told the truth |
 
-**NEXT: step 16** — item 11, `on_finished` never fires in continuous mode. Read the step first: it
-and step 20 both press on the ordering convention step 3 introduced, where nothing may touch the
-object after `running = false`. Settle that once, for both.
+**NEXT: step 17** — item 12, attached executions report idle while running (`:314-326`, `:379-380`).
+The last of group 4, and the one step 13 was expected to reshape.
 
 **Carried forward from step 12, not done there:** the by-value/double-copy half of item 8. The
 `bind()` lambdas still take `auto... args` by value and `std::bind` copies again, so a move-only
@@ -52,7 +53,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 11 steps.** Groups 4 to 7 below; groups 1, 2, 3 and 8 are closed.
+**Remaining: 10 steps.** Groups 4 to 7 below; groups 1, 2, 3 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -95,7 +96,7 @@ of atomic.
 | 14 ✅ | 7 | `_result` read uninitialised, written unsynchronised | `:447`, `:328`, `:348` | CONFIRMED (0xabababab; TSan) |
 | 15 ✅ | 13 | only the last action's return value survives | `:328`, `:348`, `:447` | CONFIRMED |
 | **Group 4 — notifications** |
-| 16 | 11 | `on_finished` never fires in continuous mode | `:387-388` vs `:396-421` | read-only |
+| 16 ✅ | 11 | `on_finished` never fires in continuous mode | `:387-388` vs `:396-421` | CONFIRMED (0/3 fired) |
 | 17 | 12 | attached executions report idle while running | `:314-326`, `:379-380` | read-only |
 | **Group 5 — output** |
 | 18 | 14 | the header writes to `std::cout` unsynchronised | `:391`, `:418` | CONFIRMED (TSan) |
@@ -485,17 +486,59 @@ pre-existing `std::cout` race in `async_smoke_test`. 30x repeat, no flakes. clan
 
 ## Group 4 — notifications
 
-### Step 16 · item 11 — `on_finished` never fires in continuous mode
-`async.hpp:387-388` (fires in `execute()`) vs `:396-421` (`loop()` does not call it)
+### Step 16 · item 11 — `on_finished` never fires in continuous mode — DONE
+`async.hpp:387-388` (fires in `execute()`) vs `:396-421` (`loop()` does not call it) · CONFIRMED
 
-A caller who uses `start()`/`stop()` never gets the callback. Where it does fire, it fires *before*
-`running = false`, so a callback that checks `is_running()` sees itself as running.
+Two defects. A caller using `start()`/`stop()` never got the callback — probed 2026-09-14, fired 0
+times out of 3 runs in that mode against 1 out of 1 for `run()`. And where it did fire, it fired
+before `running = false`, so a callback asking `is_running()` was told yes by the very notification
+that it had finished, 3/3.
 
-> Call it from `loop()` too, and after `running = false` — but note the ordering constraint added by
-> step 3: nothing may touch the object after `running = false`, because the destructor may free it
-> the moment it reads false. The callback has to fire before that store and be told the truth some
-> other way, or the destructor needs a different handshake. **This step and step 20 both press on
-> that convention; settle it once.**
+**"Finished" means a batch drained, not that the worker left.** That is the user's decision, and the
+reason is the use it has to serve: waiting for one batch of actions to complete before firing the
+next. A callback that only arrived when the worker ended would be useless for that — getting it
+would mean calling `stop()`, leaving no worker to fire the next batch at.
+
+> `execute_actions()` now returns how many actions it ran, and `loop()` reports a batch through
+> `notify_finished()`. **A pass that ran nothing reports nothing**: the wait in `loop()` is bounded
+> at 10ms so the worker can look in on attached executions, and it calls `execute_actions()` on
+> every pass, so an unguarded notification would arrive about a hundred times a second on an idle
+> execution saying that nothing had happened. A pass that drained but left more behind — an action
+> may queue another — reports nothing either; that is the next batch, not the end of this one.
+
+`run()` is unchanged in what it fires: it drains once and leaves, so per-batch and per-worker are
+the same thing there.
+
+**The ordering needed a second flag.** The callback cannot move below `running = false`, because
+step 3 made `~execution()` wait on that and the object may be freed the moment it reads false. So
+`finishing` is set before the callback and `is_running()` became
+`running && !finishing`. The two now answer different questions: `is_running()` is for callers and
+says whether work is going on, while `running` stays the handshake the destructor waits on and says
+whether the worker is still touching the object. They were the same answer until the notification
+needed to be told the truth about itself.
+
+> **Consequence to keep in mind:** `execution_poll` reads `is_running()`, so it reports an execution
+> idle while its `on_finished` is still running. That is the intended reading — idle means no
+> actions left, and the callback is the caller's own code — and it is safe, because a caller that
+> destroys the execution then still blocks in `~execution()` until the worker clears `running`.
+
+**Tests**, five cases under `execution_notification`: a batch drains and reports, twice over for two
+batches; an idle worker reports nothing across 200ms, which is twenty of those 10ms passes; `run()`
+reports once; `run()`'s callback is not told it is still running; and a drained batch does *not*
+claim the worker has stopped. The last two are separate assertions on purpose — in continuous mode
+a drained batch says nothing about the worker, which is still there waiting for the next one.
+
+**Deferred:** a second signal when the worker actually stops with nothing left to run. Nothing wants
+it yet.
+
+**Correction to this plan.** This step previously said to settle the ordering "once" together with
+step 20. That was wrong: step 20 is about `~execution()` suppressing the implicit moves and does not
+touch this ordering at all. The step it actually couples to is 3, whose destructor handshake is the
+constraint.
+
+Verified: Debug 26/26, ASan 26/26, TSan 25/26 — the one failure being step 19's pre-existing
+`std::cout` race in `async_smoke_test`. 30x repeat, no flakes; clang-format clean, 0 doxygen
+warnings.
 
 ### Step 17 · item 12 — attached executions report idle while running
 `async.hpp:314-326`, `:379-380`

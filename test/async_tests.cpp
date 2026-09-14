@@ -704,3 +704,151 @@ TEST(execution_results, are_not_filled_by_the_continuous_worker) {
   EXPECT_TRUE(exec->results().empty())
       << "the continuous worker collected results; that is deferred until something wants them";
 }
+
+/**
+ * @brief on_finished fires each time a batch of actions drains, not only after run().
+ *
+ * It was called from execute(), the one-shot path, and from nowhere else - so a caller driving the
+ * execution with start() and stop() never heard from it. Probed 2026-09-14: fired 0 times out of 3
+ * runs in that mode, against 1 out of 1 for run().
+ *
+ * "Finished" means the queue this worker was given has drained, which is the signal a caller needs
+ * to fire the next batch once the previous one is done. It is therefore per batch and not per
+ * worker: a callback that only arrived when the worker ended would be useless for that, since
+ * getting it would mean calling stop() and having no worker left to fire the next batch at.
+ *
+ * The batches are kept one pass apart on purpose. execute_actions() drains everything queued in a
+ * single call, so the two actions queued before start() are one batch and one notification; the
+ * third, queued after that notification arrives, is a second batch.
+ */
+TEST(execution_notification, on_finished_fires_each_time_a_batch_drains) {
+  const auto exec = void_execution::create_instance("continuous");
+
+  std::atomic_int fired = {0};
+  exec->on_finished = [&fired] { fired.fetch_add(1, std::memory_order_relaxed); };
+
+  exec->add_action([] {});
+  exec->add_action([] {});
+  exec->start();
+
+  ASSERT_TRUE(wait_for([&fired] { return fired.load() == 1; }, 2000ms))
+      << "the first batch drained without reporting that it had finished";
+
+  exec->add_action([] {});
+
+  ASSERT_TRUE(wait_for([&fired] { return fired.load() == 2; }, 2000ms))
+      << "a second batch drained without reporting that it had finished";
+
+  exec->stop();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(fired.load(), 2) << "stopping an already drained execution reported a third batch";
+}
+
+/**
+ * @brief An idle worker reports nothing.
+ *
+ * loop() does not wait on the condition variable indefinitely - it wakes every 10ms so that it can
+ * look in on attached executions - and it calls execute_actions() on every pass whether or not
+ * anything was queued. A notification per pass would therefore arrive about a hundred times a
+ * second on a completely idle execution, each one reporting that nothing had finished.
+ *
+ * 200ms is twenty of those passes, which is enough for the difference to be unmistakable.
+ */
+TEST(execution_notification, an_idle_worker_reports_nothing) {
+  const auto exec = void_execution::create_instance("idle");
+
+  std::atomic_int fired = {0};
+  exec->on_finished = [&fired] { fired.fetch_add(1, std::memory_order_relaxed); };
+
+  exec->start();
+  std::this_thread::sleep_for(200ms);
+  exec->stop();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(fired.load(), 0) << "an idle worker reported batches that never existed";
+}
+
+/**
+ * @brief run() reports finished exactly once.
+ *
+ * The one-shot path drains once and leaves, so per-batch and per-worker are the same thing here.
+ * Stated so that the cases above are telling us about the continuous worker rather than about a
+ * callback that never fires anywhere.
+ */
+TEST(execution_notification, on_finished_fires_once_per_run) {
+  const auto exec = void_execution::create_instance("one_shot");
+
+  std::atomic_int fired = {0};
+  exec->on_finished = [&fired] { fired.fetch_add(1, std::memory_order_relaxed); };
+
+  exec->add_action([] {});
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(fired.load(), 1) << "a run reported finished more than once, or not at all";
+}
+
+/**
+ * @brief run()'s callback is not told the execution is still running.
+ *
+ * on_finished fired before `running` was cleared, so a callback that asked is_running() was told
+ * yes - by the very notification that it had finished. Probed 3/3.
+ *
+ * The ordering is not free to change the obvious way. Step 3 made ~execution() wait on `running`,
+ * and the object can be freed the moment that reads false, so the worker may not touch anything
+ * afterwards - the callback cannot simply be moved below the store. What the callback is told and
+ * what keeps the object alive have to stop being the same answer.
+ */
+TEST(execution_notification, run_does_not_tell_on_finished_it_is_still_running) {
+  const auto exec = void_execution::create_instance("one_shot");
+
+  std::atomic_bool seen_running = {true};
+  exec->on_finished = [&exec, &seen_running] { seen_running = exec->is_running(); };
+
+  exec->add_action([] {});
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+
+  EXPECT_FALSE(seen_running.load()) << "run()'s on_finished was told the execution was running";
+}
+
+/**
+ * @brief A drained batch does not claim the worker has stopped.
+ *
+ * The counterpart of the case above, and the reason the two are not one assertion: in continuous
+ * mode a drained batch says nothing about the worker, which is still there and waiting for the next
+ * one. is_running() must keep saying so, or a caller waiting for the execution to finish would be
+ * told it had, mid-life.
+ */
+TEST(execution_notification, a_drained_batch_does_not_claim_the_worker_stopped) {
+  const auto exec = void_execution::create_instance("continuous");
+
+  std::atomic_bool seen_running = {false};
+  std::atomic_int fired = {0};
+  exec->on_finished = [&exec, &seen_running, &fired] {
+    seen_running = exec->is_running();
+    fired.fetch_add(1, std::memory_order_relaxed);
+  };
+
+  exec->add_action([] {});
+  exec->start();
+
+  ASSERT_TRUE(wait_for([&fired] { return fired.load() == 1; }, 2000ms))
+      << "the batch drained without reporting that it had finished";
+
+  EXPECT_TRUE(seen_running.load())
+      << "a drained batch reported the worker stopped while it was still running";
+
+  exec->stop();
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+      << "the worker did not finish";
+}

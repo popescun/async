@@ -341,10 +341,20 @@ class execution {
    * @return true - The execution has not finished.
    * @return false - The execution has finished.
    */
-  bool is_running() const { return running.load(); }
+  /**
+   * @brief Is this execution still working?
+   *
+   * False from the moment the worker starts reporting itself finished, which is before `running` is
+   * cleared - the two answer different questions. This one is for callers, and says whether there
+   * is still work going on; `running` is the handshake ~execution() waits on, and says whether the
+   * worker is still touching this object. They were the same answer until the notification needed
+   * to be told the truth about itself.
+   */
+  bool is_running() const { return running.load() && !finishing.load(); }
 
   void run() {
     running = true;
+    finishing = false;
     collecting_results = true;
     this_thread = std::thread(&execution::execute, this);
     this_thread.detach();
@@ -352,6 +362,7 @@ class execution {
 
   void start() {
     running = true;
+    finishing = false;
     collecting_results = false;
     {
       std::lock_guard<std::mutex> lock(action_mutex);
@@ -555,7 +566,18 @@ class execution {
     }
   }
 
-  void execute_actions() {
+  /**
+   * @brief Runs everything queued, and reports how much that was.
+   *
+   * The count is what tells loop() whether a batch actually drained or whether it just woke on the
+   * 10ms tick with nothing to do - the difference between a notification worth sending and a
+   * hundred a second saying nothing happened.
+   *
+   * @return The number of actions run, including any that reported a dead binding.
+   */
+  std::size_t execute_actions() {
+    std::size_t actions_run = 0;
+
     // The action is taken off the list under the lock and invoked with the lock released: an action
     // is caller code that may run for a while, and may itself call add_action().
     for (;;) {
@@ -580,11 +602,40 @@ class execution {
         std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
                      ia.what());
       }
+
+      // Counted whether or not it reported a dead binding: it came off the queue and the queue is
+      // what the notification is about.
+      ++actions_run;
     }
 
     if (actuator_execute.is_connected()) {
       actuator_execute();
     }
+
+    return actions_run;
+  }
+
+  /**
+   * @brief Tells the caller that the queue this worker was given has drained.
+   *
+   * @param actions_run - How many actions the pass ran. Nothing is reported for a pass that ran
+   * none: an idle worker has not finished anything.
+   */
+  void notify_finished(std::size_t actions_run) {
+    if (actions_run == 0 || !on_finished) {
+      return;
+    }
+
+    {
+      // An action may queue another, so a pass that drained can leave more behind it. That is the
+      // next batch, not the end of this one.
+      std::lock_guard<std::mutex> lock(action_mutex);
+      if (!action_list.empty()) {
+        return;
+      }
+    }
+
+    on_finished();
   }
 
   void execute() {
@@ -595,13 +646,17 @@ class execution {
       results_.clear();
     }
 
-    execute_actions();
+    const auto actions_run = execute_actions();
+
+    // Set before the callback, not after: the run is over by the time it is told so, and a callback
+    // that asks is_running() has to be told the truth. `running` cannot be cleared here instead -
+    // ~execution() waits on it and may free this object the moment it reads false, so it has to
+    // stay the last thing this worker touches.
+    finishing = true;
 
     // Before running is cleared, so a caller waiting on the poll cannot see the execution finish
     // and read the results before this has filled them.
-    if (on_finished) {
-      on_finished();
-    }
+    notify_finished(actions_run);
 
     std::cout << "finishing thread" << std::endl;
 
@@ -623,12 +678,14 @@ class execution {
         }
       }
 
-      execute_actions();
+      notify_finished(execute_actions());
     }
 
     // What was queued before stop() still belongs to this execution; nothing can have been added
-    // after it, because add_action() refuses once stopped.
-    execute_actions();
+    // after it, because add_action() refuses once stopped. A batch is a batch whichever side of the
+    // stop it drained on, so it is reported like any other; a stop with nothing left to run reports
+    // nothing, because nothing finished.
+    notify_finished(execute_actions());
 
     std::cout << "thread finished" << std::endl;
 
@@ -727,6 +784,16 @@ class execution {
    * reading one as the other would be a trap for whoever changes the other next.
    */
   std::atomic_bool collecting_results = {false};
+
+  /**
+   * @brief Set by the worker once it is reporting itself finished, and read only by is_running().
+   *
+   * It exists because the worker cannot clear `running` before the callback - ~execution() waits on
+   * that and may free the object the moment it reads false - and yet the callback must not be told
+   * the execution is still working. Splitting the two answers is what lets the notification fire
+   * while the object is still guaranteed to be there.
+   */
+  std::atomic_bool finishing = {false};
 
   execution* other_this;
 };
