@@ -434,28 +434,52 @@ class execution {
   }
 
   /**
-   * @brief
+   * @brief Queues an action for this execution's worker, and says whether it was taken.
    *
-   * @tparam Args
-   * @param action
-   * @param args
+   * The action is bound to \p args here and runs later, on whichever thread drives this execution -
+   * its own worker, or an attacher's. Queueing before run() or start() is normal; the
+   * actions already in the list are what the worker drains first.
+   *
+   * @attention An execution that has been stopped refuses. \ref stop() ends its working life, so an
+   * action accepted afterwards would sit in the list looking pending and never run. **The refusal
+   * is the return value**, and a caller that ignores it loses the action silently - a warning on
+   * stderr is what this used to offer instead, and it is no substitute for an answer.
+   *
+   * @remark A refusal is not untangle::invalid_action, and is deliberately not reported as one.
+   * That
+   * exception means a binding whose target has died - the action itself is broken. Here the action
+   * is sound and the execution is simply closed to new work, which is an answer, not a fault.
+   *
+   * @remark A caller arriving through \ref bind_action_and_method() or
+   * \ref bind_action_and_function() does **not** see this. Those lambdas return
+   * `actionT::result_type`, fixed by the specialisation, so there is nowhere to put a bool; they
+   * still swallow the outcome. Telling that caller is unfinished business, and the same question as
+   * what becomes of an action whose body throws.
+   *
+   * @tparam Args - The argument types the action is bound to.
+   * @param action - The action to queue.
+   * @param args - The arguments to bind to \p action.
+   *
+   * @return true - The action was queued and this execution's worker will run it.
+   * @return false - The execution is stopped and the action was dropped.
    */
   template <typename... Args>
-  void add_action(actionT action, Args... args) {
+  bool add_action(actionT action, Args... args) {
     {
       std::lock_guard<std::mutex> lock(action_mutex_);
 
       // Once stopped, the worker is on its way out and would never reach this action; dropping it
       // here is what keeps it from sitting in the list looking as though it were pending.
       if (stopped_) {
-        std::println(stderr, "warning: execution '{}' is stopped_, action not added", name);
-        return;
+        std::println(stderr, "warning: execution '{}' is stopped, action not added", name);
+        return false;
       }
 
       action_list_.push_back(std::bind(action, args...));
     }
 
     action_cv_.notify_one();
+    return true;
   }
 
   /**

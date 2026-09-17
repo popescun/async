@@ -169,6 +169,72 @@ TEST(execution_queue, refuses_an_action_queued_after_the_worker_stops) {
 }
 
 /**
+ * @brief A refused action tells the caller, rather than only stderr.
+ *
+ * The case above pins that a refused action does not run. This one pins that the caller finds out.
+ * add_action() prints `warning: execution '...' is stopped_, action not added` and returns void, so
+ * there is nothing for a caller to check.
+ *
+ * @attention Measured 2026-09-17. On an execution<function<int(int)>>, a bound call that was queued
+ * and really ran returned 0, and a bound call refused after stop() also returned 0 - the two are
+ * indistinguishable. The accepted one had produced a result; results() held it.
+ *
+ * @remark **A bool, not an exception.** untangle::invalid_action means a binding whose target has
+ * died - the action itself is broken. A refusal is not that: the action is perfectly good and the
+ * execution is simply closed to new work. Throwing it here would make both a catch site and the
+ * exception's own meaning ambiguous. The two cases stay separate answers to two separate questions.
+ *
+ * @remark **This case covers the direct caller only, and cannot cover the bound one.** The lambdas
+ * from bind() return `actionT::result_type`, fixed by the specialisation - void here, int for an
+ * int-returning execution - so a bool cannot be threaded back through them, and the plan's
+ * instruction to do so is not implementable as written. A caller reaching add_action() through
+ * bind() therefore stays untold, which is the half of item 8 carried forward from step 12 and is
+ * the same ground step 28 has to cover for an action that throws.
+ *
+ * @remark The type is asserted rather than assumed so that this case **builds** against the current
+ * header: decltype of a void call is well-formed, so the defect shows up as a failed expectation
+ * instead of a compile error that would take the whole suite down with it. The behaviour below it
+ * is guarded on the same condition, and starts testing once the return type is there to test.
+ */
+TEST(execution_queue, tells_the_caller_when_an_action_is_refused) {
+  using answer_t = decltype(std::declval<int_execution&>().add_action(
+      std::declval<std::function<void(int)>>(), 0));
+
+  EXPECT_TRUE((std::is_same_v<answer_t, bool>))
+      << "add_action() returns void, so a caller cannot learn that its action was refused";
+
+  // In a templated lambda because a discarded `if constexpr` branch is still instantiated outside a
+  // template: written directly in this function, the calls below would fail to compile against the
+  // current void return and take the whole suite down with them.
+  [&]<typename execT = int_execution>() {
+    if constexpr (std::is_same_v<decltype(std::declval<execT&>().add_action(
+                                     std::declval<std::function<void(int)>>(), 0)),
+                                 bool>) {
+      std::atomic_int ran = {0};
+      const auto action = [&ran](int) { ran.fetch_add(1, std::memory_order_relaxed); };
+
+      auto exec = execT::create_instance("refusal_is_reported");
+      exec->start();
+
+      EXPECT_TRUE(exec->add_action(action, 1))
+          << "an action the worker went on to run was reported refused";
+
+      ASSERT_TRUE(wait_for([&ran] { return ran.load() == 1; }, 2000ms))
+          << "the first action never ran, so this case has not reached the refusal it is about";
+
+      exec->stop();
+      ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 5000ms))
+          << "the worker did not stop";
+
+      EXPECT_FALSE(exec->add_action(action, 2))
+          << "an action refused by a stopped execution was reported accepted";
+
+      EXPECT_EQ(ran.load(), 1) << "the refused action ran anyway";
+    }
+  }();
+}
+
+/**
  * @brief stop() ends a worker that has only just been started.
  *
  * loop() sets `started` from inside the worker thread; stop() clears it from the caller. Nothing
