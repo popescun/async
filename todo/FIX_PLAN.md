@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-14):** 17 of 28 steps done, the last one uncommitted. Steps 1-10 landed in one
+**Status (2026-09-17):** 19 of 32 steps done, the last one uncommitted. Steps 1-10 landed in one
 commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
 `c4843cd` (`bind()` now holds the execution weakly; two new tests).
@@ -42,10 +42,19 @@ object dies.
 | `2e3a8d0` | 13 — `attach()` takes a `shared_ptr`, gains `detach()`, refuses cycles |
 | `f251acf` | 27 — CI pins GCC 14 on Linux, which is where `<print>` arrived |
 | `f37ee83` | 14, 15 — `_result` becomes a `results` vector, filled by `run()` only |
-| *(uncommitted)* | 16 — `on_finished` fires per drained batch, and is told the truth |
+| *(uncommitted)* | 16 — `on_finished` fires per drained batch *(half retired by 17)* |
+| *(uncommitted)* | 30 — `loop()` sets `finishing_` after its last drain, as `execute()` does |
+| *(uncommitted)* | 17 — `execute_actions()` raises the notification, so a driven execution reports |
 
-**NEXT: step 17** — item 12, attached executions report idle while running (`:314-326`, `:379-380`).
-The last of group 4, and the one step 13 was expected to reshape.
+**NEXT: step 31** — item J, the comment on the drain after `loop()` breaks, which describes a case
+the break condition prevents. The last of group 4, and the only one left in it: 16, 17 and 30 are
+applied and green in the working tree, none of them committed. It is a comment correction plus one
+decision — whether the unreachable `notify_finished()` wrapper around that drain stays.
+
+**The notification contract changed on 2026-09-17** and is worth reading before touching group 4:
+the callback is raised from inside `execute_actions()`, on the worker's thread, at the moment the
+list empties — so `on_finished` sees `is_running()` true, on both worker paths, and that is
+deliberate. See the note at the end of step 16.
 
 **Carried forward from step 12, not done there:** the by-value/double-copy half of item 8. The
 `bind()` lambdas still take `auto... args` by value and `std::bind` copies again, so a move-only
@@ -53,7 +62,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 11 steps.** Groups 4 to 7 below; groups 1, 2, 3 and 8 are closed.
+**Remaining: 13 steps.** Groups 4 to 7 below; groups 1, 2, 3 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -62,9 +71,11 @@ the ubuntu job could not compile `<print>` at all, so nothing else could be veri
 back to attached executions having their own list and no way to notify the attacher, but redesigning
 that is a feature decision, not a fix. It is called out where it bites and left alone otherwise.
 
-28 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
+32 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
 one. The audit's numbering is preserved so items stay traceable; findings added while fixing are
-lettered. Step 28 was added on 2026-09-14, after the others. The letter D is unused and skipped:
+lettered. Step 28 was added on 2026-09-14, steps 29 to 31 on 2026-09-15 and step 32 on
+2026-09-16, after the others.
+The letter D is unused and skipped:
 nothing in this file or in the history ever claimed it, and reusing a letter that may have meant
 something in the original audit would cost more than the gap does.
 
@@ -99,7 +110,9 @@ of atomic.
 | 15 ✅ | 13 | only the last action's return value survives | `:328`, `:348`, `:447` | CONFIRMED |
 | **Group 4 — notifications** |
 | 16 ✅ | 11 | `on_finished` never fires in continuous mode | `:387-388` vs `:396-421` | CONFIRMED (0/3 fired) |
-| 17 | 12 | attached executions report idle while running | `:314-326`, `:379-380` | read-only |
+| 17 ✅ | 12 | an attached execution's `on_finished` never fires | `:652-671`, `:672-698`, `:700-728` | CONFIRMED (0 fired) |
+| 30 ✅ | I | `loop()` never sets `finishing_` | `:700-728` | CONFIRMED (probe); read-only |
+| 31 | J | the drain after `loop()` breaks can never report a batch | `:718-721` | CONFIRMED (read + probe) |
 | **Group 5 — output** |
 | 18 | 14 | the header writes to `std::cout` unsynchronised | `:391`, `:418` | CONFIRMED (TSan) |
 | 19 | E | the smoke test races on `std::cout` between two workers | `async_smoke_test.cpp:15,24` | CONFIRMED (TSan) |
@@ -107,6 +120,8 @@ of atomic.
 | 20 | B | `~execution()` suppressed the implicit moves | `:203` | read-only |
 | 21 | C | a refused action is reported but not returned | `:295-312` | read-only |
 | 28 | G | an action that throws anything but `invalid_action` terminates | `:598-604` | CONFIRMED (terminate) |
+| 29 | H | the `action_*` members are public internal seams | `:565-567` | read-only |
+| 32 | K | `finishing_` and `running_` may collapse into one state | `:353`, `:732`, `:830` | investigation |
 | **Group 7 — hygiene** |
 | 22 | hyg | six more headers used but not included | `:8-14` | read-only |
 | 23 | hyg | `actuator` forward-declared after its own `#include` | `:16-23` | read-only |
@@ -543,15 +558,188 @@ Verified: Debug 26/26, ASan 26/26, TSan 25/26 — the one failure being step 19'
 `std::cout` race in `async_smoke_test`. 30x repeat, no flakes; clang-format clean, 0 doxygen
 warnings.
 
-### Step 17 · item 12 — attached executions report idle while running
-`async.hpp:314-326`, `:379-380`
+**Half of this step was retired on 2026-09-17, by step 17.** The notification moved *into*
+`execute_actions()` so that an attached execution could be told its own batch had drained, which
+means the callback is now raised the moment the list empties — before `finishing_` is set. So
+**`on_finished` sees `is_running()` true, and that is the contract now**: the callback runs on the
+worker's own thread, with the rest of the worker's path still to go, and a drained batch says
+nothing about the worker on either path. The user decided this on 2026-09-17.
 
-The attacher's worker calls `execute_actions()` on attached objects, but only `run()`/`start()` set
-`running`, and neither is called on an attached execution. The poll reports them idle while they are
-executing, and their `on_finished` never fires either.
+What that changes here: `run()`'s callback *is* told the execution is still running, and the test
+that asserted otherwise is now `a_run_batch_does_not_claim_the_worker_stopped`, asserting the
+opposite. The two cases this step called "separate assertions on purpose" are now two halves of one
+contract, kept apart only because the paths differ.
 
+What survives: `finishing_` itself, and the rest of this step. Its stated reason above — that the
+callback must not be told the execution is still working — is gone, but the other one holds and is
+now the only one. `~execution()` waits on `running_` and may free the object the moment it reads
+false, so `running_` must stay the last thing the worker touches, and a caller polling
+`is_running()` still needs an answer that goes false before the lifetime handshake does. See step 32,
+which asks whether the two flags should collapse now that one of them does less.
+
+### Step 17 · item 12 — an attached execution's `on_finished` never fires — DONE (uncommitted)
+`async.hpp:652-671` (`notify_finished`), `:672-698` (`execute`), `:700-728` (`loop`)
+
+**Narrowed on 2026-09-15**, after probing. The item as written had three parts; two of them are not
+defects, and the title above is what is left. The original wording is kept below so the change is
+traceable.
+
+`notify_finished()` is called from `execute()` and from `loop()`, and an attached execution is in
+neither: the attacher's worker reaches it through `action_execute`, which is `execute_actions()` and
+nothing else. So an attached execution drains batch after batch and reports none of them. Probed
+2026-09-15: `on_finished` fired 0 times for an attached execution across a full run, driven both
+synchronously and by a real `start()`ed attacher.
+
+> Report from where the batch actually drains. The constraint is that `execute()` already calls
+> `execute_actions()` and then `notify_finished()`, so a `notify_finished()` moved inside
+> `execute_actions()` would fire twice per `run()` — guarded by the existing
+> `on_finished_fires_once_per_run`. The rule from step 16 holds here too: a pass that ran nothing
+> reports nothing.
+
+**Applied 2026-09-17**, in the working tree, not yet committed. `execute_actions()` raises the
+notification itself, at the point its list empties, which is the one place every driver passes
+through — a worker in `execute()` or `loop()`, and an attacher's worker arriving via
+`action_execute`. `execute()` no longer notifies separately, which is what keeps `run()` to one
+callback. The count moved onto the object as `actions_run_` (`std::atomic_size_t`), so
+`notify_finished()` takes no argument and can be raised from wherever the pass was driven.
+
+**The notification is raised outside `action_mutex_`**, and that is not incidental: `on_finished` is
+caller code and may call `add_action()`, which takes the same non-recursive mutex. Holding it across
+the callback deadlocks the worker against itself — probed 2026-09-17, `add_action()` never returned,
+the worker never left the drain, and `~execution()` then spun on `running_` for ever. The pass reads
+whether the list emptied under the lock, releases, and notifies.
+
+**A rejected design, recorded so it is not re-proposed.** A separate private `execute_driven_batch()`
+bound to `action_execute`, calling `execute_actions()` then `notify_finished()`. It worked and was
+fully green, but the user turned it down on 2026-09-16 — no new method for this. Kept in the session
+scratchpad as `async_with_step17_fix.hpp`.
+
+**It cost half of step 16.** The callback is now raised before `finishing_` is set, so it sees
+`is_running()` true. That is the contract now, decided 2026-09-17 — see the note at the end of step
+16, and the reframed `a_run_batch_does_not_claim_the_worker_stopped`.
+
+Verified: Debug 33/33; ThreadSanitizer 0 warnings and AddressSanitizer 0 errors across the whole
+suite; 30x repeat, no failures; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh`
+0 warnings, 41 pages.
+
+**Not a defect — `is_running()` false for an attached execution.** `is_running()` is
+`running_ && !finishing_`, and `running_` says whether *this execution's own worker thread* is still
+touching the object — the header says so at `:347-353`, and `is_busy()`'s comment at `:362` turns on
+the same distinction. An attached execution has no worker of its own, so `false` is the documented
+answer, not a wrong one. `is_busy()` is the one that answers "is there work outstanding", and it was
+already correct for attached executions when probed.
+
+**Not a defect — the poll reporting an attached execution idle.** The poll answers for the worker
+threads registered with it, nothing more and nothing less; an execution with no worker contributing
+`false` is that contract working. Registering both an attacher and the executions it drives is fine
+and changes nothing. Decided by the user on 2026-09-15.
+
+**Two rejected designs, recorded so they are not re-proposed.** (a) An attached execution sets
+`running_`/`finishing_` around its own pass so it reports for itself — rejected: it makes
+`is_running()` mean "work is happening" instead of "my worker is alive", which is a different
+question that `is_busy()` already answers. (b) The attacher absorbs the attached work and reports
+for the whole tree — rejected: it needs `action_execute` widened from `std::function<void(void)>` to
+return the count, a public API change, and it makes an execution's answers depend on who attached
+it. A third, making the poll ask `is_running() || is_busy()`, dies with (a): it widens the poll's
+contract past the threads added to it.
+
+**Original wording, from the 2026-09-10 audit:**
+
+> The attacher's worker calls `execute_actions()` on attached objects, but only `run()`/`start()`
+> set `running`, and neither is called on an attached execution. The poll reports them idle while
+> they are executing, and their `on_finished` never fires either.
+>
 > An attached execution should carry the attacher's running state, or the poll should report through
 > the attacher. Depends on how step 13 reshapes `attach()`.
+
+### Step 30 · item I — `loop()` never sets `finishing_` — DONE (uncommitted)
+`async.hpp:700-728` · CONFIRMED by probe; **read-only — no black-box test is possible, see below**
+
+Raised by the user on 2026-09-15, reading the two worker paths against each other. Not an audit
+finding.
+
+`finishing_` separates "my worker has finished" from "my worker is still touching this object", and
+its comment at `:823-826` says it is set by the worker once it is reporting itself finished.
+`execute()` sets it at `:688`. **`loop()` never sets it.** So a continuous worker answers
+`is_running()` true from `start()` until `running_` is cleared, through the break, the drain that
+follows it and everything else it does on the way out.
+
+Measured 2026-09-15: the last `on_finished` of a `run()` saw `is_running()` false; the last
+`on_finished` of a `start()`/`stop()` saw it true, with the worker exiting immediately after.
+
+`finishing_` is read in exactly one place - `is_running()` at `:353` - so that is the whole
+observable effect, and the whole blast radius.
+
+> After the break: drain, **then** set `finishing_`, then notify, then clear `running_` last -
+> exactly `execute()`'s order at `:686-696`.
+>
+> ```
+> const auto actions_run = execute_actions();
+> finishing_ = true;
+> notify_finished(actions_run);
+> ```
+>
+> **Not in `stop()`** - that runs on the caller's thread, and would report the worker finished while
+> it is still draining. Worker-side, as the comment says.
+
+**Not before the drain, which is the trap.** This step first read "set it at the break, before the
+final drain"; the user rejected that on 2026-09-15 and was right. `execute()` runs its actions
+*first* and sets `finishing_` only afterwards, so an execution executing actions reports
+`is_running()` true - and the post-break drain still runs work, because `execute_actions()` ends by
+driving the attacher's actuator (`:645-647`). Setting `finishing_` before it would report an
+execution finished while attached actions were still running under it.
+
+**Why there is no failing test.** With the correct ordering the false window holds only
+`notify_finished(...)` - unreachable, see step 31 - and a `std::cout`. Nothing caller-written runs
+between `finishing_ = true` and the store, so the fix changes nothing observable from outside the
+header today. It is a consistency fix, and it earns its place because the flag's documented meaning
+is not honoured on one of the two worker paths, and because anything later placed in that window -
+step 17's notification seam among them - would be told the wrong thing.
+
+**Guard instead of a reproduction:**
+`execution_lifecycle.an_execution_running_its_last_actions_does_not_report_itself_finished` passes
+today and must keep passing. It samples `is_running()` from an attached execution's action run
+during the post-break drain, and expects **true** - which is what fails if `finishing_` is set too
+early. It does not pin *where* the sample was taken, since mid-loop gives true as well; its value is
+the guard. 30x repeat, no flakes; TSan silent.
+
+**What must also keep passing:** `execution_notification.a_drained_batch_does_not_claim_the_worker_
+stopped`. Mid-loop, a drained batch says nothing about the worker and `is_running()` must stay true.
+
+**Applied 2026-09-16**, in the working tree, not yet committed. `loop()`'s tail now reads as
+`execute()`'s does - the post-break drain is held in `actions_run`, `finishing_` is set after it and
+before `notify_finished()`, and `running_` stays last. Verified: 32/33 Debug, the one failure being
+step 17's own test; ThreadSanitizer 31 passed and **0 warnings** across the whole suite;
+AddressSanitizer the same with 0 errors; 30x repeat of the full suite, exactly one failing test every
+run, no flakes. clang-format clean.
+
+### Step 31 · item J — the drain after `loop()` breaks can never report a batch
+`async.hpp:735-749` · line references refreshed 2026-09-17, after steps 17 and 30 reshaped `loop()`
+
+Found 2026-09-15 while analysing step 30.
+
+`loop()` breaks only when `!started_ && action_list_.empty()` (`:728`), and `add_action()` refuses
+once `stopped_` (`:443`). So by the time control reaches the tail drain, this execution's own list is
+always empty. Nothing can report there by either route: `execute_actions()` raises the notification
+only after an action has run and the list has emptied (`:661`), and the explicit
+`notify_finished()` at `:749` finds `actions_run_` still 0. The comment above it - "What was queued
+before stop() still belongs to this execution... a batch is a batch whichever side of the stop it
+drained on" - describes a case the break condition prevents. The last batch always drains inside the
+loop.
+
+The call is **not** dead, though, and must not simply be deleted: `execute_actions()` ends by driving
+`actuator_execute_` (`:667-669`), so this is the one last pass over the attached executions - and
+since step 17 those executions now report their own batches from inside it. Step 30's guard depends
+on exactly that.
+
+> Correct the comment, which currently claims something that cannot happen, and say what the call is
+> actually for - a final pass over the attachments, not a final batch of this execution's own. Then
+> decide whether the `notify_finished()` wrapper around it stays: it is unreachable as a
+> notification, and leaving it there implies a stop-path notification that does not exist.
+
+**Related, and deliberately not reopened here:** there is no second `on_finished` when a continuous
+worker actually stops with nothing left to run. That was decided, and this step does not change it -
+it only stops the code from implying otherwise.
 
 ---
 
@@ -640,6 +828,78 @@ caller who queues work they did not write.
 A warning naming the execution, as step 2 already prints for a dead binding, is the floor. Anything
 better means the results question from steps 14 and 15 reappears for failures, so keep this cheap
 unless there is a use case pushing it.
+
+### Step 29 · item H — the `action_*` members are public internal seams
+`async.hpp:565-567`
+
+Raised by the user on 2026-09-15, while reviewing the step 17 tests. Not an audit finding, and not
+derived from one.
+
+`action_execute`, `action_stop` and `action_is_running` are public data members. They are not
+interface: each is a `std::function` the constructor wires up from `untangle::bind(other_this_, ...)`
+at `:229-231`, and they exist so that `attach()` and `execution_poll` can reach one execution from
+another. A caller who assigns to one silently unwires the attachment or the poll, and nothing
+reports it. `on_finished` and `name` are genuine interface and stay public; this is about the three
+that are not.
+
+Distinct from the naming pass in `f20119f`, which suffixed the private members with `_` and left
+these alone deliberately. That pass could only rename what was already private — changing the access
+is the follow-up it could not make.
+
+> Move the three to the private section. Read from the code on 2026-09-15, the blast radius is
+> small:
+>
+> - `attach()` and `detach()` need nothing. `template <typename otherActionT> friend class
+>   execution;` at `:184` already makes every specialisation a friend of every other, which is why
+>   they can reach `attachment_lifetime_` today.
+> - `execution_poll::add()` and `remove()` take `&async_exec.action_is_running` and are **not**
+>   friends. This is the one real dependency: it needs friendship, or a seam that does not hand out
+>   the address of a member.
+> - `test/async_tests.cpp` drives `action_execute()` directly at six sites — the attach cases use it
+>   as the public seam onto `execute_actions()`, with no worker to wait on. Those cases need another
+>   way in, and a test-only friend is the cheapest one.
+> - `async_smoke_test.cpp`, `README.md` and `prototypes/` do not touch any of the three.
+
+**Order:** after step 17, not before. Three of those six call sites are step 17's own tests, and
+redesigning the test seam and the reporting contract in one pass is two concerns in one step.
+
+### Step 32 · item K — `finishing_` and `running_` may collapse into one state
+`async.hpp:353` (`is_running()`), `:732` (`running_`), `:830` (`finishing_`) · **investigation, not
+a defect**
+
+Raised by the user on 2026-09-16: the two flags look like they overlap, and the pair may be saying
+in two variables what one could say.
+
+Read from the code, they encode a three-state worker lifecycle in two bools:
+
+| `running_` | `finishing_` | means |
+|---|---|---|
+| false | false | never started, or finished and released |
+| true | false | working - `is_running()` is true |
+| true | true | winding down: the work is over, but the worker is still touching this object |
+| false | true | **unreachable as a distinct state** - the terminal state after a `run()`, and
+`is_running()` already reads false from `running_` alone |
+
+So three meaningful states, four combinations, and an invariant kept by hand across two stores in
+two different functions. A single atomic state - `idle` / `working` / `finishing` - would say it
+once, and `is_running()` would become `state == working` instead of a conjunction that has to be
+read twice to be believed.
+
+**Step 17 strengthened the case on 2026-09-17.** `finishing_` no longer has anything to do with the
+notification — the callback is raised before it is set — so its only remaining job is to let a
+caller polling `is_running()` learn the work is over before the lifetime handshake does. One flag
+doing one job alongside another flag doing one job is exactly the shape that collapses.
+
+> Investigate; do not assume it lands. The constraint is the destructor handshake: `~execution()`
+> spins on `running_` and may free the object the moment it reads false, so whatever replaces it
+> must keep a single store that is provably the last thing the worker touches. `finishing_` exists
+> precisely because that store cannot also be what tells a callback the work is over - see step 16,
+> and `run_does_not_tell_on_finished_it_is_still_running`.
+
+**Order: after step 30.** Today `loop()` never sets `finishing_`, so the encoding is not even
+uniform across the two worker paths; merging them before that is fixed would bake the asymmetry into
+whatever replaces them.
+
 
 ---
 

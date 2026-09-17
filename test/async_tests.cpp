@@ -196,6 +196,66 @@ TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
 }
 
 /**
+ * @brief An execution still running actions on its way out does not report itself finished.
+ *
+ * A guard, not a reproduction: it passes against the current header and has to keep passing.
+ *
+ * `finishing_` separates "my worker has finished" from "my worker is still touching this object",
+ * and execute() shows where the line falls - async.hpp:686-696 runs the actions first, sets
+ * `finishing_` only afterwards, and notifies last. So an execution executing actions reports
+ * is_running() true, and reports false only once there is nothing left to run. loop() never sets
+ * `finishing_` at all (step 30), and the obvious way to correct that - setting it at the break,
+ * before the drain that follows - would break this rule: that drain still runs work, because
+ * execute_actions() ends by driving the attacher's actuator. This case is what says so.
+ *
+ * @remark The sample is taken from an attached execution's action, run by the attacher's worker
+ * during the final drain after the loop has broken. `trigger` arms `shutdown_probe` and then stops
+ * the worker, both from the attacher's own thread, which leaves the probe's action for that drain.
+ * The two are attached in this order on purpose: the actuator invokes in attachment order - a
+ * std::list walked front to back - so `shutdown_probe` is passed over while still empty and is
+ * armed only afterwards by `trigger`.
+ *
+ * @remark Reversed, or driven mid-loop, the answer is the same true, so this case does not pin
+ * *where* the sample was taken and is not evidence about the shutdown window itself. Step 30's
+ * defect has no black-box test - `finishing_` is read only by is_running(), and once it is set
+ * correctly, at the end of the drain, nothing caller-written runs before `running_` is cleared.
+ */
+TEST(execution_lifecycle, an_execution_running_its_last_actions_does_not_report_itself_finished) {
+  auto attacher = void_execution::create_instance("attacher");
+  auto shutdown_probe = void_execution::create_instance("shutdown_probe");
+  auto trigger = void_execution::create_instance("trigger");
+
+  attacher->attach(shutdown_probe);
+  attacher->attach(trigger);
+
+  std::atomic_bool running_during_last_drain = {false};
+  std::atomic_int sampled = {0};
+
+  // Runs on the attacher's worker, in the last pass before the loop breaks. The probe is armed
+  // before stop() because add_action() refuses once stopped, and attacher->stop() stops every
+  // execution it has attached.
+  trigger->add_action([&] {
+    shutdown_probe->add_action([&] {
+      running_during_last_drain = attacher->is_running();
+      sampled.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    attacher->stop();
+  });
+
+  attacher->start();
+
+  ASSERT_TRUE(wait_for([&sampled] { return sampled.load() == 1; }, 2000ms))
+      << "the drain after the break never reached the attached probe";
+
+  ASSERT_TRUE(wait_for([&attacher] { return !attacher->is_running(); }, 2000ms))
+      << "the worker did not finish";
+
+  EXPECT_TRUE(running_during_last_drain.load())
+      << "an execution reported itself finished while it was still running an action";
+}
+
+/**
  * @brief The poll does not report idle while an execution is still running.
  *
  * execution_poll is a singleton, and waiting on it is what the interface offers in place of a join,
@@ -591,6 +651,72 @@ TEST(execution_attach, refuses_a_cycle_that_closes_through_a_third_execution) {
 }
 
 /**
+ * @brief An attached execution tells on_finished that its batch has drained.
+ *
+ * notify_finished() is called from execute() and from loop(), and an attached execution is in
+ * neither: its actions are run straight out of execute_actions() by the attacher's worker. So its
+ * on_finished never fires, however much work it does. Probed 2026-09-15: 0 firings across a full
+ * run, driven both synchronously and by a started attacher.
+ *
+ * The rule the existing notification cases set is the one that has to hold here too - a batch that
+ * drained is reported once, and a pass that ran nothing reports nothing. See
+ * execution_notification.on_finished_fires_each_time_a_batch_drains, whose contract this extends to
+ * the executions an attacher drives.
+ *
+ * @remark Driven by a real start()ed attacher rather than by action_execute() from this thread, as
+ * the attach cases above it are. on_finished is signalled only from a worker thread, and for an
+ * attached execution the worker in question is the attacher's - so the notification's thread is
+ * part of the contract, not an incidental detail, and the case asserts it. A synchronous drive
+ * would exercise the same code and prove the wrong thing about who sent the notification.
+ *
+ * @remark is_running() is deliberately not asserted here. It reports whether this execution's own
+ * worker thread is alive - see its comment on async.hpp - and an attached execution has no worker,
+ * so false is the right answer rather than the defect. on_finished is a different promise: it is
+ * about a queue draining, and this queue drains.
+ */
+TEST(execution_attach, on_finished_fires_when_an_attached_batch_drains) {
+  auto attacher = void_execution::create_instance("attacher");
+  auto attached = void_execution::create_instance("attached");
+  attacher->attach(attached);
+
+  const auto test_thread = std::this_thread::get_id();
+
+  std::atomic_int finished = {0};
+  std::atomic_int ran = {0};
+  std::atomic_bool signalled_off_this_thread = {false};
+
+  attached->on_finished = [&] {
+    signalled_off_this_thread = std::this_thread::get_id() != test_thread;
+    finished.fetch_add(1, std::memory_order_relaxed);
+  };
+
+  attached->add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+
+  // A continuous worker: its loop drives the attachment on every pass, which is how an attached
+  // execution is reached in practice.
+  attacher->start();
+
+  ASSERT_TRUE(wait_for([&ran] { return ran.load() == 1; }, 2000ms))
+      << "the attacher's worker never ran the attached action";
+
+  EXPECT_TRUE(wait_for([&finished] { return finished.load() == 1; }, 2000ms))
+      << "an attached execution never told on_finished its batch drained";
+
+  EXPECT_TRUE(signalled_off_this_thread.load())
+      << "on_finished was not signalled from the attacher's worker";
+
+  // The loop keeps passing over the attachment every 10ms with nothing left to run. A pass that
+  // ran nothing has finished nothing, so none of them may report a batch.
+  std::this_thread::sleep_for(200ms);
+
+  EXPECT_EQ(finished.load(), 1) << "an empty pass over an attached execution reported a batch";
+
+  attacher->stop();
+  ASSERT_TRUE(wait_for([&attacher] { return !attacher->is_running(); }, 2000ms))
+      << "the attacher's worker did not stop";
+}
+
+/**
  * @brief A fresh execution has no results, rather than one indeterminate value.
  *
  * `_result` was a bare `typename resultT::type` with no initialiser, and no constructor touched it,
@@ -796,21 +922,38 @@ TEST(execution_notification, on_finished_fires_once_per_run) {
 }
 
 /**
- * @brief run()'s callback is not told the execution is still running.
+ * @brief run()'s callback is told the execution is still running, because it is.
  *
- * on_finished fired before `running` was cleared, so a callback that asked is_running() was told
- * yes - by the very notification that it had finished. Probed 3/3.
+ * on_finished is raised from inside the drain, on the worker's own thread, at the moment the list
+ * empties. The worker has not finished at that point - it is standing in the callback, and has the
+ * rest of execute() still to do - so is_running() answering true is the honest answer rather than a
+ * stale one. A callback is not a place to ask whether the work is over; it *is* the notification
+ * that the batch is over.
  *
- * The ordering is not free to change the obvious way. Step 3 made ~execution() wait on `running`,
- * and the object can be freed the moment that reads false, so the worker may not touch anything
- * afterwards - the callback cannot simply be moved below the store. What the callback is told and
- * what keeps the object alive have to stop being the same answer.
+ * @remark This case asserted the opposite until 2026-09-17, when the notification moved into
+ * execute_actions() so that an attached execution could be told its own batch had drained (item 12
+ * / step 17). The old contract came from step 16 and was written when `finishing_` was set before
+ * the callback; the callback is now raised earlier than that store, and the ordering it described
+ * no longer exists to be tested.
+ *
+ * @remark `finishing_` still does its other job, which is the one it was really introduced for:
+ * ~execution() waits on `running_` and may free the object the moment that reads false, so a
+ * caller polling is_running() needs an answer that goes false before the lifetime handshake does.
+ * That is untouched here.
+ *
+ * With this, both worker paths say the same thing, and this case and the one below it are two
+ * halves of one contract rather than opposites - see
+ * execution_notification.a_drained_batch_does_not_claim_the_worker_stopped.
  */
-TEST(execution_notification, run_does_not_tell_on_finished_it_is_still_running) {
+TEST(execution_notification, a_run_batch_does_not_claim_the_worker_stopped) {
   const auto exec = void_execution::create_instance("one_shot");
 
-  std::atomic_bool seen_running = {true};
-  exec->on_finished = [&exec, &seen_running] { seen_running = exec->is_running(); };
+  std::atomic_bool seen_running = {false};
+  std::atomic_int fired = {0};
+  exec->on_finished = [&exec, &seen_running, &fired] {
+    seen_running = exec->is_running();
+    fired.fetch_add(1, std::memory_order_relaxed);
+  };
 
   exec->add_action([] {});
   exec->run();
@@ -818,16 +961,24 @@ TEST(execution_notification, run_does_not_tell_on_finished_it_is_still_running) 
   ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
       << "the worker did not finish";
 
-  EXPECT_FALSE(seen_running.load()) << "run()'s on_finished was told the execution was running";
+  ASSERT_EQ(fired.load(), 1) << "the batch drained without reporting that it had finished";
+
+  EXPECT_TRUE(seen_running.load())
+      << "run()'s on_finished was told the worker had stopped while standing in the callback";
+
+  // The other half, and what `finishing_` is still for: once the worker is past the drain, the
+  // execution reports finished without waiting for the lifetime handshake.
+  EXPECT_FALSE(exec->is_running()) << "the execution still reported running after its run was over";
 }
 
 /**
  * @brief A drained batch does not claim the worker has stopped.
  *
- * The counterpart of the case above, and the reason the two are not one assertion: in continuous
- * mode a drained batch says nothing about the worker, which is still there and waiting for the next
- * one. is_running() must keep saying so, or a caller waiting for the execution to finish would be
- * told it had, mid-life.
+ * The counterpart of the case above, and since 2026-09-17 the same contract seen from the
+ * continuous side: a drained batch says nothing about the worker, which is still there and waiting
+ * for the next one. is_running() must keep saying so, or a caller waiting for the execution to
+ * finish would be told it had, mid-life. The two cases are kept apart because the paths are - one
+ * worker leaves after its batch and the other does not - not because they disagree.
  */
 TEST(execution_notification, a_drained_batch_does_not_claim_the_worker_stopped) {
   const auto exec = void_execution::create_instance("continuous");

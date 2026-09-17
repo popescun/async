@@ -347,8 +347,13 @@ class execution {
    * False from the moment the worker starts reporting itself finished, which is before `running_`
    * is cleared - the two answer different questions. This one is for callers, and says whether
    * there is still work going on; `running_` is the handshake ~execution() waits on, and says
-   * whether the worker is still touching this object. They were the same answer until the
-   * notification needed to be told the truth about itself.
+   * whether the worker is still touching this object. A caller polling this one therefore learns
+   * that a run is over without having to wait for the object to be safe to destroy.
+   *
+   * @remark A callback is not such a caller. on_finished is raised from inside the drain, on
+   * the worker's own thread, and this reads true there - the worker is standing in the callback
+   * with the rest of its path still to go. That a batch drained says nothing about the worker on
+   * either path, and is not meant to.
    */
   bool is_running() const { return running_.load() && !finishing_.load(); }
 
@@ -593,17 +598,20 @@ class execution {
   }
 
   /**
-   * @brief Runs everything queued, and reports how much that was.
+   * @brief Runs everything queued, and records how much that was in \ref actions_run_.
    *
    * The count is what tells loop() whether a batch actually drained or whether it just woke on the
    * 10ms tick with nothing to do - the difference between a notification worth sending and a
-   * hundred a second saying nothing happened.
+   * hundred a second saying nothing happened. Every action that came off the list is counted,
+   * including one that reported a dead binding.
    *
-   * @return The number of actions run, including any that reported a dead binding.
+   * It is kept on the object rather than returned because it outlives this call: \ref
+   * notify_finished() reads it afterwards, and does so wherever it happens to be called from.
+   *
+   * @remark The count is of this execution's own actions. Attached executions are driven from here
+   * as well, and each records its own; none of them add to this one.
    */
-  std::size_t execute_actions() {
-    std::size_t actions_run = 0;
-
+  void execute_actions() {
     // The action is taken off the list under the lock and invoked with the lock released: an action
     // is caller code that may run for a while, and may itself call add_action().
     for (;;) {
@@ -638,24 +646,37 @@ class execution {
 
       // Counted whether or not it reported a dead binding: it came off the queue and the queue is
       // what the notification is about.
-      ++actions_run;
+      ++actions_run_;
+
+      // Whether the list emptied is read under the lock; the notification is raised without it.
+      // on_finished is caller code and may call add_action(), which takes this same mutex - holding
+      // it across the callback would deadlock the worker against itself.
+      bool drained = false;
+      {
+        std::lock_guard<std::mutex> lock(action_mutex_);
+        drained = action_list_.empty();
+      }
+
+      if (drained) {
+        notify_finished();
+      }
     }
 
+    // Last, and part of the pass: an attachment is only ever reached through action_execute, which
+    // is this function, so whoever drives this execution drives the ones attached to it.
     if (actuator_execute_.is_connected()) {
       actuator_execute_();
     }
-
-    return actions_run;
   }
 
   /**
    * @brief Tells the caller that the queue this worker was given has drained.
    *
-   * @param actions_run - How many actions the pass ran. Nothing is reported for a pass that ran
-   * none: an idle worker has not finished anything.
+   * Reads \ref actions_run_, which the \ref execute_actions() pass just before it filled in.
+   * Nothing is reported for a pass that ran none: an idle worker has not finished anything.
    */
-  void notify_finished(std::size_t actions_run) {
-    if (actions_run == 0 || !on_finished) {
+  void notify_finished() {
+    if (actions_run_ == 0 || !on_finished) {
       return;
     }
 
@@ -679,17 +700,14 @@ class execution {
       results_.clear();
     }
 
-    const auto actions_run = execute_actions();
+    actions_run_ = 0;
+    execute_actions();
 
-    // Set before the callback, not after: the run is over by the time it is told so, and a callback
-    // that asks is_running() has to be told the truth. `running_` cannot be cleared here instead -
-    // ~execution() waits on it and may free this object the moment it reads false, so it has to
-    // stay the last thing this worker touches.
+    // After the drain, and after the callback it raised: from here on there is no more work, and a
+    // caller polling is_running() should be told so. `running_` cannot serve instead - ~execution()
+    // waits on it and may free this object the moment it reads false, so it has to stay the last
+    // thing this worker touches.
     finishing_ = true;
-
-    // Before running_ is cleared, so a caller waiting on the poll cannot see the execution finish
-    // and read the results before this has filled them.
-    notify_finished(actions_run);
 
     std::cout << "finishing_ thread" << std::endl;
 
@@ -710,15 +728,25 @@ class execution {
           break;
         }
       }
-
-      notify_finished(execute_actions());
+      actions_run_ = 0;
+      execute_actions();
     }
 
     // What was queued before stop() still belongs to this execution; nothing can have been added
     // after it, because add_action() refuses once stopped. A batch is a batch whichever side of the
     // stop it drained on, so it is reported like any other; a stop with nothing left to run reports
     // nothing, because nothing finished.
-    notify_finished(execute_actions());
+    actions_run_ = 0;
+    execute_actions();
+
+    // Set here for the same reason execute() sets it, and in the same place: after the last actions
+    // have run, because this drain still runs work - execute_actions() ends by driving the attached
+    // executions - and before the callback, which has to be told the truth if it asks is_running().
+    // `running_` cannot serve instead; it is the handshake ~execution() waits on and has to stay
+    // the last thing this worker touches.
+    finishing_ = true;
+
+    notify_finished();
 
     std::cout << "thread finished" << std::endl;
 
@@ -822,10 +850,15 @@ class execution {
   /**
    * @brief Set by the worker once it is reporting itself finished, and read only by is_running().
    *
-   * It exists because the worker cannot clear `running_` before the callback - ~execution() waits
-   * on that and may free the object the moment it reads false - and yet the callback must not be
-   * told the execution is still working. Splitting the two answers is what lets the notification
-   * fire while the object is still guaranteed to be there.
+   * It exists because the worker cannot clear `running_` as soon as its work is done - ~execution()
+   * waits on that and may free the object the moment it reads false, so it has to stay the last
+   * thing the worker touches. Splitting the two answers is what lets a caller polling is_running()
+   * learn that the work is over while the object is still guaranteed to be there.
+   *
+   * @remark It is not what tells on_finished anything. That is raised from inside the drain,
+   * before this is set, and sees is_running() true - see the remark on is_running(). This was the
+   * original reason for the split, and stopped being so on 2026-09-17 when the notification moved
+   * into \ref execute_actions(); the reason above is the one that remains.
    */
   std::atomic_bool finishing_ = {false};
 
@@ -838,6 +871,18 @@ class execution {
    * for is_busy().
    */
   std::atomic_bool executing_action_ = {false};
+
+  /**
+   * @brief How many of this execution's own actions the last \ref execute_actions() pass ran.
+   *
+   * It outlives that pass on purpose. \ref notify_finished() is its only reader, and keeping the
+   * count on the object rather than handing it along means the notification can be raised from
+   * wherever the pass was driven, without the count having to be carried there.
+   *
+   * Atomic because the pass and the reader need not be on the same thread: an execution driven
+   * through \ref attach() runs on its attacher's worker rather than on one of its own.
+   */
+  std::atomic_size_t actions_run_ = {0};
 
   execution* other_this_;
 };
