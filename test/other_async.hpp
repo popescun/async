@@ -2,6 +2,7 @@
 
 #include <async.hpp>
 #include <memory>
+#include <print>
 #include <string>
 
 template <typename T>
@@ -10,7 +11,7 @@ class other_async : public std::enable_shared_from_this<other_async<T>> {
   other_async() = default;
   ~other_async() = default;
 
-  void set(const T& text) { std::cout << text << std::endl; }
+  void set(const T& text) { std::println("{}", text); }
 
   using exec_t = untangle::async::execution<std::function<void(const std::string&)>>;
 

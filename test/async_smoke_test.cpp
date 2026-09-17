@@ -1,4 +1,8 @@
 #include <async.hpp>
+#include <format>
+#include <print>
+#include <string>
+#include <thread>
 
 #include "other_async.hpp"
 
@@ -6,23 +10,21 @@ class A {
  public:
   A() = default;
   void f() {
-    std::cout << "A::f thread " << std::this_thread::get_id() << std::endl;
+    std::println("A::f thread {}", std::this_thread::get_id());
 
     // on_finished();
   }
 
   void f_with_arg(int x) {
-    std::cout << "A::f_with_arg " << x << " thread " << std::this_thread::get_id() << std::endl;
+    std::println("A::f_with_arg {} thread {}", x, std::this_thread::get_id());
   }
 
   void f_with_arg_2(int x, int y) {
-    std::cout << "A::f_with_arg_2 " << x << " " << y << " thread " << std::this_thread::get_id()
-              << std::endl;
+    std::println("A::f_with_arg_2 {} {} thread {}", x, y, std::this_thread::get_id());
   }
 
   int f_with_arg_and_return(int x) {
-    std::cout << "A::f_with_arg_and_return " << x << " thread " << std::this_thread::get_id()
-              << std::endl;
+    std::println("A::f_with_arg_and_return {} thread {}", x, std::this_thread::get_id());
     return x;
   }
 
@@ -38,10 +40,10 @@ using int_exec = untangle::async::execution<std::function<void(int)>>;
 using int_int_exec = untangle::async::execution<std::function<void(int, int)>>;
 using int_ret_exec = untangle::async::execution<std::function<int(int)>>;
 
-void f() { std::cout << "f thread " << std::this_thread::get_id() << std::endl; }
+void f() { std::println("f thread {}", std::this_thread::get_id()); }
 
 int main() {
-  std::cout << "main thread " << std::this_thread::get_id() << std::endl;
+  std::println("main thread {}", std::this_thread::get_id());
 
   auto a = std::make_shared<A>();
   auto asyncexec = void_exec::create_instance("asyncexec");
@@ -72,24 +74,30 @@ int main() {
   // receive on finished using an attached execution
   std::function<void(void)> action_on_finished;
   auto on_finished = [&asyncexec3]() {
-    std::cout << "on_finished thread " << std::this_thread::get_id() << std::endl;
+    std::println("on_finished thread {}", std::this_thread::get_id());
     auto results = asyncexec3->results();
-    std::cout << "results=" << results.size() << " value(s)";
+
+    // Built into one string and printed once: a line assembled by several calls can be split down
+    // the middle by another worker's line, which is what this test used to do.
+    std::string values;
     for (const auto& value : results) {
-      std::cout << " " << value;
+      values += std::format(" {}", value);
     }
-    std::cout << std::endl;
+    std::println("results={} value(s){}", results.size(), values);
   };
 
   // receive on finished by assigning the internal notifier
   asyncexec3->on_finished = [&asyncexec3]() {
-    std::cout << "on_finished thread " << std::this_thread::get_id() << std::endl;
+    std::println("on_finished thread {}", std::this_thread::get_id());
     auto results = asyncexec3->results();
-    std::cout << "results=" << results.size() << " value(s)";
+
+    // Built into one string and printed once: a line assembled by several calls can be split down
+    // the middle by another worker's line, which is what this test used to do.
+    std::string values;
     for (const auto& value : results) {
-      std::cout << " " << value;
+      values += std::format(" {}", value);
     }
-    std::cout << std::endl;
+    std::println("results={} value(s){}", results.size(), values);
   };
 
   auto asyncexec5 = void_exec::create_instance("asyncexec5");

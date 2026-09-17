@@ -709,7 +709,7 @@ class execution {
     // thing this worker touches.
     finishing_ = true;
 
-    std::cout << "finishing_ thread" << std::endl;
+    std::println("execution '{}' finishing thread", name);
 
     running_ = false;
   }
@@ -748,7 +748,7 @@ class execution {
 
     notify_finished();
 
-    std::cout << "thread finished" << std::endl;
+    std::println("execution '{}' thread finished", name);
 
     // Must stay last: ~execution() may free this object the moment it reads false.
     running_ = false;
