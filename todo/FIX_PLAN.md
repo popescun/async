@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-17):** 19 of 32 steps done, the last one uncommitted. Steps 1-10 landed in one
+**Status (2026-09-17):** 21 of 32 steps done, the last one uncommitted. Steps 1-10 landed in one
 commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
 `c4843cd` (`bind()` now holds the execution weakly; two new tests).
@@ -45,11 +45,20 @@ object dies.
 | *(uncommitted)* | 16 — `on_finished` fires per drained batch *(half retired by 17)* |
 | *(uncommitted)* | 30 — `loop()` sets `finishing_` after its last drain, as `execute()` does |
 | *(uncommitted)* | 17 — `execute_actions()` raises the notification, so a driven execution reports |
+| *(uncommitted)* | 18, 19 — every `std::cout` becomes `std::println`; the repo is TSan-clean |
 
 **NEXT: step 31** — item J, the comment on the drain after `loop()` breaks, which describes a case
 the break condition prevents. The last of group 4, and the only one left in it: 16, 17 and 30 are
 applied and green in the working tree, none of them committed. It is a comment correction plus one
-decision — whether the unreachable `notify_finished()` wrapper around that drain stays.
+decision — whether the unreachable `notify_finished()` wrapper around that drain stays. Confirmed
+unreachable by probe on 2026-09-17, in three arrangements; see the step.
+
+**Also waiting on a decision:** `actions_run_` is reset only by `execute()` and `loop()`, so an
+execution driven through `attach()` — which runs neither — never has it reset. Its
+`actions_run_ == 0` guard is therefore permanently false after the first action, and the
+notification is correct only because its one call site sits immediately after an action ran.
+Resetting at the top of `execute_actions()` would fix it for every driver. Not yet a step; raised
+2026-09-17 while probing step 31.
 
 **The notification contract changed on 2026-09-17** and is worth reading before touching group 4:
 the callback is raised from inside `execute_actions()`, on the worker's thread, at the moment the
@@ -62,7 +71,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 13 steps.** Groups 4 to 7 below; groups 1, 2, 3 and 8 are closed.
+**Remaining: 11 steps.** Groups 4, 6 and 7 below; groups 1, 2, 3, 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -113,9 +122,9 @@ of atomic.
 | 17 ✅ | 12 | an attached execution's `on_finished` never fires | `:652-671`, `:672-698`, `:700-728` | CONFIRMED (0 fired) |
 | 30 ✅ | I | `loop()` never sets `finishing_` | `:700-728` | CONFIRMED (probe); read-only |
 | 31 | J | the drain after `loop()` breaks can never report a batch | `:718-721` | CONFIRMED (read + probe) |
-| **Group 5 — output** |
-| 18 | 14 | the header writes to `std::cout` unsynchronised | `:391`, `:418` | CONFIRMED (TSan) |
-| 19 | E | the smoke test races on `std::cout` between two workers | `async_smoke_test.cpp:15,24` | CONFIRMED (TSan) |
+| **Group 5 — output (closed)** |
+| 18 ✅ | 14 | the header writes to `std::cout` unsynchronised | `:712`, `:751` | CONFIRMED (TSan) |
+| 19 ✅ | E | the smoke test races on `std::cout` between two workers | `async_smoke_test.cpp:15,24` | CONFIRMED (TSan) |
 | **Group 6 — API contract** |
 | 20 | B | `~execution()` suppressed the implicit moves | `:203` | read-only |
 | 21 | C | a refused action is reported but not returned | `:295-312` | read-only |
@@ -123,7 +132,7 @@ of atomic.
 | 29 | H | the `action_*` members are public internal seams | `:565-567` | read-only |
 | 32 | K | `finishing_` and `running_` may collapse into one state | `:353`, `:732`, `:830` | investigation |
 | **Group 7 — hygiene** |
-| 22 | hyg | six more headers used but not included | `:8-14` | read-only |
+| 22 | hyg | five more headers used but not included | `:8-14` | read-only |
 | 23 | hyg | `actuator` forward-declared after its own `#include` | `:16-23` | read-only |
 | 24 | hyg | `other_this = this` is pointless indirection | `:176`, `:449` | read-only |
 | 25 | hyg | `add_action` copies the action and every argument twice | `:295-307` | read-only |
@@ -743,10 +752,10 @@ it only stops the code from implying otherwise.
 
 ---
 
-## Group 5 — output
+## Group 5 — output (closed)
 
-### Step 18 · item 14 — the header writes to `std::cout` unsynchronised
-`async.hpp:391` (`"finishing thread"`), `:418` (`"thread finished"`)
+### Step 18 · item 14 — the header writes to `std::cout` unsynchronised — DONE (uncommitted)
+`async.hpp:712` (`execute()`), `:751` (`loop()`) · line references refreshed 2026-09-17
 
 Two debug prints from worker threads, in a header-only library, on a stream shared with the
 application. `std::println` was introduced for the warnings in steps 2 and 21 and locks the stream;
@@ -756,7 +765,26 @@ these two predate it and do not.
 > a library should not print at all on the success path. Consider taking them out entirely and
 > letting the logger you have planned own this.
 
-### Step 19 · item E — the smoke test races on `std::cout` between two workers
+**Applied 2026-09-17**, in the working tree, not yet committed. Both routed through `std::println`,
+which the user chose over deleting them. Each now names the execution, as the two existing warnings
+at `:444` and `:641` do — with several workers running they were otherwise anonymous, which was most
+of what made them useless:
+
+```
+std::println("execution '{}' finishing thread", name);
+std::println("execution '{}' thread finished", name);
+```
+
+The first read `"finishing_ thread"` until now. That underscore was collateral from `f20119f`'s
+rename pass catching a string literal, not something anyone wrote.
+
+**Still open, and deliberately not settled here:** whether a library should print on the success
+path at all. These are locked now, so they are no longer a race; they are still debug leftovers, and
+the suggestion above to let a logger own them stands.
+
+**Flow-on:** `async.hpp` no longer uses `<iostream>`, which shortens step 22's list.
+
+### Step 19 · item E — the smoke test races on `std::cout` between two workers — DONE (uncommitted)
 `test/async_smoke_test.cpp:15`, `:24` · CONFIRMED under TSan, and present before `60f7970`
 
 `A::f_with_arg` and `A::f_with_arg_and_return` print from two different workers concurrently. This
@@ -766,6 +794,36 @@ Visible in the output as interleaved lines:
 
 > `std::println` per line, or a mutex in the test. Worth doing so that "TSan is clean" becomes true
 > of the whole repo and a future regression is not lost in a known warning.
+
+**Applied 2026-09-17**, in the working tree, not yet committed. Fifteen sites converted: fourteen in
+`async_smoke_test.cpp` and one in `test/other_async.hpp:13`, which this item never named and which
+produced the stray `test` line in the output.
+
+**Per line, not per call, is the whole fix.** The two `on_finished` bodies built one line out of four
+`<<` calls, which is exactly where another worker cut in. Converting call-for-call would have kept
+that open, so the values are accumulated first and the line is printed once:
+
+```
+std::string values;
+for (const auto& value : results) {
+  values += std::format(" {}", value);
+}
+std::println("results={} value(s){}", results.size(), values);
+```
+
+A comment in the test says so, because the next person adding a line there will reach for `<<`.
+
+Both files were relying entirely on transitive includes through `async.hpp`; they now include
+`<format>`, `<print>`, `<string>` and `<thread>` for what they use directly.
+
+**Verified, and this one needed repeating rather than a single run** — the race was intermittent, so
+one clean run would have proved little. 25 consecutive TSan runs of `async_smoke_test`, 0 warnings
+every time; `async_tests` 0; ASan 0 on both; 33/33; smoke exit 0 with every line intact;
+clang-format clean.
+
+**`TSan is clean` is now true of the whole repo**, which it was not before — and note that it had
+been claimed once during this session on the strength of running `async_tests` alone. Both binaries,
+from here on.
 
 ---
 
@@ -905,12 +963,14 @@ whatever replaces them.
 
 ## Group 7 — hygiene
 
-### Step 22 · hygiene — six more headers used but not included
+### Step 22 · hygiene — five more headers used but not included
 `async.hpp:8-14`
 
-Step 10 added four. Still used but not included: `<list>`, `<functional>`, `<memory>`,
-`<iostream>`, `<chrono>`, `<type_traits>`. The header compiles only because
-`<actuator/actuator.hpp>` pulls them in first.
+Step 10 added four. Still used but not included: `<list>`, `<functional>`, `<memory>`, `<chrono>`,
+`<type_traits>`. The header compiles only because `<actuator/actuator.hpp>` pulls them in first.
+
+**`<iostream>` came off this list on 2026-09-17**, when step 18 replaced the last two `std::cout`
+calls in the header with `std::println`. Nothing in `async.hpp` uses it any more.
 
 > Include what you use. Cheap, and it stops a change in `actuator` from breaking this header.
 
