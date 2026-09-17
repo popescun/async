@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-17):** 22 of 32 steps done, the last one uncommitted. Steps 1-10 landed in one
+**Status (2026-09-17):** 23 of 32 steps done and committed; only this plan update is not. Steps 1-10 landed in one
 commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
 `c4843cd` (`bind()` now holds the execution weakly; two new tests).
@@ -49,15 +49,16 @@ and both binaries are ThreadSanitizer-clean, which had never been true before.
 | `2e3a8d0` | 13 — `attach()` takes a `shared_ptr`, gains `detach()`, refuses cycles |
 | `f251acf` | 27 — CI pins GCC 14 on Linux, which is where `<print>` arrived |
 | `f37ee83` | 14, 15 — `_result` becomes a `results` vector, filled by `run()` only |
-| *(uncommitted)* | 16 — `on_finished` fires per drained batch *(half retired by 17)* |
-| *(uncommitted)* | 30 — `loop()` sets `finishing_` after its last drain, as `execute()` does |
-| *(uncommitted)* | 17 — `execute_actions()` raises the notification, so a driven execution reports |
-| *(uncommitted)* | 18, 19 — every `std::cout` becomes `std::println`; the repo is TSan-clean |
-| *(uncommitted)* | 31 — the unreachable tail notification goes; `actions_run_` resets in the pass |
+| `282ceb7` | 16 — `on_finished` fires per drained batch *(half retired by 17)* |
+| `5408eff` | 30 — `loop()` sets `finishing_` after its last drain, as `execute()` does |
+| `5408eff` | 17 — `execute_actions()` raises the notification, so a driven execution reports |
+| `86f343a` | 18, 19 — every `std::cout` becomes `std::println`; the repo is TSan-clean |
+| `91c6112` | 31 — the unreachable tail notification goes; `actions_run_` resets in the pass |
+| `9404816` | 20 — **declined**; the reasoning recorded instead, plus a guard |
 
-**NEXT: group 6, starting with step 20** — the rule of five. Nothing before it is outstanding:
-groups 1 to 5 and 8 are closed, and steps 16, 17, 18, 19, 30 and 31 are applied and green in the
-working tree, **none of them committed**.
+**NEXT: step 21** — item C, a refused action reported but not returned. Everything before it is
+committed: groups 1 to 5 and 8 are closed, and step 20 was closed on 2026-09-17 by declining it.
+Group 6 has 21, 28, 29 and 32 left; group 7 has 22 to 26.
 
 **Read the couplings before picking an order.** Step 21 touches the same two `bind()` lambdas as
 step 25 and as the half of item 8 carried forward below — land the three together or accept three
@@ -82,7 +83,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 10 steps.** Groups 6 and 7 below; groups 1, 2, 3, 4, 5 and 8 are closed.
+**Remaining: 9 steps.** Groups 6 and 7 below; groups 1, 2, 3, 4, 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -137,7 +138,7 @@ of atomic.
 | 18 ✅ | 14 | the header writes to `std::cout` unsynchronised | `:712`, `:751` | CONFIRMED (TSan) |
 | 19 ✅ | E | the smoke test races on `std::cout` between two workers | `async_smoke_test.cpp:15,24` | CONFIRMED (TSan) |
 | **Group 6 — API contract** |
-| 20 | B | `~execution()` suppressed the implicit moves | `:203` | read-only |
+| 20 ✅ | B | `~execution()` suppressed the implicit moves | `:255` | declined, see step |
 | 21 | C | a refused action is reported but not returned | `:295-312` | read-only |
 | 28 | G | an action that throws anything but `invalid_action` terminates | `:598-604` | CONFIRMED (terminate) |
 | 29 | H | the `action_*` members are public internal seams | `:565-567` | read-only |
@@ -873,8 +874,8 @@ from here on.
 
 ## Group 6 — API contract
 
-### Step 20 · item B — `~execution()` suppressed the implicit moves
-`async.hpp:203`
+### Step 20 · item B — `~execution()` suppressed the implicit moves — DONE, **declined** (uncommitted)
+`async.hpp:255` (`~execution()`) · line reference refreshed 2026-09-17
 
 Step 3 gave `execution` a user-declared destructor, which suppresses the implicit move constructor
 and move assignment. The class was already effectively non-copyable through its members, so nothing
@@ -887,6 +888,55 @@ This is the same finding `actuator` closed as its item B, and the audit's hygien
 > Rule of five: `= delete` the copy operations explicitly and decide whether moving an `execution`
 > is meaningful at all. It probably is not, while `other_this` and the poll hold pointers to `this`
 > — see step 24.
+
+**Closed on 2026-09-17 by declining the instruction above, not by carrying it out.** The rule of
+five was written, applied, measured and reverted. What landed instead is the reasoning, as a remark
+on `~execution()`, plus a guard in the suite. Both halves of the item were probed rather than argued
+about.
+
+**The premise was wrong about `this_thread_`.** The compiler blames that field only because
+`std::thread` is the first member declared. Removing the thread from a scratch header changed
+nothing: `started_` is blamed next and all four traits stay false. Every atomic, both mutexes and
+the condition variable delete the copy operations independently. The deletion is over-determined, so
+four declarations would restate what a dozen members already enforce, and would begin to matter only
+if all of them were replaced by copyable ones at once. That is not a change anyone makes by accident.
+
+**"A template wall rather than a statement" only half holds.** Measured against a scratch header
+with the rule of five applied:
+
+| case | today | with `= delete` |
+|---|---|---|
+| `execution b = std::move(a)` | `call to implicitly-deleted copy constructor` (7 lines) | `call to deleted constructor` (7 lines) |
+| `execution b = a` | identical message to the move | `call to deleted constructor` |
+| `std::vector<execution>` | 48 lines, fails in `allocator_traits` | **48 lines, unchanged** |
+
+So the direct case becomes a statement, and the case that actually bites a user stays a wall. The
+gain is real and smaller than the item implies.
+
+**The decision, and it is a design one:** an execution is declared once and used in place, and is
+never copied, moved or assigned. `create_instance()` hands out a `std::shared_ptr`, so nothing needs
+to relocate one, and four things hold pointers into a live execution that a move would leave behind
+- `other_this_`, `execution_poll` holding `&action_is_running`, `attach()` holding
+`&other.action_execute` and `&actuator_execute_`, and the detached worker reading `this`. The
+remark on `~execution()` says this where the question arises, and reaches the generated docs.
+
+**Guard:** `execution_special_members.cannot_be_copied_or_moved`, four `static_assert`s.
+**It cannot fail against this defect and no case can** - all four traits read false before and after,
+because item B's whole effect is on diagnostic text, which no trait reports. What it does earn:
+nothing in the class states that an execution must not be copied; the members merely happen to
+prevent it. This is the only executable statement of the intent, and fails if that stops being true.
+
+A `try_compile` test asserting the diagnostic text *would* go red until the fix landed, and was
+rejected: it introduces a test mechanism this repo does not have, and matches on compiler message
+text across the clang/gcc/MSVC matrix, which a toolchain bump would break.
+
+**Alignment with `actuator` was the starting point and did not survive contact.** `actuator.hpp:81-92`
+declares all five, every one `= default`, because an actuator is copyable. The shape aligns; the
+values do not, and here the conclusion was that the declarations are not worth their place at all.
+
+Verified: 34/34; 30x repeat, no failures; ThreadSanitizer 0 warnings and AddressSanitizer 0 errors
+on both binaries; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings,
+41 pages.
 
 ### Step 21 · item C — a refused action is reported but not returned
 `async.hpp:295-312`
