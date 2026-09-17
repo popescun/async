@@ -244,6 +244,13 @@ class execution {
    * @remark This is safe only because running_ is cleared as the very last thing the worker does.
    * Nothing may be added after it in execute() or loop(): the object can be freed the moment it
    * reads false.
+   *
+   * @remark **No rule of five, deliberately.** An execution is declared once and used in place; it
+   * is never copied, moved or assigned. Declaring this destructor suppresses the implicit moves,
+   * and the copy operations are deleted several times over - by std::thread, by every atomic, by
+   * both mutexes and by the condition variable, each on its own. Spelling the four out would only
+   * restate that, and would start earning its keep only if all of those members were replaced by
+   * copyable ones at once. `execution_special_members.cannot_be_copied_or_moved` pins the result.
    */
   ~execution() {
     // Out of the attacher first, before the worker is even asked to stop: from here on nothing
