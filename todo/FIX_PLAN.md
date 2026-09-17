@@ -1,6 +1,7 @@
 # async.hpp — fix plan
 
-**Status (2026-09-17):** 23 of 32 steps done and committed; only this plan update is not. Steps 1-10 landed in one
+**Status (2026-09-17):** 24 of 32 steps done; step 21 and this plan update are uncommitted.
+Steps 1-10 landed in one
 commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
 `c4843cd` (`bind()` now holds the execution weakly; two new tests).
@@ -55,10 +56,15 @@ and both binaries are ThreadSanitizer-clean, which had never been true before.
 | `86f343a` | 18, 19 — every `std::cout` becomes `std::println`; the repo is TSan-clean |
 | `91c6112` | 31 — the unreachable tail notification goes; `actions_run_` resets in the pass |
 | `9404816` | 20 — **declined**; the reasoning recorded instead, plus a guard |
+| *(uncommitted)* | 21 — `add_action()` returns bool; the bound path stays untold |
 
-**NEXT: step 21** — item C, a refused action reported but not returned. Everything before it is
-committed: groups 1 to 5 and 8 are closed, and step 20 was closed on 2026-09-17 by declining it.
-Group 6 has 21, 28, 29 and 32 left; group 7 has 22 to 26.
+**NEXT: step 28** — item G, an action that throws anything but `invalid_action` terminates. It is
+the other half of the question step 21 just answered for a refused action, and step 21 left the bound
+path untold on purpose, so settle them as one. Group 6 then has 29 and 32 left; group 7 has 22 to 26.
+
+**Carried into step 28 from step 21:** a caller reaching `add_action()` through `bind()` still learns
+nothing, because those lambdas have no room in their return type. Whatever answer step 28 gives a
+thrown action has to work for that caller too, or neither question is really closed.
 
 **Read the couplings before picking an order.** Step 21 touches the same two `bind()` lambdas as
 step 25 and as the half of item 8 carried forward below — land the three together or accept three
@@ -83,7 +89,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 9 steps.** Groups 6 and 7 below; groups 1, 2, 3, 4, 5 and 8 are closed.
+**Remaining: 8 steps.** Groups 6 and 7 below; groups 1, 2, 3, 4, 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -139,7 +145,7 @@ of atomic.
 | 19 ✅ | E | the smoke test races on `std::cout` between two workers | `async_smoke_test.cpp:15,24` | CONFIRMED (TSan) |
 | **Group 6 — API contract** |
 | 20 ✅ | B | `~execution()` suppressed the implicit moves | `:255` | declined, see step |
-| 21 | C | a refused action is reported but not returned | `:295-312` | read-only |
+| 21 ✅ | C | a refused action is reported but not returned | `:440-480` | CONFIRMED (probe) |
 | 28 | G | an action that throws anything but `invalid_action` terminates | `:598-604` | CONFIRMED (terminate) |
 | 29 | H | the `action_*` members are public internal seams | `:565-567` | read-only |
 | 32 | K | `finishing_` and `running_` may collapse into one state | `:353`, `:732`, `:830` | investigation |
@@ -938,8 +944,8 @@ Verified: 34/34; 30x repeat, no failures; ThreadSanitizer 0 warnings and Address
 on both binaries; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings,
 41 pages.
 
-### Step 21 · item C — a refused action is reported but not returned
-`async.hpp:295-312`
+### Step 21 · item C — a refused action is reported but not returned — DONE (uncommitted)
+`async.hpp:440-480` (`add_action()`) · line reference refreshed 2026-09-17
 
 `add_action()` on a stopped execution prints a warning and returns. The caller has no programmatic
 way to learn the action was dropped — and the caller is usually the lambda from `bind()`, which
@@ -950,6 +956,58 @@ on stderr is better than silence, and less than telling.
 
 > `bool add_action(...)`, threaded back through the `bind()` lambdas. Touches the same two lambdas
 > as step 12, so land them together or accept two passes over the same lines.
+
+**Applied 2026-09-17**, in the working tree, not yet committed. `add_action()` returns `bool` —
+`false` when the execution is stopped and the action was dropped, `true` when it was queued. The
+empty `@brief` stub it carried was written properly at the same time; the return value needed
+documenting and there was nothing there to add it to.
+
+**Half the instruction above is not implementable, and was dropped.** The bool cannot be threaded
+back through the `bind()` lambdas: they return `actionT::result_type`, fixed by the specialisation —
+`void` for `execution<function<void()>>`, `int` for an `int`-returning one — so there is nowhere to
+put it. A caller arriving through `bind_action_and_method()` or `bind_action_and_function()` is
+therefore still not told, and that is recorded in `add_action()`'s own documentation rather than left
+to be rediscovered. It is the same ground as the carried-forward half of item 8 and as what step 28
+owes for an action whose body throws.
+
+**An exception was proposed and rejected**, on 2026-09-17. The test first asserted that a refused
+action throws `untangle::invalid_action`, on the reasoning that a bound call on a *destroyed*
+execution already throws exactly that while a *stopped* one returns silently — two answers to the
+same "your action will never run". The user rejected the premise: `invalid_action` means a binding
+whose target has died, so the action itself is broken, while a refusal is a sound action meeting an
+execution that is closed to new work. Conflating them would blur both the catch site and the
+exception's own meaning. **An answer, not a fault** — the distinction is now in the header.
+
+**Measured before any of this was written**, 2026-09-17. On an `execution<function<int(int)>>`, a
+bound call that was queued and really ran returned `0`, and a bound call refused after `stop()` also
+returned `0`; the accepted one's result was sitting in `results()` at the time. `add_action()`'s own
+return type was `void`, so a direct caller had nothing to check either.
+
+**Test:** `execution_queue.tells_the_caller_when_an_action_is_refused`, sitting beside
+`refuses_an_action_queued_after_the_worker_stops` — that one pins that a refused action does not run,
+this one that the caller finds out. Two notes on its construction, because neither is obvious:
+
+- It asserts the **return type** before exercising it, so the case builds against a `void`
+  `add_action()` and fails as an expectation rather than as a compile error that would take the
+  whole suite down.
+- The behavioural half lives in a **templated lambda**. A discarded `if constexpr` branch is still
+  instantiated outside a template, so written directly in the test body those calls would not
+  compile against the old signature. Inside a templated lambda the compiler really does skip them.
+
+Confirmed to go green with the fix, not merely red without it: against a scratch header, `true`
+before `stop()`, `false` after, and the action count unchanged.
+
+**Also fixed:** the warning read `execution '...' is stopped_, action not added`. That underscore was
+`f20119f` rename collateral catching a string literal — the third such found this session, after
+`"finishing thread"` and the `is_running()` comment.
+
+**Not a behaviour change for existing callers**, which is the risk worth stating: ignoring a new
+return value compiles cleanly, so every direct caller in tree stays exactly as silent as before until
+it is changed to check.
+
+Verified: 35/35; 30x repeat, no failures; ThreadSanitizer 0 warnings and AddressSanitizer 0 errors on
+both binaries; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings, 41
+pages — after fixing two `\ref`s in the new documentation that do not resolve in this file.
 
 ### Step 28 · item G — an action that throws anything but `invalid_action` terminates
 `async.hpp:598-604` · CONFIRMED: `libc++abi: terminating due to uncaught exception`
