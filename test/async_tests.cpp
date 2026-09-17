@@ -235,6 +235,57 @@ TEST(execution_queue, tells_the_caller_when_an_action_is_refused) {
 }
 
 /**
+ * @brief An action whose own body throws does not kill the worker.
+ *
+ * execute_actions() wraps each action in a try that catches untangle::invalid_action and nothing
+ * else. That exception is the header's own - a binding whose target has died - and step 2 added the
+ * catch for it. An action's body is caller code, and nothing constrains what comes out of it: any
+ * other exception leaves the worker's thread function and calls std::terminate.
+ *
+ * @attention Measured 2026-09-17. An action throwing std::runtime_error killed the process on both
+ * paths - `run()` and `start()` alike - with `libc++abi: terminating due to uncaught exception` and
+ * exit 134, SIGABRT. Nothing queued behind it ran. This is not a latent defect; it is one line of
+ * caller code away.
+ *
+ * @attention **This case aborts rather than fails against the current header**, because that is
+ * what the defect does. gtest_discover_tests gives every case its own process, so it takes down
+ * this one and not the suite - the same arrangement
+ * execution_attach.does_not_reach_an_attached_execution_that_has_been_destroyed relies on. Expect
+ * ctest to report it as a crash until the fix lands.
+ *
+ * @remark The contract asserted is the one the header already applies to a dead binding: the
+ * exception is swallowed, a warning names the execution, the action is counted as having come off
+ * the queue, and the worker carries on with what is behind it. Same shape, same place - a throwing
+ * action is not a special kind of failure, it is the second kind the worker has to survive.
+ *
+ * @remark What this case deliberately does not assert is the caller being *told*, which is the half
+ * step 21 answered with a bool return. There is no synchronous caller here to return anything to -
+ * the submitter is long gone by the time the action runs - so the warning on stderr is the floor,
+ * and anything better is the results question from steps 14 and 15 reappearing for failures.
+ */
+TEST(execution_queue, an_action_that_throws_does_not_kill_the_worker) {
+  auto exec = void_execution::create_instance("throwing_action");
+
+  std::atomic_int before = {0};
+  std::atomic_int behind = {0};
+  std::atomic_int finished = {0};
+  exec->on_finished = [&finished] { finished.fetch_add(1, std::memory_order_relaxed); };
+
+  exec->add_action([&before] { before.fetch_add(1, std::memory_order_relaxed); });
+  exec->add_action([] { throw std::runtime_error("the caller's own code threw"); });
+  exec->add_action([&behind] { behind.fetch_add(1, std::memory_order_relaxed); });
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 5000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(before.load(), 1) << "the action before the throwing one did not run";
+  EXPECT_EQ(behind.load(), 1) << "an action queued behind a throwing one never ran";
+  EXPECT_EQ(finished.load(), 1) << "the batch drained without reporting that it had finished";
+}
+
+/**
  * @brief stop() ends a worker that has only just been started.
  *
  * loop() sets `started` from inside the worker thread; stop() clears it from the caller. Nothing

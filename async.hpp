@@ -665,20 +665,32 @@ class execution {
         executing_action_ = true;
       }
 
-      // An action bound to an object that has since died throws invalid_action. Letting it leave a
-      // thread function calls std::terminate, and a detached worker gives no one a chance to catch
-      // it; the actuator drops such an action, and so does this.
+      // Nothing may leave this loop. The worker is a detached thread function, so an exception
+      // escaping it calls std::terminate and gives no one anywhere to catch it - and an execution
+      // exists to run code the header did not write, which can throw anything at all.
+      //
+      // Two kinds arrive here. invalid_action is the header's own: a binding whose target has died,
+      // which the actuator drops and so does this. Anything else came out of the action's body and
+      // is the caller's, and the answer is the same - name the execution, drop the action, and go
+      // on to the next one. A worker that died with the first task that threw could not be given
+      // work it did not write.
       try {
         execute_action(action);
       } catch (const invalid_action& ia) {
         std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
                      ia.what());
+      } catch (const std::exception& e) {
+        std::println(stderr, "warning: execution '{}' dropped an action that threw: {}", name,
+                     e.what());
+      } catch (...) {
+        std::println(stderr, "warning: execution '{}' dropped an action that threw an unknown type",
+                     name);
       }
 
       executing_action_ = false;
 
-      // Counted whether or not it reported a dead binding: it came off the queue and the queue is
-      // what the notification is about.
+      // Counted whether it ran cleanly, reported a dead binding, or threw: it came off the queue,
+      // and the queue is what the notification is about.
       ++actions_run_;
 
       // Whether the list emptied is read under the lock; the notification is raised without it.
