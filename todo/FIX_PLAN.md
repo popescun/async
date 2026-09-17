@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-17):** 24 of 32 steps done; step 21 and this plan update are uncommitted.
+**Status (2026-09-17):** 25 of 32 steps done and committed; only this plan update is not.
 Steps 1-10 landed in one
 commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
@@ -56,15 +56,19 @@ and both binaries are ThreadSanitizer-clean, which had never been true before.
 | `86f343a` | 18, 19 — every `std::cout` becomes `std::println`; the repo is TSan-clean |
 | `91c6112` | 31 — the unreachable tail notification goes; `actions_run_` resets in the pass |
 | `9404816` | 20 — **declined**; the reasoning recorded instead, plus a guard |
-| *(uncommitted)* | 21 — `add_action()` returns bool; the bound path stays untold |
+| `f8472c0` | 21 — `add_action()` returns bool; the bound path stays untold |
+| `b14373e` | 28 — a throwing action is caught in three arms; the worker survives |
 
-**NEXT: step 28** — item G, an action that throws anything but `invalid_action` terminates. It is
-the other half of the question step 21 just answered for a refused action, and step 21 left the bound
-path untold on purpose, so settle them as one. Group 6 then has 29 and 32 left; group 7 has 22 to 26.
+**NEXT: step 29** — item H, the `action_*` members are public internal seams. Probed and tested on
+2026-09-17; the fix is not written and its test is the only thing in the working tree. Group 6 then
+has 32 left; group 7 has 22 to 26.
 
-**Carried into step 28 from step 21:** a caller reaching `add_action()` through `bind()` still learns
-nothing, because those lambdas have no room in their return type. Whatever answer step 28 gives a
-thrown action has to work for that caller too, or neither question is really closed.
+**Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
+through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
+return `actionT::result_type`, which has no room for an answer. Both steps closed with the direct
+caller served and that one not, so "settle them together" was only half met. It is the same ground
+as item 8's carried-forward half; land it with steps 21 and 25 or state that the bound caller is
+never told.
 
 **Read the couplings before picking an order.** Step 21 touches the same two `bind()` lambdas as
 step 25 and as the half of item 8 carried forward below — land the three together or accept three
@@ -89,7 +93,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 8 steps.** Groups 6 and 7 below; groups 1, 2, 3, 4, 5 and 8 are closed.
+**Remaining: 7 steps.** Groups 6 and 7 below; groups 1, 2, 3, 4, 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -146,7 +150,7 @@ of atomic.
 | **Group 6 — API contract** |
 | 20 ✅ | B | `~execution()` suppressed the implicit moves | `:255` | declined, see step |
 | 21 ✅ | C | a refused action is reported but not returned | `:440-480` | CONFIRMED (probe) |
-| 28 | G | an action that throws anything but `invalid_action` terminates | `:598-604` | CONFIRMED (terminate) |
+| 28 ✅ | G | an action that throws anything but `invalid_action` terminates | `:670-690` | CONFIRMED (terminate) |
 | 29 | H | the `action_*` members are public internal seams | `:565-567` | read-only |
 | 32 | K | `finishing_` and `running_` may collapse into one state | `:353`, `:732`, `:830` | investigation |
 | **Group 7 — hygiene** |
@@ -1009,8 +1013,9 @@ Verified: 35/35; 30x repeat, no failures; ThreadSanitizer 0 warnings and Address
 both binaries; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings, 41
 pages — after fixing two `\ref`s in the new documentation that do not resolve in this file.
 
-### Step 28 · item G — an action that throws anything but `invalid_action` terminates
-`async.hpp:598-604` · CONFIRMED: `libc++abi: terminating due to uncaught exception`
+### Step 28 · item G — an action that throws anything but `invalid_action` terminates — DONE
+`async.hpp:670-690` (the catch site) · CONFIRMED: `libc++abi: terminating due to uncaught exception`
+· line reference refreshed 2026-09-17
 
 Found on 2026-09-14 while prototyping a thread pool on top of `execution` — see
 `prototypes/README.md`.
@@ -1038,6 +1043,41 @@ caller who queues work they did not write.
 A warning naming the execution, as step 2 already prints for a dead binding, is the floor. Anything
 better means the results question from steps 14 and 15 reappears for failures, so keep this cheap
 unless there is a use case pushing it.
+
+**Landed 2026-09-17 in `b14373e`.** Re-probed first, and it is worse than "latent": an action
+throwing `std::runtime_error` killed the process on **both** paths, `run()` and `start()` alike,
+exit 134, with nothing queued behind it ever running.
+
+**Three catch arms, not the one the instruction asked for.** `invalid_action` keeps its own message.
+A `std::exception` gets its own arm so the warning can carry `what()` — a bare `catch (...)` would
+have satisfied the instruction and thrown away the only useful detail. Everything else lands in
+`catch (...)`. All three name the execution and drop the action, which is what step 2 already did
+for a dead binding: a throwing action is not a special kind of failure, it is the second kind the
+worker has to survive.
+
+**The `catch (...)` arm was probed on its own**, with an action throwing a bare `int` and another
+throwing a plain struct. With the `std::exception` arm in front of it, a broken catch-all would look
+identical in the suite — both were caught, both warned, and the worker carried on.
+
+The action is still counted as having come off the queue, so its batch reports finished like any
+other; the comment saying so listed two outcomes and now lists three.
+
+**The other half is still open, and deliberately.** What the submitter is told has not changed. Step
+21 could answer a refused action with a `bool` because the caller was standing there; here the
+submitter is long gone by the time the action runs, so the stderr warning remains the floor. The
+plan's instruction to "settle the two together" is therefore only half met: both questions now have
+*an* answer, but neither reaches a caller who arrived through `bind()`, whose lambdas have no room
+in their return type. That gap is item 8's carried-forward half and belongs with steps 21 and 25.
+
+**Test:** `execution_queue.an_action_that_throws_does_not_kill_the_worker`. It **aborted rather than
+failed** before the fix, because that is what the defect did — `gtest_discover_tests` gives every
+case its own process, so it took down that one case and not the suite, the same arrangement
+`does_not_reach_an_attached_execution_that_has_been_destroyed` relies on. Its doc comment says to
+expect that, so it is not read as broken.
+
+Verified: 36/36; 30x repeat, no failures; ThreadSanitizer 0 warnings and AddressSanitizer 0 errors
+on both binaries; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings,
+41 pages.
 
 ### Step 29 · item H — the `action_*` members are public internal seams
 `async.hpp:565-567`
