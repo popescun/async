@@ -612,6 +612,8 @@ class execution {
    * as well, and each records its own; none of them add to this one.
    */
   void execute_actions() {
+    actions_run_ = 0;
+
     // The action is taken off the list under the lock and invoked with the lock released: an action
     // is caller code that may run for a while, and may itself call add_action().
     for (;;) {
@@ -700,7 +702,6 @@ class execution {
       results_.clear();
     }
 
-    actions_run_ = 0;
     execute_actions();
 
     // After the drain, and after the callback it raised: from here on there is no more work, and a
@@ -728,25 +729,21 @@ class execution {
           break;
         }
       }
-      actions_run_ = 0;
       execute_actions();
     }
 
-    // What was queued before stop() still belongs to this execution; nothing can have been added
-    // after it, because add_action() refuses once stopped. A batch is a batch whichever side of the
-    // stop it drained on, so it is reported like any other; a stop with nothing left to run reports
-    // nothing, because nothing finished.
-    actions_run_ = 0;
+    // A last pass over the attachments, not a last batch of this execution's own. The loop above
+    // leaves only when this list is already empty, and add_action() refuses once stopped, so
+    // nothing of ours can be waiting here and this pass reports nothing. What can be waiting is an
+    // attached execution with actions queued: execute_actions() ends by driving them, and each
+    // reports its own batch as it drains.
     execute_actions();
 
-    // Set here for the same reason execute() sets it, and in the same place: after the last actions
-    // have run, because this drain still runs work - execute_actions() ends by driving the attached
-    // executions - and before the callback, which has to be told the truth if it asks is_running().
-    // `running_` cannot serve instead; it is the handshake ~execution() waits on and has to stay
-    // the last thing this worker touches.
+    // Set here for the same reason execute() sets it, and in the same place: after the last pass,
+    // because that pass still runs work - the attachments above - and a caller polling is_running()
+    // may only be told the work is over once it is. `running_` cannot serve instead; it is the
+    // handshake ~execution() waits on and has to stay the last thing this worker touches.
     finishing_ = true;
-
-    notify_finished();
 
     std::println("execution '{}' thread finished", name);
 

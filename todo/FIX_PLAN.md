@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-17):** 21 of 32 steps done, the last one uncommitted. Steps 1-10 landed in one
+**Status (2026-09-17):** 22 of 32 steps done, the last one uncommitted. Steps 1-10 landed in one
 commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
 landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
 `c4843cd` (`bind()` now holds the execution weakly; two new tests).
@@ -19,11 +19,18 @@ code unless marked otherwise.
 
 ## Progress
 
-Done — steps 1 to 16, and step 27 out of order. Step 11 finished what step 4 left of the poll,
-step 12 closed the dangling `bind()` capture, and step 13 closed `attach()`. **Group 2 is
+Done — steps 1 to 19, 27, and 30 and 31 out of order. Step 11 finished what step 4 left of the
+poll, step 12 closed the dangling `bind()` capture, and step 13 closed `attach()`. **Group 2 is
 complete**: every place the header held a raw pointer into another object now learns when that
 object dies.
 **Group 8 is complete** too, forced early by a red CI run, and **group 3** with steps 14 and 15.
+
+**Group 4 closed on 2026-09-17**, with 16, 17, 30 and 31. The notification is now raised from one
+place — inside `execute_actions()`, as the list empties — which is the only point every driver
+passes through, so an execution reached through `attach()` reports its own batches like any other.
+It cost half of step 16's contract: `on_finished` now sees `is_running()` true, deliberately.
+**Group 5 closed the same day**, with 18 and 19: every `std::cout` in the repo is a `std::println`,
+and both binaries are ThreadSanitizer-clean, which had never been true before.
 
 | Commit | Step |
 |---|---|
@@ -46,19 +53,23 @@ object dies.
 | *(uncommitted)* | 30 — `loop()` sets `finishing_` after its last drain, as `execute()` does |
 | *(uncommitted)* | 17 — `execute_actions()` raises the notification, so a driven execution reports |
 | *(uncommitted)* | 18, 19 — every `std::cout` becomes `std::println`; the repo is TSan-clean |
+| *(uncommitted)* | 31 — the unreachable tail notification goes; `actions_run_` resets in the pass |
 
-**NEXT: step 31** — item J, the comment on the drain after `loop()` breaks, which describes a case
-the break condition prevents. The last of group 4, and the only one left in it: 16, 17 and 30 are
-applied and green in the working tree, none of them committed. It is a comment correction plus one
-decision — whether the unreachable `notify_finished()` wrapper around that drain stays. Confirmed
-unreachable by probe on 2026-09-17, in three arrangements; see the step.
+**NEXT: group 6, starting with step 20** — the rule of five. Nothing before it is outstanding:
+groups 1 to 5 and 8 are closed, and steps 16, 17, 18, 19, 30 and 31 are applied and green in the
+working tree, **none of them committed**.
 
-**Also waiting on a decision:** `actions_run_` is reset only by `execute()` and `loop()`, so an
-execution driven through `attach()` — which runs neither — never has it reset. Its
-`actions_run_ == 0` guard is therefore permanently false after the first action, and the
-notification is correct only because its one call site sits immediately after an action ran.
-Resetting at the top of `execute_actions()` would fix it for every driver. Not yet a step; raised
-2026-09-17 while probing step 31.
+**Read the couplings before picking an order.** Step 21 touches the same two `bind()` lambdas as
+step 25 and as the half of item 8 carried forward below — land the three together or accept three
+passes over the same lines. Steps 21 and 28 ask the same question, "what happened to the action I
+gave you", and the plan says to settle them together. Step 29 was blocked on step 17 and no longer
+is. Step 32 was blocked on step 30 and no longer is; step 17 also strengthened its case, since
+`finishing_` now does less than it did.
+
+**The notification contract changed on 2026-09-17.** The callback is raised from inside
+`execute_actions()`, on the worker's thread, at the moment the list empties — so `on_finished` sees
+`is_running()` true, on both worker paths, and that is deliberate. Read the note at the end of step
+16 before touching anything that notifies.
 
 **The notification contract changed on 2026-09-17** and is worth reading before touching group 4:
 the callback is raised from inside `execute_actions()`, on the worker's thread, at the moment the
@@ -71,7 +82,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 11 steps.** Groups 4, 6 and 7 below; groups 1, 2, 3, 5 and 8 are closed.
+**Remaining: 10 steps.** Groups 6 and 7 below; groups 1, 2, 3, 4, 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -117,11 +128,11 @@ of atomic.
 | **Group 3 — results (closed)** |
 | 14 ✅ | 7 | `_result` read uninitialised, written unsynchronised | `:447`, `:328`, `:348` | CONFIRMED (0xabababab; TSan) |
 | 15 ✅ | 13 | only the last action's return value survives | `:328`, `:348`, `:447` | CONFIRMED |
-| **Group 4 — notifications** |
+| **Group 4 — notifications (closed)** |
 | 16 ✅ | 11 | `on_finished` never fires in continuous mode | `:387-388` vs `:396-421` | CONFIRMED (0/3 fired) |
 | 17 ✅ | 12 | an attached execution's `on_finished` never fires | `:652-671`, `:672-698`, `:700-728` | CONFIRMED (0 fired) |
 | 30 ✅ | I | `loop()` never sets `finishing_` | `:700-728` | CONFIRMED (probe); read-only |
-| 31 | J | the drain after `loop()` breaks can never report a batch | `:718-721` | CONFIRMED (read + probe) |
+| 31 ✅ | J | the drain after `loop()` breaks can never report a batch | `:735-745` | CONFIRMED (read + probe) |
 | **Group 5 — output (closed)** |
 | 18 ✅ | 14 | the header writes to `std::cout` unsynchronised | `:712`, `:751` | CONFIRMED (TSan) |
 | 19 ✅ | E | the smoke test races on `std::cout` between two workers | `async_smoke_test.cpp:15,24` | CONFIRMED (TSan) |
@@ -511,7 +522,7 @@ pre-existing `std::cout` race in `async_smoke_test`. 30x repeat, no flakes. clan
 
 ---
 
-## Group 4 — notifications
+## Group 4 — notifications (closed)
 
 ### Step 16 · item 11 — `on_finished` never fires in continuous mode — DONE
 `async.hpp:387-388` (fires in `execute()`) vs `:396-421` (`loop()` does not call it) · CONFIRMED
@@ -722,8 +733,8 @@ step 17's own test; ThreadSanitizer 31 passed and **0 warnings** across the whol
 AddressSanitizer the same with 0 errors; 30x repeat of the full suite, exactly one failing test every
 run, no flakes. clang-format clean.
 
-### Step 31 · item J — the drain after `loop()` breaks can never report a batch
-`async.hpp:735-749` · line references refreshed 2026-09-17, after steps 17 and 30 reshaped `loop()`
+### Step 31 · item J — the drain after `loop()` breaks can never report a batch — DONE (uncommitted)
+`async.hpp:735-745` · line references refreshed 2026-09-17, after steps 17 and 30 reshaped `loop()`
 
 Found 2026-09-15 while analysing step 30.
 
@@ -749,6 +760,39 @@ on exactly that.
 **Related, and deliberately not reopened here:** there is no second `on_finished` when a continuous
 worker actually stops with nothing left to run. That was decided, and this step does not change it -
 it only stops the code from implying otherwise.
+
+**Applied 2026-09-17**, in the working tree, not yet committed. Three changes, the third decided
+with this step rather than carried separately.
+
+1. **The tail `notify_finished()` is gone.** Unreachable, and leaving it implied a stop-path
+   notification that does not exist.
+2. **Two comments corrected, not one.** The comment above the drain described a batch being
+   reported there; it now says what the pass is for - a last pass over the attachments, not a last
+   batch of this execution's own - and why this execution's own list is always empty by then. The
+   `finishing_` comment immediately below it was stale in the same way: it ended "and before the
+   callback, which has to be told the truth if it asks `is_running()`", and after step 17 there is
+   no callback at that point at all. It now reads against what the code does.
+3. **`actions_run_` is reset at the top of `execute_actions()`** (`:615`), not by its callers. The
+   three resets in `execute()` and `loop()` came out with it. This was raised while probing this
+   step: the reset used to belong to the two worker functions, and an execution driven through
+   `attach()` runs neither, so its counter was never reset and its `actions_run_ == 0` guard was
+   permanently false after the first action. The notification was still correct, but only because
+   its one call site sits immediately after an action ran - which is not a property worth relying
+   on. Every driver now starts a pass from zero.
+
+**Confirmed by probe rather than by reading.** Since step 30 sets `finishing_` between the two
+notification sites, `is_running()` inside the callback says which one raised it. Three arrangements
+- `stop()` landing mid-batch, an action that queues another with `stop()` in between, and an
+attached execution queueing back onto its attacher during the final pass - each gave
+`from_drain=1, from_tail=0`, before and after the change. Nothing was receiving the removed
+notification.
+
+None of the three changes behaviour today: the call was unreachable, and the reset only mattered to
+a guard that the call site's position was already masking. The suite passing identically before and
+after is the expected result here, not weak evidence.
+
+Verified: 33/33; 30x repeat, no failures; ThreadSanitizer 0 warnings and AddressSanitizer 0 errors
+on **both** binaries; `tools/make_doc.sh` clean, 41 pages; clang-format clean.
 
 ---
 
