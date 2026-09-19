@@ -186,10 +186,9 @@ class execution {
    * @param exec_name - A name for this execution.
    */
   explicit execution(std::string exec_name) : name(std::move(exec_name)) {
-    other_this_ = this;
-    action_execute = untangle::bind(other_this_, &execution<actionT>::execute_actions);
-    action_stop = untangle::bind(other_this_, &execution<actionT>::stop);
-    action_is_running = untangle::bind(other_this_, &execution<actionT>::is_running);
+    action_execute = untangle::bind(this, &execution<actionT>::execute_actions);
+    action_stop = untangle::bind(this, &execution<actionT>::stop);
+    action_is_running = untangle::bind(this, &execution<actionT>::is_running);
   }
 
   /**
@@ -827,8 +826,6 @@ class execution {
    * \ref attach() runs on its attacher's.
    */
   std::atomic_size_t actions_run_ = {0};
-
-  execution* other_this_;
 };
 }  // namespace async
 }  // namespace untangle

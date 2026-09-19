@@ -1,7 +1,7 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 29 of 33 steps done — 1 to 23, plus 27 to 31 and 33 out of order. 28 are
-committed, HEAD `5f09f17`; step 23 is in the working tree. The per-step commits are in the
+**Status (2026-09-19):** 30 of 33 steps done — 1 to 24, plus 27 to 31 and 33 out of order. 29 are
+committed, HEAD `686b7e5`; step 24 is in the working tree. The per-step commits are in the
 table under **Progress**; this line no longer restates them, because that is how it kept drifting.
 **Tests:** 35 of 35 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
@@ -68,10 +68,11 @@ remains of the group**, and step 33 joins group 7.
 | `622660b` | 29 — **declined**; the three connection points are documented instead |
 | `588b7ca` | 33 — the header's doc comments cut to what each entity is and does |
 | `5f09f17` | 22 — five headers the header uses and did not include |
-| *(uncommitted)* | 23 — both dead forward declarations go |
+| `686b7e5` | 23 — both dead forward declarations go |
+| *(uncommitted)* | 24 — the three connection points bind through `this` |
 
-**NEXT: group 7**, steps 24 to 26 — all hygiene, all read-only findings; 22, 23 and 33 are done.
-Step 32 is the only investigation left, and nothing blocks it any more.
+**NEXT: group 7**, steps 25 and 26 — both hygiene; 22, 23, 24 and 33 are done. Step 32 is the only
+investigation left, and nothing blocks it any more.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -103,7 +104,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 4 steps.** Step 32, and group 7's 24 to 26; groups 1 to 5 and 8 are closed.
+**Remaining: 3 steps.** Step 32, and group 7's 25 and 26; groups 1 to 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -166,7 +167,7 @@ of atomic.
 | **Group 7 — hygiene** |
 | 22 ✅ | hyg | headers used but not included | `:8-23` | read-only |
 | 23 ✅ | hyg | a forward-declaration block in which both declarations were dead | `:24` | read-only |
-| 24 | hyg | `other_this = this` is pointless indirection | `:176`, `:449` | read-only |
+| 24 ✅ | hyg | `other_this_ = this` was pointless indirection | `:188-192` | read-only |
 | 25 | hyg | `add_action` copies the action and every argument twice | `:295-307` | read-only |
 | 26 | hyg | `result \|= ret` on a bool | `:135` | read-only |
 | 33 ✅ | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
@@ -1227,13 +1228,25 @@ identical set of `.tex` files - equal but for the source listing, which is the h
 **Verified:** 35/35; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings,
 41 pages.
 
-### Step 24 · hygiene — `other_this = this` is pointless indirection
-`async.hpp:176`, `:449`
+### Step 24 · hygiene — `other_this_ = this` was pointless indirection — DONE
+`async.hpp:188-192` (the constructor) · verified by reading the code, 2026-09-19
 
-The constructor stores `this` in a member and binds through it. It buys nothing over `this`, and it
-is a stale-pointer trap the moment the class gains a copy or move — see step 20.
+The constructor stored `this` in a member and bound the three connection points through it. It
+bought nothing: `untangle::bind(class_t*, method)` at `actuator/actuator.hpp:364` **captures the
+pointer by value** in its lambda, so what the member held afterwards was never read again. It was
+also a stale-pointer trap the moment the class gained a copy or move - see step 20.
 
-> Bind through `this` and delete the member.
+> Bound through `this`; the member is gone. `execution* other_this_;` was also the only member
+> without an initialiser.
+
+**It retires one of the four pointers step 20 listed** as reasons an execution must not be moved.
+Three remain: `execution_poll` holding `&action_is_running`, `attach()` holding
+`&other.action_execute` and `&actuator_execute_`, and the detached worker reading `this`. The case
+for not moving is unchanged.
+
+**Verified:** 35/35 Debug; **35/35 under AddressSanitizer and 35/35 under ThreadSanitizer**, both
+reconfigured for this step because the directories were gone; `async_smoke_test` exit 0 on all
+three, 0 TSan warnings; clang-format clean; `tools/make_doc.sh` 0 warnings, 41 pages.
 
 ### Step 25 · hygiene — `add_action` copies the action and every argument twice
 `async.hpp:295-307`
