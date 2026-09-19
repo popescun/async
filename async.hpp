@@ -292,17 +292,17 @@ class execution {
   }
 
   /**
-   * @brief Is this execution still working?
+   * @brief Is a worker of this execution's still there?
    *
-   * False from the moment the worker starts reporting itself finished, so a caller polling it
-   * learns a run is over without waiting for the object to become safe to destroy.
+   * True from \ref run() or \ref start() until the worker has left, which is the same instant
+   * \ref ~execution() waits for and the same one \ref run() waits for before starting another.
    *
    * @remark \ref on_finished is raised from inside the drain and reads this as **true** - the
    * worker is standing in the callback with the rest of its path still to go.
    *
-   * @return true - the execution is still working.
+   * @return true - a worker is still there.
    */
-  bool is_running() const { return running_.load() && !finishing_.load(); }
+  bool is_running() const { return running_.load(); }
 
   /**
    * @brief Is this execution working through its action list?
@@ -331,15 +331,14 @@ class execution {
    * queued while it is draining are run by it too. \ref results() is filled by this path only.
    *
    * Blocks until a worker still resident from a previous run has left, so one execution never has
-   * two. \ref is_running() goes false a moment before that, so a caller that runs again the instant
-   * it reads finished waits here for the remainder.
+   * two. \ref is_running() reads false at exactly that moment, so a caller that waits for it and
+   * then runs again does not wait here at all.
    *
    * @attention Never call this from inside an action: the worker that would have to leave is the
    * one making the call, so it waits for itself and hangs.
    */
   void run() {
     wait_thread_to_finish();
-    finishing_ = false;
     collecting_results_ = true;
     thread_ = std::thread(&execution::execute, this);
     thread_.detach();
@@ -357,7 +356,6 @@ class execution {
    */
   void start() {
     wait_thread_to_finish();
-    finishing_ = false;
     collecting_results_ = false;
     {
       std::lock_guard<std::mutex> lock(action_mutex_);
@@ -708,9 +706,6 @@ class execution {
 
     execute_actions();
 
-    // After the drain and the callback it raised: there is no more work to be told about.
-    finishing_ = true;
-
     std::println("execution '{}' finishing thread", name);
 
     // Must stay last: ~execution() may free this object the moment it reads false.
@@ -736,9 +731,6 @@ class execution {
 
     // A last pass for the attachments; this execution's own list is already empty here.
     execute_actions();
-
-    // After the last pass, because that pass still runs work.
-    finishing_ = true;
 
     std::println("execution '{}' thread finished", name);
 
@@ -822,18 +814,6 @@ class execution {
    * hands anything back.
    */
   std::atomic_bool collecting_results_ = {false};
-
-  /**
-   * @brief Set by the worker once it is reporting itself finished, and read only by is_running().
-   *
-   * It exists because the worker cannot clear `running_` as soon as its work is done - ~execution()
-   * waits on that and may free the object the moment it reads false. Splitting the two lets a
-   * caller learn the work is over while the object is still guaranteed to be there.
-   *
-   * @remark Not what tells \ref on_finished anything: that is raised from inside the drain,
-   * before this is set.
-   */
-  std::atomic_bool finishing_ = {false};
 
   /**
    * @brief Whether an action that has already left the list is still running.

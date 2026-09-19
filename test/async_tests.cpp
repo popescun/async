@@ -439,13 +439,10 @@ TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
  *
  * A guard, not a reproduction: it passes against the current header and has to keep passing.
  *
- * `finishing_` separates "my worker has finished" from "my worker is still touching this object",
- * and execute() shows where the line falls - async.hpp:686-696 runs the actions first, sets
- * `finishing_` only afterwards, and notifies last. So an execution executing actions reports
- * is_running() true, and reports false only once there is nothing left to run. loop() never sets
- * `finishing_` at all (step 30), and the obvious way to correct that - setting it at the break,
- * before the drain that follows - would break this rule: that drain still runs work, because
- * execute_actions() ends by driving the attacher's actuator. This case is what says so.
+ * An execution that is running actions is running, whichever path it is on and however near the
+ * end. The rule was once carried by a second flag, `finishing_`, which step 32 removed as
+ * redundant; what it protected is this case, and this case still holds: the drain after loop()
+ * breaks still runs work, because execute_actions() ends by driving the attacher's actuator.
  *
  * @remark The sample is taken from an attached execution's action, run by the attacher's worker
  * during the final drain after the loop has broken. `trigger` arms `shutdown_probe` and then stops
@@ -456,8 +453,8 @@ TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
  *
  * @remark Reversed, or driven mid-loop, the answer is the same true, so this case does not pin
  * *where* the sample was taken and is not evidence about the shutdown window itself. Step 30's
- * defect has no black-box test - `finishing_` is read only by is_running(), and once it is set
- * correctly, at the end of the drain, nothing caller-written runs before `running_` is cleared.
+ * defect had no black-box test either: nothing caller-written runs between the end of the drain
+ * and `running_` being cleared.
  */
 TEST(execution_lifecycle, an_execution_running_its_last_actions_does_not_report_itself_finished) {
   auto attacher = void_execution::create_instance("attacher");
@@ -497,10 +494,11 @@ TEST(execution_lifecycle, an_execution_running_its_last_actions_does_not_report_
 /**
  * @brief A second run() does not leave two workers inside one execution.
  *
- * run() spawns a worker and sets `running_`, which is also the handshake ~execution() waits on.
- * Nothing checks whether a worker is already there, so a second run() starts a second one and both
- * share that single flag: whichever finishes first clears it, the destructor's wait is satisfied
- * while the other is still inside the object, and the object is freed under it.
+ * run() spawns a worker and takes `running_`, which is also the handshake ~execution() waits on.
+ * Before step 36 nothing checked whether a worker was already there, so a second run() started a
+ * second one and both shared that single flag: whichever finished first cleared it, the
+ * destructor's wait was satisfied while the other was still inside the object, and the object was
+ * freed under it.
  *
  * @attention This case **aborts rather than fails** under AddressSanitizer, which is what the
  * defect does - `heap-use-after-free` at async.hpp:629, written by the surviving worker into the
@@ -508,10 +506,10 @@ TEST(execution_lifecycle, an_execution_running_its_last_actions_does_not_report_
  * so it takes down this one and not the suite. In a plain Debug build it passes silently: nothing
  * observable goes wrong, which is exactly why the case is written this way.
  *
- * @remark The flaky `execution_results.are_cleared_between_runs` is the same defect arriving by a
- * narrower door: is_running() goes false when `finishing_` is set, before `running_` is cleared, so
- * a caller told the run is over starts its second run into the first worker's tail. That one shows
- * up about once in a hundred iterations under ThreadSanitizer; this one is deterministic.
+ * @remark `execution_results.are_cleared_between_runs` used to be flaky for the same reason,
+ * through a narrower door: is_running() went false while the worker was still in its tail, so a
+ * caller told the run was over started its second run into it. Step 32 closed that door by
+ * removing the flag that opened it; this case is the deterministic one.
  */
 TEST(execution_lifecycle, a_second_run_does_not_leave_two_workers_in_one_execution) {
   // Repeated, because the window is the instant between one worker clearing `running_` and the
@@ -1278,14 +1276,9 @@ TEST(execution_notification, on_finished_fires_once_per_run) {
  *
  * @remark This case asserted the opposite until 2026-09-17, when the notification moved into
  * execute_actions() so that an attached execution could be told its own batch had drained (item 12
- * / step 17). The old contract came from step 16 and was written when `finishing_` was set before
- * the callback; the callback is now raised earlier than that store, and the ordering it described
- * no longer exists to be tested.
- *
- * @remark `finishing_` still does its other job, which is the one it was really introduced for:
- * ~execution() waits on `running_` and may free the object the moment that reads false, so a
- * caller polling is_running() needs an answer that goes false before the lifetime handshake does.
- * That is untouched here.
+ * / step 17). The old contract came from step 16, when a second flag was set before the callback;
+ * the callback is now raised earlier than any such store, and the ordering it described no longer
+ * exists to be tested.
  *
  * With this, both worker paths say the same thing, and this case and the one below it are two
  * halves of one contract rather than opposites - see
@@ -1312,8 +1305,7 @@ TEST(execution_notification, a_run_batch_does_not_claim_the_worker_stopped) {
   EXPECT_TRUE(seen_running.load())
       << "run()'s on_finished was told the worker had stopped while standing in the callback";
 
-  // The other half, and what `finishing_` is still for: once the worker is past the drain, the
-  // execution reports finished without waiting for the lifetime handshake.
+  // The other half: once the worker has left, the execution reports finished.
   EXPECT_FALSE(exec->is_running()) << "the execution still reported running after its run was over";
 }
 

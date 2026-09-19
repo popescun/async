@@ -1,8 +1,9 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 33 of 36 steps done — 1 to 26, plus 27 to 31, 33 and 36 out of order. 32
-are committed, HEAD `305b672`; step 36 is in the working tree. **Group 7 is complete**, and the last
-outright defect is closed. The per-step
+**Status (2026-09-19):** 34 of 37 steps done — 1 to 26, plus 27 to 33 and 36. 33 are committed,
+HEAD `26f91ed`; step 32 is in the working tree. **Groups 1 to 8 are complete**; what remains is two
+investigations.
+The per-step
 commits are in the table under **Progress**; this line no longer restates them, because that is how
 it kept drifting.
 **Tests:** 41 of 41 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
@@ -75,10 +76,12 @@ remains of the group**, and step 33 joins group 7.
 | `d20640f` | 24 — the three connection points bind through `this` |
 | `5d4a4ee` | 25 — `add_action()` and both `bind()` lambdas forward |
 | `305b672` | 26 — `\|=` on a bool becomes `\|\|`, and the poll's fold gains a test |
-| *(uncommitted)* | 36 — `run()` and `start()` wait for a resident worker to leave |
+| `26f91ed` | 36 — `run()` and `start()` wait for a resident worker to leave |
+| *(uncommitted)* | 32 — `finishing_` is gone; `is_running()` is `running_` |
 
-**NEXT: step 32**, whose single state would subsume step 36's wait, and then the investigations 34
-and 35 out of step 25's measurements. Nothing left is a known defect.
+**NEXT: step 37**, the test-comment sweep, then the investigations 34 and 35 - both out of step
+25's measurements, and both really the same question: what the queue should hold. Nothing left is a
+known defect.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -111,8 +114,8 @@ default-constructed result, so an async call to an `int`-returning method yields
 argument still will not compile, and never could have here: the queue stores `std::function`, which
 needs a copy-constructible target. See step 25.
 
-**Remaining: 3 steps**, none of them a known defect: step 32, and the investigations 34 and 35.
-Groups 1 to 5, 7 and 8 are closed.
+**Remaining: 3 steps**, none a known defect: the investigations 34 and 35, and the test-comment
+sweep 37. Every group is closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -121,10 +124,10 @@ the ubuntu job could not compile `<print>` at all, so nothing else could be veri
 back to attached executions having their own list and no way to notify the attacher, but redesigning
 that is a feature decision, not a fix. It is called out where it bites and left alone otherwise.
 
-36 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
+37 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
 one. The audit's numbering is preserved so items stay traceable; findings added while fixing are
 lettered. Step 28 was added on 2026-09-14, steps 29 to 31 on 2026-09-15, step 32 on 2026-09-16 and
-steps 33 to 36 on 2026-09-19, after the others.
+steps 33 to 37 on 2026-09-19, after the others.
 The letter D is unused and skipped:
 nothing in this file or in the history ever claimed it, and reusing a letter that may have meant
 something in the original audit would cost more than the gap does.
@@ -171,7 +174,7 @@ of atomic.
 | 21 ✅ | C | a refused action is reported but not returned | `:440-480` | CONFIRMED (probe) |
 | 28 ✅ | G | an action that throws anything but `invalid_action` terminates | `:670-690` | CONFIRMED (terminate) |
 | 29 ✅ | H | the `action_*` members are public internal seams | `:600-624` | declined, documented |
-| 32 | K | `finishing_` and `running_` may collapse into one state | `:353`, `:732`, `:830` | investigation |
+| 32 ✅ | K | `finishing_` was redundant and is gone | `:305`, `:744` | investigation |
 | **Group 7 — hygiene** |
 | 22 ✅ | hyg | headers used but not included | `:8-23` | read-only |
 | 23 ✅ | hyg | a forward-declaration block in which both declarations were dead | `:24` | read-only |
@@ -182,6 +185,7 @@ of atomic.
 | 34 | perf | a bound action is copied once per invocation | `:264`, `:294` | CONFIRMED (counted) |
 | 35 | api | a second entry point for actions the caller gives up | `:394`, `:836` | investigation |
 | 36 ✅ | bug | two workers in one execution, and one handshake between them | `:341`, `:359` | CONFIRMED (ASan) |
+| 37 | hyg | test comments carry plan-sized narrative | `test/async_tests.cpp` | read-only |
 | **Group 8 — build (closed)** |
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 
@@ -1151,43 +1155,49 @@ dead-binding drop all worked, while assignment stopped compiling. Not taken here
 stays this repo's accepted callable. The user's note is that the actuator's "works only with
 `std::function`" statement could be reworked there instead.
 
-### Step 32 · item K — `finishing_` and `running_` may collapse into one state
-`async.hpp:353` (`is_running()`), `:732` (`running_`), `:830` (`finishing_`) · **investigation, not
-a defect**
+### Step 32 · item K — `finishing_` was redundant and is gone — DONE
+`async.hpp:305` (`is_running()`), `:744` (`running_`) · **investigation, closed by removing a flag**
 
-Raised by the user on 2026-09-16: the two flags look like they overlap, and the pair may be saying
-in two variables what one could say.
+Raised by the user on 2026-09-16: the two flags look like they overlap. They did. Read from the code
+on 2026-09-19, they encoded three meanings in two bools, with the fourth combination reachable but
+not distinct:
 
-Read from the code, they encode a three-state worker lifecycle in two bools:
-
-| `running_` | `finishing_` | means |
+| `running_` | `finishing_` | meant |
 |---|---|---|
-| false | false | never started, or finished and released |
-| true | false | working - `is_running()` is true |
-| true | true | winding down: the work is over, but the worker is still touching this object |
-| false | true | **unreachable as a distinct state** - the terminal state after a `run()`, and
-`is_running()` already reads false from `running_` alone |
+| false | false | never started |
+| true | false | working - `is_running()` true |
+| true | true | winding down: work over, worker still inside the object |
+| false | true | gone; the terminal state after a run |
 
-So three meaningful states, four combinations, and an invariant kept by hand across two stores in
-two different functions. A single atomic state - `idle` / `working` / `finishing` - would say it
-once, and `is_running()` would become `state == working` instead of a conjunction that has to be
-read twice to be believed.
+**What `finishing_` bought, and it was only this:** `is_running()` went false a few instructions
+early - while the worker was still printing its farewell and had yet to clear `running_`. Nothing
+read that difference for its own sake, and step 17 had already taken away its other job: the
+notification is raised from inside the drain, before any such store.
 
-**Step 17 strengthened the case on 2026-09-17.** `finishing_` no longer has anything to do with the
-notification — the callback is raised before it is set — so its only remaining job is to let a
-caller polling `is_running()` learn the work is over before the lifetime handshake does. One flag
-doing one job alongside another flag doing one job is exactly the shape that collapses.
+**What it cost was step 36.** That early false is precisely what invited a caller to start a second
+run into the first worker's tail, which is where the two workers, the shared handshake and the
+use-after-free came from. The flag did not merely fail to earn its place; it opened the door.
 
-> Investigate; do not assume it lands. The constraint is the destructor handshake: `~execution()`
-> spins on `running_` and may free the object the moment it reads false, so whatever replaces it
-> must keep a single store that is provably the last thing the worker touches. `finishing_` exists
-> precisely because that store cannot also be what tells a callback the work is over - see step 16,
-> and `run_does_not_tell_on_finished_it_is_still_running`.
+> `finishing_` deleted. `is_running()` is `running_.load()`, so it means what `~execution()` and
+> `wait_thread_to_finish()` already meant by it: **a worker is still there**. The two stores in
+> `run()`/`start()` and the two in the worker tails go with it - seven lines added, twenty-seven
+> removed.
 
-**Order: after step 30.** Today `loop()` never sets `finishing_`, so the encoding is not even
-uniform across the two worker paths; merging them before that is fixed would bake the asymmetry into
-whatever replaces them.
+**Deliberately not done:** no enum, no `idle`/`working`/`finishing` state, no rename of `running_`.
+The user's call, and the right one - once the redundant flag is gone there is one thing to say and
+one flag saying it, and a three-valued state would only re-introduce a distinction nothing reads.
 
+**No test could fail on this**, and none was invented. The semantics that moved are the ones no case
+asserts: `a_run_batch_does_not_claim_the_worker_stopped` checks `is_running()` **after** waiting for
+the worker, which holds either way, and
+`an_execution_running_its_last_actions_does_not_report_itself_finished` pins the true answer during
+the last drain, which is unchanged. Four test comments described the two-flag world and were
+rewritten.
+
+**Verified:** 41/41 Debug with a 30x repeat; 41/41 under AddressSanitizer and under
+ThreadSanitizer; `async_smoke_test` exit 0 on all three, 0 TSan warnings; the flake that led here
+**0 of 20 batches** of 50 TSan repeats; clang-format clean; `tools/make_doc.sh` 0 warnings, 41
+pages.
 
 ---
 
@@ -1479,6 +1489,22 @@ does not block that; it closes the use-after-free in the meantime.
 ThreadSanitizer, 10x repeat each with no failures; `async_smoke_test` exit 0 on all three, 0 TSan warnings; the original flake
 **0 of 40 batches** of 50 TSan repeats, where it was 21 of 40; clang-format clean;
 `tools/make_doc.sh` 0 warnings.
+
+### Step 37 · hygiene — test comments carry plan-sized narrative
+`test/async_tests.cpp` (throughout) · added 2026-09-19, the user's own · **open**
+
+Step 33 did this for `async.hpp`; the test file was not swept and reads the way the header used to.
+591 of its 1456 lines are comment, the longest case comments run 22 to 29 lines, and **17 lines name
+a step number, an item number or a date** - how the defect was found, what the plan said, which
+contract moved on which day.
+
+> Same rule as step 33: say briefly and accurately **what the case does and what it asserts**.
+> Keep what a reader of the case cannot get from its code - that a case aborts rather than fails
+> under a sanitizer, that counters are read as deltas because the binary may run every case in one
+> process, that a case is a guard rather than a reproduction. Drop the history: it is in this file
+> and in the git log.
+
+**Not a rename of any case.** The names are the contract and stay as they are.
 
 ### Step 33 · hygiene — doc comments carry plan-sized narrative — DONE
 `async.hpp` (throughout) · added and done 2026-09-19, the user's own
