@@ -329,13 +329,20 @@ class execution {
    *
    * The worker is detached: wait for it with \ref is_running() or \ref execution_poll. Actions
    * queued while it is draining are run by it too. \ref results() is filled by this path only.
+   *
+   * Blocks until a worker still resident from a previous run has left, so one execution never has
+   * two. \ref is_running() goes false a moment before that, so a caller that runs again the instant
+   * it reads finished waits here for the remainder.
+   *
+   * @attention Never call this from inside an action: the worker that would have to leave is the
+   * one making the call, so it waits for itself and hangs.
    */
   void run() {
-    running_ = true;
+    wait_thread_to_finish();
     finishing_ = false;
     collecting_results_ = true;
-    this_thread_ = std::thread(&execution::execute, this);
-    this_thread_.detach();
+    thread_ = std::thread(&execution::execute, this);
+    thread_.detach();
   }
 
   /**
@@ -343,9 +350,13 @@ class execution {
    *
    * Unlike \ref run(), the worker stays for the life of the execution, so \ref is_running() is
    * true whether or not there is work; ask \ref is_busy() instead. Results are not collected.
+   *
+   * Blocks until a worker still resident has left, as \ref run() does.
+   *
+   * @attention Never call this from inside an action, for the reason given on \ref run().
    */
   void start() {
-    running_ = true;
+    wait_thread_to_finish();
     finishing_ = false;
     collecting_results_ = false;
     {
@@ -354,8 +365,8 @@ class execution {
       stopped_ = false;
     }
 
-    this_thread_ = std::thread(&execution::loop, this);
-    this_thread_.detach();
+    thread_ = std::thread(&execution::loop, this);
+    thread_.detach();
   }
 
   /**
@@ -673,6 +684,21 @@ class execution {
     on_finished();
   }
 
+  /**
+   * @brief Waits for a resident worker to finish, and takes its place in the same step.
+   *
+   * `running_` is what a worker owns for its whole life and clears last, so taking it with one
+   * compare-exchange is what keeps two workers out of one execution - and out of one handshake,
+   * which ~execution() reads to decide the object may be freed.
+   */
+  void wait_thread_to_finish() {
+    auto resident = false;
+    while (!running_.compare_exchange_weak(resident, true)) {
+      resident = false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
   void execute() {
     // The results belong to this run, not to this run and the last one.
     {
@@ -720,7 +746,7 @@ class execution {
     running_ = false;
   }
 
-  std::thread this_thread_;
+  std::thread thread_;
 
   std::atomic_bool started_ = {false};
   std::atomic_bool running_ = {false};

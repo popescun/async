@@ -1,10 +1,11 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 32 of 36 steps done — 1 to 26, plus 27 to 31 and 33 out of order. 31 are
-committed, HEAD `5d4a4ee`; step 26 is in the working tree. **Group 7 is complete.** The per-step
+**Status (2026-09-19):** 33 of 36 steps done — 1 to 26, plus 27 to 31, 33 and 36 out of order. 32
+are committed, HEAD `305b672`; step 36 is in the working tree. **Group 7 is complete**, and the last
+outright defect is closed. The per-step
 commits are in the table under **Progress**; this line no longer restates them, because that is how
 it kept drifting.
-**Tests:** 40 of 40 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
+**Tests:** 41 of 41 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
 and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
 flakes.
@@ -73,11 +74,11 @@ remains of the group**, and step 33 joins group 7.
 | `686b7e5` | 23 — both dead forward declarations go |
 | `d20640f` | 24 — the three connection points bind through `this` |
 | `5d4a4ee` | 25 — `add_action()` and both `bind()` lambdas forward |
-| *(uncommitted)* | 26 — `\|=` on a bool becomes `\|\|`, and the poll's fold gains a test |
+| `305b672` | 26 — `\|=` on a bool becomes `\|\|`, and the poll's fold gains a test |
+| *(uncommitted)* | 36 — `run()` and `start()` wait for a resident worker to leave |
 
-**NEXT: step 36**, the one outright defect left - a flaky case that points at a real race between a
-second `run()` and the first worker's tail. Then step 32, whose single state may be the answer to
-it, and the investigations 34 and 35 out of step 25's measurements.
+**NEXT: step 32**, whose single state would subsume step 36's wait, and then the investigations 34
+and 35 out of step 25's measurements. Nothing left is a known defect.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -110,8 +111,8 @@ default-constructed result, so an async call to an `int`-returning method yields
 argument still will not compile, and never could have here: the queue stores `std::function`, which
 needs a copy-constructible target. See step 25.
 
-**Remaining: 4 steps.** Step 32, the investigations 34 and 35, and the flake in 36; groups 1 to 5,
-7 and 8 are closed.
+**Remaining: 3 steps**, none of them a known defect: step 32, and the investigations 34 and 35.
+Groups 1 to 5, 7 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -180,7 +181,7 @@ of atomic.
 | 33 ✅ | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
 | 34 | perf | a bound action is copied once per invocation | `:264`, `:294` | CONFIRMED (counted) |
 | 35 | api | a second entry point for actions the caller gives up | `:394`, `:836` | investigation |
-| 36 | bug | `are_cleared_between_runs` is flaky: a second `run()` races the first worker's tail | `test:1108` | CONFIRMED (repeats) |
+| 36 ✅ | bug | two workers in one execution, and one handshake between them | `:341`, `:359` | CONFIRMED (ASan) |
 | **Group 8 — build (closed)** |
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 
@@ -929,7 +930,8 @@ five was written, applied, measured and reverted. What landed instead is the rea
 on `~execution()`, plus a guard in the suite. Both halves of the item were probed rather than argued
 about.
 
-**The premise was wrong about `this_thread_`.** The compiler blames that field only because
+**The premise was wrong about the thread member** - `this_thread_` then, `thread_` since
+2026-09-19. The compiler blames that field only because
 `std::thread` is the first member declared. Removing the thread from a scratch header changed
 nothing: `started_` is blamed next and all four traits stay false. Every atomic, both mutexes and
 the condition variable delete the copy operations independently. The deletion is over-determined, so
@@ -1424,33 +1426,59 @@ not a reproduction.
 clean; `tools/make_doc.sh` 0 warnings, 41 pages. ThreadSanitizer is 40/40 too, but see step 36:
 one case there is flaky for reasons that predate this step.
 
-### Step 36 · `are_cleared_between_runs` is flaky — an execution that is run twice
-`test/async_tests.cpp:1108`, `async.hpp:365` (`is_running()`), `:749`, `:763` (`execute()`'s tail) ·
-CONFIRMED by repetition, 2026-09-19 · **open**
+### Step 36 · two workers in one execution — DONE
+`async.hpp:341`, `:359` (`run()`, `start()`), `:694` (the wait) · CONFIRMED: ASan
+`heap-use-after-free`, deterministic
 
-`execution_results.are_cleared_between_runs` fails intermittently. Found when a ThreadSanitizer ctest
-run came back 39/40 and the rerun was green; hunted down by repetition rather than left as noise.
+Found as a flaky test - `execution_results.are_cleared_between_runs` failing about one iteration in
+a hundred under ThreadSanitizer, reporting `results()` as `{}` or as the previous run's `{1}`. The
+flake was the narrow door onto a real defect.
 
-**Rate, measured 2026-09-19** with `--gtest_repeat=50` batches under TSan: **21 of 40 batches** in
-the working tree, 13 of 20 at HEAD, so roughly one iteration in a hundred. It reports
-`exec->results()` as `{}`, and once as `{1}` - the *previous* run's result.
+**What it was.** `run()` never asked whether a worker was already there. A second `run()` spawned a
+second one, and both shared `running_` - which is not merely a status flag but the handshake
+`~execution()` waits on. The first worker to finish cleared it, the destructor's wait was satisfied
+while the other was still inside the object, and the object was freed under it.
 
-**The suspected mechanism, not yet proven**, and it is step 32's ground: `is_running()` is
-`running_ && !finishing_`, and the worker sets `finishing_` **before** clearing `running_`. So a
-caller that waits for `!is_running()` is released while the first worker is still in its tail. It
-calls `run()` again, which sets `running_ = true` and spawns a second worker - and the departing
-first worker then writes `running_ = false` over it. The second wait returns at once, before the new
-worker has run anything, and the results vector is read empty or still holding the old value.
+**Probed 2026-09-19.** Two `run()` calls back to back, then letting the object go: **5 of 5 runs**
+aborted under AddressSanitizer with `heap-use-after-free` at `async.hpp:629`, written by the
+surviving worker into the block the destructor had already returned. The flaky case is the same
+thing arriving by timing: `is_running()` goes false when `finishing_` is set, *before* `running_` is
+cleared - deliberately, since steps 17 and 30 - so a caller told the run is over starts its second
+run into the first worker's tail.
 
-> If that is right, the defect is not in the test: **an execution cannot safely be run again at the
-> moment it says it has finished**, which is precisely what `results()` invites a caller to do.
-> Confirm the mechanism first - a probe that logs the two flags around both runs will settle it -
-> then decide whether the answer is step 32's single state, or `run()` refusing to start while a
-> previous worker is still resident.
+> `run()` and `start()` now call `wait_thread_to_finish()`, which takes `running_` with a single
+> `compare_exchange_weak`, waiting 1ms at a time while a worker still holds it. One step rather than
+> a wait followed by a store, so two callers racing cannot both pass it. The destructor's own spin
+> on `running_` is unchanged.
 
-**Not caused by the hygiene steps.** The case was green where it was introduced (`f37ee83`, 0 of 20)
-and the rate rises across the notification work; where exactly does not matter, and the bisect was
-stopped on the user's call. Nothing in steps 22 to 26 touches these flags.
+**Chosen over refusing.** A refusal would have been the `add_action()` shape - an answer rather than
+a wait - but it breaks the legitimate pattern the flaky case uses: a caller told the work is
+finished runs again straight away, and has no other way to know when that is safe, precisely because
+`is_running()` goes false first. Waiting keeps every published contract and costs the caller the
+remainder of a tail.
+
+**@attention on both, and it is new:** calling `run()` or `start()` **from inside an action** now
+hangs - the worker that must leave is the one making the call. Probed on the old header first: it
+did not deadlock there, it silently started a second worker, which is the defect itself. A hang in
+place of corruption is the better failure, and it is documented on both functions rather than
+detected.
+
+**Test:** `execution_lifecycle.a_second_run_does_not_leave_two_workers_in_one_execution`. Twenty
+double runs, each let go at once so the destructor's handshake meets both workers. It **aborted
+rather than failed** under ASan before the fix, 3 of 3 runs, and passes after. In a plain Debug build
+it passed either way, which the case says out loud: nothing observable goes wrong there.
+
+**Also renamed, at the user's call:** the thread member `this_thread_` is now `thread_`, which no
+longer reads like `std::this_thread`.
+
+**Step 32 would subsume this.** One atomic `idle`/`working`/`finishing` makes "a worker is resident"
+a state rather than a flag shared by two meanings, and `run()`'s wait becomes a transition. This fix
+does not block that; it closes the use-after-free in the meantime.
+
+**Verified:** 41/41 Debug, 30x repeat with no failures; 41/41 under AddressSanitizer and under
+ThreadSanitizer, 10x repeat each with no failures; `async_smoke_test` exit 0 on all three, 0 TSan warnings; the original flake
+**0 of 40 batches** of 50 TSan repeats, where it was 21 of 40; clang-format clean;
+`tools/make_doc.sh` 0 warnings.
 
 ### Step 33 · hygiene — doc comments carry plan-sized narrative — DONE
 `async.hpp` (throughout) · added and done 2026-09-19, the user's own

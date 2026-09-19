@@ -495,6 +495,39 @@ TEST(execution_lifecycle, an_execution_running_its_last_actions_does_not_report_
 }
 
 /**
+ * @brief A second run() does not leave two workers inside one execution.
+ *
+ * run() spawns a worker and sets `running_`, which is also the handshake ~execution() waits on.
+ * Nothing checks whether a worker is already there, so a second run() starts a second one and both
+ * share that single flag: whichever finishes first clears it, the destructor's wait is satisfied
+ * while the other is still inside the object, and the object is freed under it.
+ *
+ * @attention This case **aborts rather than fails** under AddressSanitizer, which is what the
+ * defect does - `heap-use-after-free` at async.hpp:629, written by the surviving worker into the
+ * block the destructor has already returned. gtest_discover_tests gives every case its own process,
+ * so it takes down this one and not the suite. In a plain Debug build it passes silently: nothing
+ * observable goes wrong, which is exactly why the case is written this way.
+ *
+ * @remark The flaky `execution_results.are_cleared_between_runs` is the same defect arriving by a
+ * narrower door: is_running() goes false when `finishing_` is set, before `running_` is cleared, so
+ * a caller told the run is over starts its second run into the first worker's tail. That one shows
+ * up about once in a hundred iterations under ThreadSanitizer; this one is deterministic.
+ */
+TEST(execution_lifecycle, a_second_run_does_not_leave_two_workers_in_one_execution) {
+  // Repeated, because the window is the instant between one worker clearing `running_` and the
+  // other leaving; one pass can miss it and twenty do not.
+  for (auto i = 0; i < 20; ++i) {
+    auto exec = void_execution::create_instance("twice_over");
+    exec->add_action([] { std::this_thread::sleep_for(2ms); });
+
+    exec->run();
+    exec->run();  // a second worker, while the first is still resident
+  }  // let go at once, so the destructor's handshake meets both workers
+
+  SUCCEED() << "twenty double runs, and the object outlived both workers each time";
+}
+
+/**
  * @brief The poll does not report idle while an execution is still running.
  *
  * execution_poll is a singleton, and waiting on it is what the interface offers in place of a join,
