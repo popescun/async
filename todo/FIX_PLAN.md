@@ -1,9 +1,8 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 27 of 33 steps done — 1 to 21, plus 27 to 31 and 33. 26 of them are
-committed, HEAD `622660b`. The per-step commits are in the table under **Progress**; this line no
-longer restates them, because that is how it kept drifting.
-**Uncommitted:** step 33, the doc-comment sweep over `async.hpp`, plus this plan update.
+**Status (2026-09-19):** 27 of 33 steps done and committed — 1 to 21, plus 27 to 31 and 33 out of
+order. HEAD `588b7ca`; nothing is pending but this plan update. The per-step commits are in the
+table under **Progress**; this line no longer restates them, because that is how it kept drifting.
 **Tests:** 35 of 35 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
 and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
@@ -64,7 +63,7 @@ remains of the group**, and step 33 joins group 7.
 | `f8472c0` | 21 — `add_action()` returns bool; the bound path stays untold |
 | `b14373e` | 28 — a throwing action is caught in three arms; the worker survives |
 | `622660b` | 29 — **declined**; the three connection points are documented instead |
-| *(uncommitted)* | 33 — the header's doc comments cut to what each entity is and does |
+| `588b7ca` | 33 — the header's doc comments cut to what each entity is and does |
 
 **NEXT: group 7**, steps 22 to 26 — all hygiene, all read-only findings; 33 is done. Step 32 is the
 only investigation left, and nothing blocks it any more.
@@ -615,7 +614,7 @@ false, so `running_` must stay the last thing the worker touches, and a caller p
 `is_running()` still needs an answer that goes false before the lifetime handshake does. See step 32,
 which asks whether the two flags should collapse now that one of them does less.
 
-### Step 17 · item 12 — an attached execution's `on_finished` never fires — DONE (uncommitted)
+### Step 17 · item 12 — an attached execution's `on_finished` never fires — DONE
 `async.hpp:652-671` (`notify_finished`), `:672-698` (`execute`), `:700-728` (`loop`)
 
 **Narrowed on 2026-09-15**, after probing. The item as written had three parts; two of them are not
@@ -634,7 +633,7 @@ synchronously and by a real `start()`ed attacher.
 > `on_finished_fires_once_per_run`. The rule from step 16 holds here too: a pass that ran nothing
 > reports nothing.
 
-**Applied 2026-09-17**, in the working tree, not yet committed. `execute_actions()` raises the
+**Applied 2026-09-17**, and landed in `5408eff`. `execute_actions()` raises the
 notification itself, at the point its list empties, which is the one place every driver passes
 through — a worker in `execute()` or `loop()`, and an attacher's worker arriving via
 `action_execute`. `execute()` no longer notifies separately, which is what keeps `run()` to one
@@ -690,7 +689,7 @@ contract past the threads added to it.
 > An attached execution should carry the attacher's running state, or the poll should report through
 > the attacher. Depends on how step 13 reshapes `attach()`.
 
-### Step 30 · item I — `loop()` never sets `finishing_` — DONE (uncommitted)
+### Step 30 · item I — `loop()` never sets `finishing_` — DONE
 `async.hpp:700-728` · CONFIRMED by probe; **read-only — no black-box test is possible, see below**
 
 Raised by the user on 2026-09-15, reading the two worker paths against each other. Not an audit
@@ -744,14 +743,14 @@ the guard. 30x repeat, no flakes; TSan silent.
 **What must also keep passing:** `execution_notification.a_drained_batch_does_not_claim_the_worker_
 stopped`. Mid-loop, a drained batch says nothing about the worker and `is_running()` must stay true.
 
-**Applied 2026-09-16**, in the working tree, not yet committed. `loop()`'s tail now reads as
+**Applied 2026-09-16**, and landed in `5408eff`. `loop()`'s tail now reads as
 `execute()`'s does - the post-break drain is held in `actions_run`, `finishing_` is set after it and
 before `notify_finished()`, and `running_` stays last. Verified: 32/33 Debug, the one failure being
 step 17's own test; ThreadSanitizer 31 passed and **0 warnings** across the whole suite;
 AddressSanitizer the same with 0 errors; 30x repeat of the full suite, exactly one failing test every
 run, no flakes. clang-format clean.
 
-### Step 31 · item J — the drain after `loop()` breaks can never report a batch — DONE (uncommitted)
+### Step 31 · item J — the drain after `loop()` breaks can never report a batch — DONE
 `async.hpp:735-745` · line references refreshed 2026-09-17, after steps 17 and 30 reshaped `loop()`
 
 Found 2026-09-15 while analysing step 30.
@@ -779,7 +778,7 @@ on exactly that.
 worker actually stops with nothing left to run. That was decided, and this step does not change it -
 it only stops the code from implying otherwise.
 
-**Applied 2026-09-17**, in the working tree, not yet committed. Three changes, the third decided
+**Applied 2026-09-17**, and landed in `91c6112`. Three changes, the third decided
 with this step rather than carried separately.
 
 1. **The tail `notify_finished()` is gone.** Unreachable, and leaving it implied a stop-path
@@ -816,7 +815,7 @@ on **both** binaries; `tools/make_doc.sh` clean, 41 pages; clang-format clean.
 
 ## Group 5 — output (closed)
 
-### Step 18 · item 14 — the header writes to `std::cout` unsynchronised — DONE (uncommitted)
+### Step 18 · item 14 — the header writes to `std::cout` unsynchronised — DONE
 `async.hpp:712` (`execute()`), `:751` (`loop()`) · line references refreshed 2026-09-17
 
 Two debug prints from worker threads, in a header-only library, on a stream shared with the
@@ -827,7 +826,7 @@ these two predate it and do not.
 > a library should not print at all on the success path. Consider taking them out entirely and
 > letting the logger you have planned own this.
 
-**Applied 2026-09-17**, in the working tree, not yet committed. Both routed through `std::println`,
+**Applied 2026-09-17**, and landed in `86f343a`. Both routed through `std::println`,
 which the user chose over deleting them. Each now names the execution, as the two existing warnings
 at `:444` and `:641` do — with several workers running they were otherwise anonymous, which was most
 of what made them useless:
@@ -846,7 +845,7 @@ the suggestion above to let a logger own them stands.
 
 **Flow-on:** `async.hpp` no longer uses `<iostream>`, which shortens step 22's list.
 
-### Step 19 · item E — the smoke test races on `std::cout` between two workers — DONE (uncommitted)
+### Step 19 · item E — the smoke test races on `std::cout` between two workers — DONE
 `test/async_smoke_test.cpp:15`, `:24` · CONFIRMED under TSan, and present before `60f7970`
 
 `A::f_with_arg` and `A::f_with_arg_and_return` print from two different workers concurrently. This
@@ -857,7 +856,7 @@ Visible in the output as interleaved lines:
 > `std::println` per line, or a mutex in the test. Worth doing so that "TSan is clean" becomes true
 > of the whole repo and a future regression is not lost in a known warning.
 
-**Applied 2026-09-17**, in the working tree, not yet committed. Fifteen sites converted: fourteen in
+**Applied 2026-09-17**, and landed in `86f343a`. Fifteen sites converted: fourteen in
 `async_smoke_test.cpp` and one in `test/other_async.hpp:13`, which this item never named and which
 produced the stray `test` line in the output.
 
@@ -891,7 +890,7 @@ from here on.
 
 ## Group 6 — API contract
 
-### Step 20 · item B — `~execution()` suppressed the implicit moves — DONE, **declined** (uncommitted)
+### Step 20 · item B — `~execution()` suppressed the implicit moves — DONE, **declined**
 `async.hpp:255` (`~execution()`) · line reference refreshed 2026-09-17
 
 Step 3 gave `execution` a user-declared destructor, which suppresses the implicit move constructor
@@ -956,7 +955,7 @@ Verified: 34/34; 30x repeat, no failures; ThreadSanitizer 0 warnings and Address
 on both binaries; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings,
 41 pages.
 
-### Step 21 · item C — a refused action is reported but not returned — DONE (uncommitted)
+### Step 21 · item C — a refused action is reported but not returned — DONE
 `async.hpp:440-480` (`add_action()`) · line reference refreshed 2026-09-17
 
 `add_action()` on a stopped execution prints a warning and returns. The caller has no programmatic
@@ -969,7 +968,7 @@ on stderr is better than silence, and less than telling.
 > `bool add_action(...)`, threaded back through the `bind()` lambdas. Touches the same two lambdas
 > as step 12, so land them together or accept two passes over the same lines.
 
-**Applied 2026-09-17**, in the working tree, not yet committed. `add_action()` returns `bool` —
+**Applied 2026-09-17**, and landed in `f8472c0`. `add_action()` returns `bool` —
 `false` when the execution is stopped and the action was dropped, `true` when it was queued. The
 empty `@brief` stub it carried was written properly at the same time; the return value needed
 documenting and there was nothing there to add it to.
@@ -1247,7 +1246,8 @@ lock or a bound is what it is.
   has a brief: `run()` is one-shot and fills `results()`; `start()` is continuous, reports
   `is_running()` true for its whole life, and collects nothing.
 
-**Verified:** 35/35; `tools/make_doc.sh` 0 warnings, 41 pages; clang-format clean.
+**Verified:** 35/35; `tools/make_doc.sh` 0 warnings, 41 pages; clang-format clean. Landed in
+`588b7ca`, the fix plan with it.
 
 ---
 
