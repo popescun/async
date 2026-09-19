@@ -84,7 +84,128 @@ bool wait_until_poll_idle(std::chrono::milliseconds limit) {
   return wait_for([] { return !untangle::async::execution_poll::get().is_running(); }, limit);
 }
 
+/**
+ * @brief Counts the copies made of it, so the queue's own copying is measurable.
+ *
+ * The move constructor is declared because declaring the copy constructor would otherwise suppress
+ * it, and every move would be reported as a copy.
+ */
+struct copy_counter {
+  copy_counter() = default;
+  copy_counter(const copy_counter&) { copies.fetch_add(1, std::memory_order_relaxed); }
+  copy_counter(copy_counter&&) noexcept = default;
+
+  static inline std::atomic_int copies = {0};
+};
+
+/**
+ * @brief The same, for the action itself: a callable the std::function carries its copies with.
+ *
+ * @attention The copy constructor must stay non-noexcept. libc++ keeps a nothrow-copyable target in
+ * std::function's small buffer and copy-constructs it on every relocation, which turns the one copy
+ * counted below into three - a fact about the counter, not about add_action().
+ */
+struct counting_action {
+  counting_action() = default;
+  counting_action(const counting_action&) { copies.fetch_add(1, std::memory_order_relaxed); }
+  counting_action(counting_action&&) noexcept = default;
+
+  void operator()(const copy_counter&) const {}
+
+  static inline std::atomic_int copies = {0};
+};
+
+//! A method to bind, so the copies the bound lambda makes can be counted too.
+struct counting_target {
+  void take(const copy_counter&) {}
+};
+
+using counting_action_t = std::function<void(const copy_counter&)>;
+using counting_execution = untangle::async::execution<counting_action_t>;
+
 }  // namespace
+
+/**
+ * @brief An action the caller keeps is copied once, and its arguments once, not twice.
+ *
+ * The queue has to own what it is given, so one copy of an action the caller goes on holding is the
+ * price of queueing it. A second copy was not: it came from taking the parameters by value and then
+ * handing those copies to std::bind, which copies again.
+ *
+ * @remark The action is queued and never run - running it would copy for its own reasons, and the
+ * question here is what queueing costs.
+ */
+TEST(execution_queue, queueing_copies_the_action_and_its_arguments_once) {
+  auto exec = counting_execution::create_instance("copies");
+
+  const copy_counter argument;
+  counting_action_t action = counting_action{};
+
+  // Counted as a delta rather than from zero: the counters are static, and running this binary
+  // directly puts every case in one process.
+  const auto actions_before = counting_action::copies.load();
+  const auto arguments_before = copy_counter::copies.load();
+
+  EXPECT_TRUE(exec->add_action(action, argument));
+
+  EXPECT_EQ(counting_action::copies.load() - actions_before, 1)
+      << "the action was copied " << counting_action::copies.load() - actions_before
+      << " times on its way to the queue";
+  EXPECT_EQ(copy_counter::copies.load() - arguments_before, 1)
+      << "the argument was copied " << copy_counter::copies.load() - arguments_before
+      << " times on its way to the queue";
+}
+
+/**
+ * @brief An action the caller gives up is not copied at all.
+ *
+ * add_action() takes the action by value, which makes it a sink: std::move() at the call site, a
+ * temporary, and a lambda all hand it straight to the queue. That is the shape most callers use -
+ * every lambda in this file arrives this way - and it is why there is no second overload for it.
+ */
+TEST(execution_queue, queueing_an_action_the_caller_gives_up_copies_it_not_at_all) {
+  auto exec = counting_execution::create_instance("given_up");
+
+  const copy_counter argument;
+  counting_action_t action = counting_action{};
+
+  const auto moved_before = counting_action::copies.load();
+  EXPECT_TRUE(exec->add_action(std::move(action), argument));
+  EXPECT_EQ(counting_action::copies.load() - moved_before, 0)
+      << "an action moved into add_action() was copied "
+      << counting_action::copies.load() - moved_before << " times";
+
+  // A temporary is the same shape, and is how a lambda arrives.
+  const auto temporary_before = counting_action::copies.load();
+  EXPECT_TRUE(exec->add_action(counting_action{}, argument));
+  EXPECT_EQ(counting_action::copies.load() - temporary_before, 0)
+      << "a temporary action was copied " << counting_action::copies.load() - temporary_before
+      << " times";
+}
+
+/**
+ * @brief An argument handed to a bound action is copied once too.
+ *
+ * bind_action_and_method() wraps the call in a lambda that passes the arguments on to
+ * add_action(). A lambda taking them by value copies once before add_action() has seen them, which
+ * puts the second copy back however add_action() is written.
+ */
+TEST(execution_queue, queueing_through_a_binding_copies_the_argument_once) {
+  auto target = std::make_shared<counting_target>();
+  auto exec = counting_execution::create_instance("bound_copies");
+
+  counting_action_t bound;
+  counting_execution::bind_action_and_method(bound, target, &counting_target::take, exec);
+
+  const copy_counter argument;
+  const auto arguments_before = copy_counter::copies.load();
+
+  bound(argument);
+
+  EXPECT_EQ(copy_counter::copies.load() - arguments_before, 1)
+      << "the argument was copied " << copy_counter::copies.load() - arguments_before
+      << " times on its way through the binding";
+}
 
 /**
  * @brief The queue works at all: one action, queued before the worker exists, runs once.
@@ -532,6 +653,37 @@ TEST(execution_binding, a_function_action_does_not_reach_a_destroyed_execution) 
       << "an action outliving its execution must report a dead binding, not follow it";
 
   EXPECT_EQ(calls.load(), 0) << "an action bound to a destroyed execution appeared to run";
+}
+
+/**
+ * @brief Building a binding copies the callable only if the caller keeps it.
+ *
+ * bind_action_and_function() takes the callable by value and moves it into the action it builds,
+ * and the action is moved into the lambda that carries it. Neither step copies, so a caller who
+ * hands over a temporary - or moves one in - pays nothing to be bound.
+ *
+ * @remark This is about building the binding, not about calling it. What one call costs is
+ * queueing_through_a_binding_copies_the_argument_once, and the action copy it still makes is step
+ * 34.
+ */
+TEST(execution_binding, building_a_binding_copies_a_callable_the_caller_gives_up_not_at_all) {
+  auto exec = counting_execution::create_instance("bind_cost");
+
+  counting_action_t bound;
+
+  const auto temporary_before = counting_action::copies.load();
+  counting_execution::bind_action_and_function(bound, counting_action{}, exec);
+  EXPECT_EQ(counting_action::copies.load() - temporary_before, 0)
+      << "binding a temporary copied it " << counting_action::copies.load() - temporary_before
+      << " times";
+
+  const counting_action kept;
+  const auto lvalue_before = counting_action::copies.load();
+  counting_execution::bind_action_and_function(bound, kept, exec);
+  EXPECT_EQ(counting_action::copies.load() - lvalue_before, 1)
+      << "binding a callable the caller keeps copied it "
+      << counting_action::copies.load() - lvalue_before
+      << " times, and one is the price of keeping";
 }
 
 /**

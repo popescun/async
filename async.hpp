@@ -254,13 +254,13 @@ class execution {
     actionT async_action = untangle::bind(obj, method);
 
     action = [wp = std::weak_ptr<execution>(async_exec),
-              async_action](auto... args) -> actionT::result_type {
+              async_action = std::move(async_action)](auto&&... args) -> actionT::result_type {
       // lock() also keeps the execution alive for the duration of the call
       const auto exec = wp.lock();
       if (!exec) {
         throw invalid_action("bind: invalid execution");
       }
-      exec->add_action(async_action, args...);
+      exec->add_action(async_action, std::forward<decltype(args)>(args)...);
       return typename actionT::result_type();
     };
   }
@@ -272,21 +272,21 @@ class execution {
    * \ref add_action(). The execution is held weakly, as in \ref bind_action_and_method().
    *
    * @param action [in,out] - An action of type std::function<...>.
-   * @param Fn - A plain function.
+   * @param Fn - A plain function, or any callable; moved into the binding.
    * @param async_exec - A std::shared_ptr owning the execution the action is queued on.
    */
   template <typename T>
-  static void bind_action_and_function(actionT& action, const T& Fn,
+  static void bind_action_and_function(actionT& action, T Fn,
                                        const std::shared_ptr<execution>& async_exec) {
-    actionT async_action = Fn;
+    actionT async_action = std::move(Fn);
 
     action = [wp = std::weak_ptr<execution>(async_exec),
-              async_action](auto... args) -> actionT::result_type {
+              async_action = std::move(async_action)](auto&&... args) -> actionT::result_type {
       const auto exec = wp.lock();
       if (!exec) {
         throw invalid_action("bind: invalid execution");
       }
-      exec->add_action(async_action, args...);
+      exec->add_action(async_action, std::forward<decltype(args)>(args)...);
       return typename actionT::result_type();
     };
   }
@@ -402,7 +402,7 @@ class execution {
    * @return false - the execution is stopped and the action was dropped.
    */
   template <typename... Args>
-  bool add_action(actionT action, Args... args) {
+  bool add_action(actionT action, Args&&... args) {
     {
       std::lock_guard<std::mutex> lock(action_mutex_);
 
@@ -413,7 +413,7 @@ class execution {
         return false;
       }
 
-      action_list_.push_back(std::bind(action, args...));
+      action_list_.push_back(std::bind(std::move(action), std::forward<Args>(args)...));
     }
 
     action_cv_.notify_one();

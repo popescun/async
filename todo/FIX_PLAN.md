@@ -1,9 +1,9 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 30 of 33 steps done — 1 to 24, plus 27 to 31 and 33 out of order. 29 are
-committed, HEAD `686b7e5`; step 24 is in the working tree. The per-step commits are in the
+**Status (2026-09-19):** 31 of 35 steps done — 1 to 25, plus 27 to 31 and 33 out of order. 30 are
+committed, HEAD `d20640f`; step 25 is in the working tree. The per-step commits are in the
 table under **Progress**; this line no longer restates them, because that is how it kept drifting.
-**Tests:** 35 of 35 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
+**Tests:** 39 of 39 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
 and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
 flakes.
@@ -69,10 +69,11 @@ remains of the group**, and step 33 joins group 7.
 | `588b7ca` | 33 — the header's doc comments cut to what each entity is and does |
 | `5f09f17` | 22 — five headers the header uses and did not include |
 | `686b7e5` | 23 — both dead forward declarations go |
-| *(uncommitted)* | 24 — the three connection points bind through `this` |
+| `d20640f` | 24 — the three connection points bind through `this` |
+| *(uncommitted)* | 25 — `add_action()` and both `bind()` lambdas forward |
 
-**NEXT: group 7**, steps 25 and 26 — both hygiene; 22, 23, 24 and 33 are done. Step 32 is the only
-investigation left, and nothing blocks it any more.
+**NEXT: step 26**, the last of group 7; 22 to 25 and 33 are done. Then the three that are left are
+all open questions rather than defects: 32, and 34 and 35, both out of step 25's measurements.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -98,13 +99,15 @@ the callback is raised from inside `execute_actions()`, on the worker's thread, 
 list empties — so `on_finished` sees `is_running()` true, on both worker paths, and that is
 deliberate. See the note at the end of step 16.
 
-**Carried forward from step 12, not done there:** the by-value/double-copy half of item 8. The
-`bind()` lambdas still take `auto... args` by value and `std::bind` copies again, so a move-only
-argument will not compile, and they return a default-constructed result, so an async call to an
-`int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
-together, or accept three passes over the same two lambdas.
+**Carried forward from step 12, and half of it is now done.** The by-value/double-copy half landed
+with **step 25** on 2026-09-19: both `bind()` lambdas forward their arguments, and the copy count
+through the bound path went from two to one. What is still open is the other half — they return a
+default-constructed result, so an async call to an `int`-returning method yields 0. A move-only
+argument still will not compile, and never could have here: the queue stores `std::function`, which
+needs a copy-constructible target. See step 25.
 
-**Remaining: 3 steps.** Step 32, and group 7's 25 and 26; groups 1 to 5 and 8 are closed.
+**Remaining: 4 steps.** Step 32, group 7's 26, and the new 34 and 35; groups 1 to 5 and 8 are
+closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -113,10 +116,10 @@ the ubuntu job could not compile `<print>` at all, so nothing else could be veri
 back to attached executions having their own list and no way to notify the attacher, but redesigning
 that is a feature decision, not a fix. It is called out where it bites and left alone otherwise.
 
-33 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
+35 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
 one. The audit's numbering is preserved so items stay traceable; findings added while fixing are
 lettered. Step 28 was added on 2026-09-14, steps 29 to 31 on 2026-09-15, step 32 on 2026-09-16 and
-step 33 on 2026-09-19, after the others.
+steps 33, 34 and 35 on 2026-09-19, after the others.
 The letter D is unused and skipped:
 nothing in this file or in the history ever claimed it, and reusing a letter that may have meant
 something in the original audit would cost more than the gap does.
@@ -168,9 +171,11 @@ of atomic.
 | 22 ✅ | hyg | headers used but not included | `:8-23` | read-only |
 | 23 ✅ | hyg | a forward-declaration block in which both declarations were dead | `:24` | read-only |
 | 24 ✅ | hyg | `other_this_ = this` was pointless indirection | `:188-192` | read-only |
-| 25 | hyg | `add_action` copies the action and every argument twice | `:295-307` | read-only |
+| 25 ✅ | hyg | `add_action` copied the action and every argument twice | `:394` | CONFIRMED (counted) |
 | 26 | hyg | `result \|= ret` on a bool | `:135` | read-only |
 | 33 ✅ | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
+| 34 | perf | a bound action is copied once per invocation | `:264`, `:294` | CONFIRMED (counted) |
+| 35 | api | a second entry point for actions the caller gives up | `:394`, `:836` | investigation |
 | **Group 8 — build (closed)** |
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 
@@ -385,9 +390,12 @@ caller-held `shared_ptr` while an action is in flight runs `~execution()` - whic
 on whichever thread drops the temporary.
 
 > Still open in this step: the by-value/double-copy half, separable and not done here — `auto...
-> args` takes by value and `std::bind` copies again, so a move-only argument will not compile; and
-> the lambda returns a default-constructed result, so an async call to an `int`-returning method
-> yields 0. Lands as `auto&&... args` with perfect forwarding.
+> args` takes by value and `std::bind` copies again; and the lambda returns a default-constructed
+> result, so an async call to an `int`-returning method yields 0.
+
+**The copying half landed in step 25** as `auto&&... args` with perfect forwarding. The move-only
+argument named there is *not* what that fixed - see step 25 for why it cannot be, while the queue
+stores `std::function`. The default-constructed result is still open.
 
 ### Step 13 · item 9 — `attach()` stores pointers, has no inverse, no cycle check — DONE
 `async.hpp:314-326` · CONFIRMED: ASan `heap-use-after-free`; SIGSEGV for the cycle
@@ -1248,12 +1256,146 @@ for not moving is unchanged.
 reconfigured for this step because the directories were gone; `async_smoke_test` exit 0 on all
 three, 0 TSan warnings; clang-format clean; `tools/make_doc.sh` 0 warnings, 41 pages.
 
-### Step 25 · hygiene — `add_action` copies the action and every argument twice
-`async.hpp:295-307`
+### Step 25 · hygiene — `add_action` copied the action and every argument twice — DONE
+`async.hpp:394` (`add_action`), `:262-276`, `:292-305` (the two `bind()` overloads) · CONFIRMED by
+counting, 2026-09-19
 
-`add_action(actionT action, Args... args)` takes everything by value, then `std::bind` copies again.
+`add_action(actionT action, Args... args)` took everything by value and then handed those copies to
+`std::bind`, which copies again. Counted with two types that tally their own copy constructors, on
+an action that is queued and never run:
 
-> Perfect forwarding. Same lines as the by-value half of step 12; do them together.
+| | action | argument |
+|---|---|---|
+| before | 2 | 2 |
+| `Args&&... args` + `std::forward` | 2 | **1** |
+| + `std::bind(std::move(action), ...)` | **1** | 1 |
+
+So one copy of each came from the by-value parameter and one from `std::bind` — the two halves
+attributed separately, by changing one thing at a time. What remains is the copy the queue needs:
+the argument's lands in the bind object, the action's in the by-value parameter, which is the sink
+the caller keeps their own copy behind.
+
+**The bound path had the same defect and is fixed with it**, as the plan said to do: both `bind()`
+lambdas took `auto... args` by value, which put the second copy back however `add_action()` was
+written. `auto&&... args` forwarded on. Measured the same way: 2 copies before, 1 after.
+
+> `add_action(actionT action, Args&&... args)`, queueing
+> `std::bind(std::move(action), std::forward<Args>(args)...)`; `auto&&... args` in both lambdas.
+
+**Tests:** three cases, reading the counters as a **delta** rather than from zero, so they hold when
+the binary is run directly and every case shares one process:
+`queueing_copies_the_action_and_its_arguments_once` (an action the caller keeps: one copy, was two),
+`queueing_an_action_the_caller_gives_up_copies_it_not_at_all` (moved in, or a temporary: none), and
+`queueing_through_a_binding_copies_the_argument_once`.
+
+**What each call shape costs, measured 2026-09-19 against the fixed header:**
+
+| call | action copies | action moves |
+|---|---|---|
+| `add_action(action, ...)`, an lvalue the caller keeps | 1 | 0 |
+| `add_action(std::move(action), ...)` | **0** | 0 |
+| `add_action(counter{}, ...)`, a temporary | **0** | 1 |
+| `add_action([]{...}, ...)`, a lambda | **0** | 0 |
+| one invocation of a bound action | 1 | 0 |
+
+**Building a binding was copying too, and that is fixed here as well** - the user's question,
+2026-09-19. `bind_action_and_function()` took its callable by `const T&` and copied it into the
+action, then the lambda captured that action by copy: two copies before a single call was made.
+`bind_action_and_method()` had the second of those. Both lambdas now capture with
+`async_action = std::move(async_action)`, and the plain-function overload takes `T Fn` by value and
+moves it in - the same sink shape as `add_action()`.
+
+| building a binding | callable copies | moves |
+|---|---|---|
+| a temporary, before | 2 | 1 |
+| a temporary, after | **0** | 2 |
+| an lvalue the caller keeps, after | 1 | 2 |
+
+Pinned by `execution_binding.building_a_binding_copies_a_callable_the_caller_gives_up_not_at_all`.
+
+**The by-value parameter is what makes that table possible, and is why there is no second
+overload.** `add_action(actionT action, ...)` is a sink: an rvalue is constructed straight into the
+parameter and `std::bind` then steals it, so `std::move()`, a temporary and a lambda all cost
+nothing. A second `actionT&&` overload could not improve on zero and would be ambiguous against the
+by-value one for every rvalue call. The lvalue copy is the caller's own choice to keep their action;
+the queue must still own one.
+
+**A move-only argument still will not compile, and forwarding was never going to fix that** - the
+claim carried in item 8 and in step 12's "still open" note was wrong. Probed 2026-09-19: `std::bind`
+holds a `unique_ptr` happily, but the queue element is `std::function<result_type(void)>`, which
+requires a **copy-constructible** target; storing such a bind object is a hard error inside libc++'s
+`__clone`, not a substitution failure, so even `std::is_constructible_v` answers `true` for it.
+`std::move_only_function` would take it and **does not exist in this libc++** (Apple clang 21). The
+blocker is the queue's element type, and changing that is its own decision, not hygiene.
+
+**Also still open, and untouched here:** the lambdas return a default-constructed
+`actionT::result_type`, so an async call to an `int`-returning method yields 0. That is the results
+question of steps 14, 15 and 21, not a copying one.
+
+**Verified:** 39/39 Debug, 39/39 under AddressSanitizer, 39/39 under ThreadSanitizer with 0
+warnings; `async_smoke_test` exit 0 on all three; clang-format clean; `tools/make_doc.sh` 0
+warnings, 41 pages.
+
+### Step 34 · a bound action is copied once per invocation
+`async.hpp:264`, `:294` (the two `bind()` lambdas) · CONFIRMED by counting, 2026-09-19 · **open**
+
+Each `bind()` lambda captures `async_action` and hands it to `add_action()` as an lvalue, because it
+has to keep its own for the next call. So every call through a binding copies a `std::function` -
+measured at exactly one copy per invocation, twice for two calls. A `std::function` whose target is
+not nothrow-copy-constructible is heap-allocated by libc++, so that copy is an allocation, not a
+pointer move.
+
+> Capture the action once as a `std::shared_ptr<const actionT>` and queue a callable that holds the
+> pointer, so a call costs a refcount bump. It needs a private seam that takes a ready-made nullary
+> callable, since `add_action()` takes `actionT` by value by design - see step 25.
+
+**Moving the captured action into `add_action()` is not the answer, and both ways of trying it were
+measured on 2026-09-19.** Written as `std::move(async_action)` in the lambda as it stands, it
+compiles and does **nothing**: the capture is const in a non-mutable lambda, so `std::move` yields a
+`const std::function&&` and the copy constructor is chosen anyway - still one copy per call. Add
+`mutable` and the move happens: zero copies, and the binding is emptied by its first call. Every
+later call then queues a moved-from `std::function`, which the worker invokes and reports as
+`dropped an action that threw: std::bad_function_call`.
+`execution_queue.runs_every_action_queued_while_the_worker_drains` goes red, which is the only thing
+standing between that idea and a silent one-shot binding. A binding is a callable the caller keeps;
+its action has to survive being called, which is why sharing ownership is the way and moving is
+not.
+
+**Raised by the user on 2026-09-19**, out of step 25's measurements. Not an audit finding.
+
+**Not urgent, and not free:** the shared_ptr adds an indirection to every invocation of the queued
+action, and the win is one allocation per call on the binding path only. Measure both before
+choosing.
+
+### Step 35 · a second entry point for actions the caller gives up
+`async.hpp:394` (`add_action`), `:836` (the queue) · **investigation, not a defect**
+
+Raised by the user on 2026-09-19, out of step 25: should `add_action()` become private, used only by
+the two `bind()` statics, with a separate public entry point - an overload, or an
+`add_movable_action()` - for lambdas and movable actions?
+
+**What is already true, measured in step 25.** `add_action(actionT action, ...)` takes the action by
+value, which makes it a sink: `std::move(action)`, a temporary and a lambda all reach the queue with
+**zero** copies, and only an lvalue the caller keeps costs one. So a second entry point cannot
+improve the copyable case, and an `actionT&&` overload beside a by-value parameter would be
+ambiguous for every rvalue call. Making the current one private would also take away the lvalue
+case, which 30 call sites in `async_tests.cpp`, the smoke test and the README all use.
+
+**What a second entry point could add, and what it would cost.** The one thing out of reach today is
+a **move-only** action - a lambda capturing a `unique_ptr`, say. That is blocked twice over, and not
+by the parameter: the caller cannot even form `actionT`, because `actionT` is a `std::function`; and
+the queue element is `std::function<result_type(void)>`, which needs a copy-constructible target.
+Probed 2026-09-19: storing a move-only callable is a hard error inside libc++'s `__clone`, not a
+substitution failure, and `std::move_only_function` does not exist in this libc++ (Apple clang 21).
+
+> So the question is not really about `add_action()`'s signature. It is whether the queue should
+> hold something other than `std::function` - `std::move_only_function` when the toolchain has it,
+> or a small hand-rolled holder - and whether move-only work is wanted at all. Decide that first;
+> the entry point follows from it.
+
+**Related:** step 34 wants the same queue to hold a callable that owns its action through a
+`shared_ptr`, and steps 14, 15 and 21 all turn on what the queue can report back. Any change to the
+element type should be weighed against all three at once rather than one at a time.
 
 ### Step 26 · hygiene — `result |= ret` on a bool
 `async.hpp:135`
