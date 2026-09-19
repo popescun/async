@@ -1,14 +1,14 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 27 of 33 steps done and committed — 1 to 21, plus 27 to 31 and 33 out of
-order. HEAD `588b7ca`; nothing is pending but this plan update. The per-step commits are in the
+**Status (2026-09-19):** 28 of 33 steps done — 1 to 22, plus 27 to 31 and 33 out of order. 27 are
+committed, HEAD `588b7ca`; step 22 is in the working tree. The per-step commits are in the
 table under **Progress**; this line no longer restates them, because that is how it kept drifting.
 **Tests:** 35 of 35 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
 and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
 flakes.
-**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 41 pages (was 31), rebuilt with `tools/make_doc.sh`
-at step 33.
+**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with `tools/make_doc.sh`
+at step 22 — doxygen lists a file's includes, so the five new ones cost two pages.
 **Source:** audit of 2026-09-10 (4 critical, 5 high, 5 medium, 8 hygiene), findings 1, 2, 3 and 5
 reproduced under TSan/ASan. Items lettered A onwards were found while fixing, and are read from the
 code unless marked otherwise.
@@ -64,9 +64,10 @@ remains of the group**, and step 33 joins group 7.
 | `b14373e` | 28 — a throwing action is caught in three arms; the worker survives |
 | `622660b` | 29 — **declined**; the three connection points are documented instead |
 | `588b7ca` | 33 — the header's doc comments cut to what each entity is and does |
+| *(uncommitted)* | 22 — five headers the header uses and did not include |
 
-**NEXT: group 7**, steps 22 to 26 — all hygiene, all read-only findings; 33 is done. Step 32 is the
-only investigation left, and nothing blocks it any more.
+**NEXT: group 7**, steps 23 to 26 — all hygiene, all read-only findings; 22 and 33 are done. Step 32
+is the only investigation left, and nothing blocks it any more.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -98,7 +99,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 6 steps.** Step 32, and group 7's 22 to 26; groups 1 to 5 and 8 are closed.
+**Remaining: 5 steps.** Step 32, and group 7's 23 to 26; groups 1 to 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -159,7 +160,7 @@ of atomic.
 | 29 ✅ | H | the `action_*` members are public internal seams | `:600-624` | declined, documented |
 | 32 | K | `finishing_` and `running_` may collapse into one state | `:353`, `:732`, `:830` | investigation |
 | **Group 7 — hygiene** |
-| 22 | hyg | five more headers used but not included | `:8-14` | read-only |
+| 22 ✅ | hyg | headers used but not included | `:8-23` | read-only |
 | 23 | hyg | `actuator` forward-declared after its own `#include` | `:16-23` | read-only |
 | 24 | hyg | `other_this = this` is pointless indirection | `:176`, `:449` | read-only |
 | 25 | hyg | `add_action` copies the action and every argument twice | `:295-307` | read-only |
@@ -1172,16 +1173,37 @@ whatever replaces them.
 
 ## Group 7 — hygiene
 
-### Step 22 · hygiene — five more headers used but not included
-`async.hpp:8-14`
+### Step 22 · hygiene — headers used but not included — DONE
+`async.hpp:8-23` · verified by reading the code, 2026-09-19
 
-Step 10 added four. Still used but not included: `<list>`, `<functional>`, `<memory>`, `<chrono>`,
-`<type_traits>`. The header compiles only because `<actuator/actuator.hpp>` pulls them in first.
+Step 10 added four. **Five more were missing, not the four the entry used to list.** Read from the
+code rather than from the old list:
+
+| added | used at |
+|---|---|
+| `<chrono>` | `:231`, `:707` — `std::chrono::milliseconds` |
+| `<functional>` | 13 sites — `std::function`, and `std::bind` at `:422` |
+| `<list>` | `:743` — `std::list` |
+| `<type_traits>` | `:577`, `:785` — `std::is_void_v`, `std::conditional` |
+| `<utility>` | 5 sites — `std::move`, and `std::forward` at `:178` |
+
+**`<memory>` was already there**, added by step 10; the old entry listed it wrongly. **`<utility>`
+was not listed at all** and is the one this step would have missed.
+
+**Where they were coming from.** `<actuator/actuator.hpp>` includes `<functional>`, `<list>`,
+`<type_traits>` and `<utility>` among others, so those four arrived with it. `<chrono>` does not
+come from there: it arrives through `<thread>` and `<condition_variable>`, which is a libc++
+implementation detail, not a guarantee — probed 2026-09-19 with a two-line translation unit.
 
 **`<iostream>` came off this list on 2026-09-17**, when step 18 replaced the last two `std::cout`
 calls in the header with `std::println`. Nothing in `async.hpp` uses it any more.
 
-> Include what you use. Cheap, and it stops a change in `actuator` from breaking this header.
+> Include what you use. Cheap, and it stops a change in `actuator` - or a different standard
+> library - from breaking this header.
+
+**The reverse direction was checked too:** all fifteen includes are used, none is dead.
+
+**Verified:** 35/35; `async_smoke_test` exit 0; clang-format clean.
 
 ### Step 23 · hygiene — `actuator` forward-declared after its own `#include`
 `async.hpp:16-23`
