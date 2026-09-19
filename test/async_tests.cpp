@@ -645,6 +645,30 @@ TEST(execution_binding, building_a_binding_copies_a_callable_the_caller_gives_up
 }
 
 /**
+ * @brief Calling a binding does not copy the action it carries.
+ *
+ * The binding owns its action once and shares it with every call it queues, so an invocation costs
+ * a reference rather than a copy of the std::function - and a std::function copy is an allocation
+ * whenever its target is not nothrow-copy-constructible.
+ */
+TEST(execution_binding, calling_a_binding_does_not_copy_the_action) {
+  auto exec = counting_execution::create_instance("per_call");
+
+  counting_action_t bound;
+  counting_execution::bind_action_and_function(bound, counting_action{}, exec);
+
+  const copy_counter argument;
+  const auto before = counting_action::copies.load();
+
+  bound(argument);
+  bound(argument);
+
+  EXPECT_EQ(counting_action::copies.load() - before, 0)
+      << "two calls through a binding copied the action " << counting_action::copies.load() - before
+      << " times";
+}
+
+/**
  * @brief An attacher does not reach into an attached execution that has been destroyed.
  *
  * attach() hands the attacher's actuator a pointer into the attached object, so a destroyed

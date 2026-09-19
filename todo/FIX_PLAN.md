@@ -1,16 +1,16 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 35 of 37 steps done — 1 to 26, plus 27 to 33 and 36. 33 are committed,
+**Status (2026-09-19):** 36 of 37 steps done — 1 to 26, plus 27 to 33 and 36. 33 are committed,
 HEAD `26f91ed`; step 32 is in the working tree. **Groups 1 to 8 are complete**; what remains is two
 investigations.
 The per-step
 commits are in the table under **Progress**; this line no longer restates them, because that is how
 it kept drifting.
-**Tests:** 41 of 41 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
+**Tests:** 42 of 42 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
 and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
 flakes.
-**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 41 pages (was 31), rebuilt with `tools/make_doc.sh`
+**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with `tools/make_doc.sh`
 at step 23. **The PDF embeds the header's own source listing** - there is no separate file page - so
 the page count tracks `async.hpp`'s length, and a few lines either way can move it by a page or two
 at a boundary. Measured 2026-09-19: the five includes of step 22 are worth two pages, and so is the
@@ -79,8 +79,8 @@ remains of the group**, and step 33 joins group 7.
 | `26f91ed` | 36 — `run()` and `start()` wait for a resident worker to leave |
 | *(uncommitted)* | 32 — `finishing_` is gone; `is_running()` is `running_` |
 
-**NEXT: the investigations 34 and 35**, both out of step 25's measurements, and both really the
-same question: what the queue should hold. Nothing left is a known defect.
+**NEXT: step 35**, the last one open: whether the queue should hold something other than
+`std::function`. Step 34 left two allocations per call that only that can remove.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -113,8 +113,7 @@ default-constructed result, so an async call to an `int`-returning method yields
 argument still will not compile, and never could have here: the queue stores `std::function`, which
 needs a copy-constructible target. See step 25.
 
-**Remaining: 2 steps**, neither a known defect: the investigations 34 and 35. Every group is
-closed.
+**Remaining: 1 step**, and not a defect: the investigation 35. Every group is closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -181,7 +180,7 @@ of atomic.
 | 25 ✅ | hyg | `add_action` copied the action and every argument twice | `:394` | CONFIRMED (counted) |
 | 26 ✅ | hyg | `result \|= ret` on a bool | `:135` | read-only |
 | 33 ✅ | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
-| 34 | perf | a bound action is copied once per invocation | `:264`, `:294` | CONFIRMED (counted) |
+| 34 ✅ | perf | a bound action was copied once per invocation | `:573`, `:262`, `:296` | CONFIRMED (counted) |
 | 35 | api | a second entry point for actions the caller gives up | `:394`, `:836` | investigation |
 | 36 ✅ | bug | two workers in one execution, and one handshake between them | `:341`, `:359` | CONFIRMED (ASan) |
 | 37 ✅ | hyg | test comments carry plan-sized narrative | `test/async_tests.cpp` | read-only |
@@ -1352,36 +1351,58 @@ question of steps 14, 15 and 21, not a copying one.
 warnings; `async_smoke_test` exit 0 on all three; clang-format clean; `tools/make_doc.sh` 0
 warnings, 41 pages.
 
-### Step 34 · a bound action is copied once per invocation
-`async.hpp:264`, `:294` (the two `bind()` lambdas) · CONFIRMED by counting, 2026-09-19 · **open**
+### Step 34 · a bound action was copied once per invocation — DONE
+`async.hpp:573` (`add_queued_action()`), `:262`, `:296` (the two `bind()` overloads) · CONFIRMED by
+counting, 2026-09-19
 
-Each `bind()` lambda captures `async_action` and hands it to `add_action()` as an lvalue, because it
-has to keep its own for the next call. So every call through a binding copies a `std::function` -
-measured at exactly one copy per invocation, twice for two calls. A `std::function` whose target is
-not nothrow-copy-constructible is heap-allocated by libc++, so that copy is an allocation, not a
-pointer move.
+Each `bind()` lambda captured its action and handed it to `add_action()` as an lvalue, because it
+has to keep its own for the next call. `add_action()` takes `actionT` by value, so every call
+through a binding copied a `std::function` - and libc++ heap-allocates the target of one whose own
+target is not nothrow-copy-constructible.
 
-> Capture the action once as a `std::shared_ptr<const actionT>` and queue a callable that holds the
-> pointer, so a call costs a refcount bump. It needs a private seam that takes a ready-made nullary
-> callable, since `add_action()` takes `actionT` by value by design - see step 25.
+**Measured with a counting `operator new`**, 1000 calls through a binding at `-O1`:
 
-**Moving the captured action into `add_action()` is not the answer, and both ways of trying it were
-measured on 2026-09-19.** Written as `std::move(async_action)` in the lambda as it stands, it
-compiles and does **nothing**: the capture is const in a non-mutable lambda, so `std::move` yields a
-`const std::function&&` and the copy constructor is chosen anyway - still one copy per call. Add
-`mutable` and the move happens: zero copies, and the binding is emptied by its first call. Every
-later call then queues a moved-from `std::function`, which the worker invokes and reports as
-`dropped an action that threw: std::bad_function_call`.
-`execution_queue.runs_every_action_queued_while_the_worker_drains` goes red, which is the only thing
-standing between that idea and a silent one-shot binding. A binding is a callable the caller keeps;
-its action has to survive being called, which is why sharing ownership is the way and moving is
-not.
+| per call | action copies | allocations |
+|---|---|---|
+| before | 1 | 3 |
+| after | **0** | **2** |
 
-**Raised by the user on 2026-09-19**, out of step 25's measurements. Not an audit finding.
+The three were the copied action's target, the `std::bind` object inside the queued
+`std::function`, and the `std::list` node. The first is what went.
 
-**Not urgent, and not free:** the shared_ptr adds an indirection to every invocation of the queued
-action, and the win is one allocation per call on the binding path only. Measure both before
-choosing.
+> A binding now holds its action once, in a `std::shared_ptr<const actionT>`, and queues a callable
+> carrying the pointer and the bound arguments - so a call costs a reference rather than a copy.
+> That callable is already nullary, which `add_action()` cannot take: its parameter is `actionT`,
+> the action type **with** its arguments, while the queue holds
+> `std::function<result_type(void)>`. Hence `add_queued_action()`, private, holding what
+> `add_action()` does once it has bound one; `add_action()` is now a one-line forwarder onto it.
+
+**Why not just pass the lambda to `add_action()`** - the first thing to try, and it does not
+compile: *no known conversion from '(lambda)' to 'std::function<void (int)>'*. It **does** compile
+when `actionT` is itself nullary, which is most of the test suite, so the idea looks right until
+`execution<std::function<void(int)>>` - the smoke test's own type - stops building.
+
+**Why not an overload of `add_action()`:** when `actionT` is nullary the two have identical
+parameter lists, so which one a call selects would depend on the specialisation.
+
+**The indirection the entry warned about does not show up.** Queue-and-drain of 200k calls at
+`-O2`, medians of nine runs:
+
+| | queue | drain | total |
+|---|---|---|---|
+| before | 31 ns/call | 43 ns/action | 75 ns |
+| after | 27 ns/call | 31 ns/action | 58 ns |
+
+**Test:** `execution_binding.calling_a_binding_does_not_copy_the_action` - two calls through a
+binding, 2 copies before and 0 after.
+
+**What is left, and it belongs to step 35:** two allocations per call remain - the `std::list` node
+and the queued callable's target, where a 16-byte `shared_ptr` plus arguments plus libc++'s vptr
+overflows the 24-byte small buffer. Both need the queue's container or element type to change.
+
+**Verified:** 42/42 Debug with a 30x repeat; 42/42 under AddressSanitizer and under
+ThreadSanitizer; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean;
+`tools/make_doc.sh` 0 warnings, 43 pages.
 
 ### Step 35 · a second entry point for actions the caller gives up
 `async.hpp:394` (`add_action`), `:836` (the queue) · **investigation, not a defect**

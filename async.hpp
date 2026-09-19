@@ -234,8 +234,8 @@ class execution {
    * @brief Binds asynchronously an external action to a class function member.
    *
    * It creates an action as a binding to a class method (by untangle::bind()), and assigns to
-   * \p action a callable that passes it to \ref add_action(). The execution is held weakly, so the
-   * action may outlive it.
+   * \p action a callable that queues it. The execution is held weakly, so the action may outlive
+   * it; the action itself is shared with every call queued from it, rather than copied per call.
    *
    * @attention Invoking \p action after the execution has been destroyed throws
    * untangle::invalid_action. The worker catches it and drops the action with a warning.
@@ -251,16 +251,20 @@ class execution {
   static void bind_action_and_method(actionT& action, const std::shared_ptr<classT>& obj,
                                      T classT::* method,
                                      const std::shared_ptr<execution>& async_exec) {
-    actionT async_action = untangle::bind(obj, method);
+    auto async_action = std::make_shared<const actionT>(untangle::bind(obj, method));
 
     action = [wp = std::weak_ptr<execution>(async_exec),
-              async_action = std::move(async_action)](auto&&... args) -> actionT::result_type {
+              async_action](auto&&... args) -> actionT::result_type {
       // lock() also keeps the execution alive for the duration of the call
       const auto exec = wp.lock();
       if (!exec) {
         throw invalid_action("bind: invalid execution");
       }
-      exec->add_action(async_action, std::forward<decltype(args)>(args)...);
+
+      exec->add_queued_action([async_action, ... args = std::forward<decltype(args)>(args)] {
+        return (*async_action)(args...);
+      });
+
       return typename actionT::result_type();
     };
   }
@@ -268,8 +272,9 @@ class execution {
   /**
    * @brief Binds asynchronously an external action to a plain function.
    *
-   * It wraps \p Fn in an action and assigns to \p action a callable that passes it to
-   * \ref add_action(). The execution is held weakly, as in \ref bind_action_and_method().
+   * It wraps \p Fn in an action and assigns to \p action a callable that queues it. The execution
+   * is held weakly, as in \ref bind_action_and_method(), and the action is shared with every call
+   * queued from it rather than copied per call.
    *
    * @param action [in,out] - An action of type std::function<...>.
    * @param Fn - A plain function, or any callable; moved into the binding.
@@ -278,15 +283,19 @@ class execution {
   template <typename T>
   static void bind_action_and_function(actionT& action, T Fn,
                                        const std::shared_ptr<execution>& async_exec) {
-    actionT async_action = std::move(Fn);
+    auto async_action = std::make_shared<const actionT>(std::move(Fn));
 
     action = [wp = std::weak_ptr<execution>(async_exec),
-              async_action = std::move(async_action)](auto&&... args) -> actionT::result_type {
+              async_action](auto&&... args) -> actionT::result_type {
       const auto exec = wp.lock();
       if (!exec) {
         throw invalid_action("bind: invalid execution");
       }
-      exec->add_action(async_action, std::forward<decltype(args)>(args)...);
+
+      exec->add_queued_action([async_action, ... args = std::forward<decltype(args)>(args)] {
+        return (*async_action)(args...);
+      });
+
       return typename actionT::result_type();
     };
   }
@@ -412,21 +421,7 @@ class execution {
    */
   template <typename... Args>
   bool add_action(actionT action, Args&&... args) {
-    {
-      std::lock_guard<std::mutex> lock(action_mutex_);
-
-      // Once stopped, the worker is on its way out and would never reach this action; dropping it
-      // here is what keeps it from sitting in the list looking as though it were pending.
-      if (stopped_) {
-        std::println(stderr, "warning: execution '{}' is stopped, action not added", name);
-        return false;
-      }
-
-      action_list_.push_back(std::bind(std::move(action), std::forward<Args>(args)...));
-    }
-
-    action_cv_.notify_one();
-    return true;
+    return add_queued_action(std::bind(std::move(action), std::forward<Args>(args)...));
   }
 
   /**
@@ -569,6 +564,33 @@ class execution {
 
  private:
   using queued_action_t = std::function<typename actionT::result_type(void)>;
+
+  /**
+   * @brief Queues a callable already bound to its arguments, and says whether it was taken.
+   *
+   * What \ref add_action() does once it has bound one, and what a binding queues directly: a
+   * binding holds its action in a std::shared_ptr and hands over a callable carrying the pointer,
+   * so a call costs a reference rather than a copy of the action.
+   *
+   * @return true - queued; false - the execution is stopped and the callable was dropped.
+   */
+  bool add_queued_action(queued_action_t action) {
+    {
+      std::lock_guard<std::mutex> lock(action_mutex_);
+
+      // Once stopped, the worker is on its way out and would never reach this action; dropping it
+      // here is what keeps it from sitting in the list looking as though it were pending.
+      if (stopped_) {
+        std::println(stderr, "warning: execution '{}' is stopped, action not added", name);
+        return false;
+      }
+
+      action_list_.push_back(std::move(action));
+    }
+
+    action_cv_.notify_one();
+    return true;
+  }
 
   /**
    * @brief Runs one action, keeping its return value when the action type has one and run() asked.
