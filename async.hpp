@@ -23,16 +23,6 @@
 #include <vector>
 
 namespace untangle {
-template <typename actionT>
-struct actuator;
-
-namespace async {
-template <typename actionT>
-class execution;
-}
-}  // namespace untangle
-
-namespace untangle {
 namespace async {
 /**
  *  @defgroup untangle_functions namespace untangle: functions

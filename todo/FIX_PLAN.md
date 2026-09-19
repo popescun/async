@@ -1,14 +1,17 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 28 of 33 steps done — 1 to 22, plus 27 to 31 and 33 out of order. 27 are
-committed, HEAD `588b7ca`; step 22 is in the working tree. The per-step commits are in the
+**Status (2026-09-19):** 29 of 33 steps done — 1 to 23, plus 27 to 31 and 33 out of order. 28 are
+committed, HEAD `5f09f17`; step 23 is in the working tree. The per-step commits are in the
 table under **Progress**; this line no longer restates them, because that is how it kept drifting.
 **Tests:** 35 of 35 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
 and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
 flakes.
-**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with `tools/make_doc.sh`
-at step 22 — doxygen lists a file's includes, so the five new ones cost two pages.
+**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 41 pages (was 31), rebuilt with `tools/make_doc.sh`
+at step 23. **The PDF embeds the header's own source listing** - there is no separate file page - so
+the page count tracks `async.hpp`'s length, and a few lines either way can move it by a page or two
+at a boundary. Measured 2026-09-19: the five includes of step 22 are worth two pages, and so is the
+six-line forward-declaration block. Do not read a page count as a content change.
 **Source:** audit of 2026-09-10 (4 critical, 5 high, 5 medium, 8 hygiene), findings 1, 2, 3 and 5
 reproduced under TSan/ASan. Items lettered A onwards were found while fixing, and are read from the
 code unless marked otherwise.
@@ -64,10 +67,11 @@ remains of the group**, and step 33 joins group 7.
 | `b14373e` | 28 — a throwing action is caught in three arms; the worker survives |
 | `622660b` | 29 — **declined**; the three connection points are documented instead |
 | `588b7ca` | 33 — the header's doc comments cut to what each entity is and does |
-| *(uncommitted)* | 22 — five headers the header uses and did not include |
+| `5f09f17` | 22 — five headers the header uses and did not include |
+| *(uncommitted)* | 23 — both dead forward declarations go |
 
-**NEXT: group 7**, steps 23 to 26 — all hygiene, all read-only findings; 22 and 33 are done. Step 32
-is the only investigation left, and nothing blocks it any more.
+**NEXT: group 7**, steps 24 to 26 — all hygiene, all read-only findings; 22, 23 and 33 are done.
+Step 32 is the only investigation left, and nothing blocks it any more.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -99,7 +103,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 5 steps.** Step 32, and group 7's 23 to 26; groups 1 to 5 and 8 are closed.
+**Remaining: 4 steps.** Step 32, and group 7's 24 to 26; groups 1 to 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -161,7 +165,7 @@ of atomic.
 | 32 | K | `finishing_` and `running_` may collapse into one state | `:353`, `:732`, `:830` | investigation |
 | **Group 7 — hygiene** |
 | 22 ✅ | hyg | headers used but not included | `:8-23` | read-only |
-| 23 | hyg | `actuator` forward-declared after its own `#include` | `:16-23` | read-only |
+| 23 ✅ | hyg | a forward-declaration block in which both declarations were dead | `:24` | read-only |
 | 24 | hyg | `other_this = this` is pointless indirection | `:176`, `:449` | read-only |
 | 25 | hyg | `add_action` copies the action and every argument twice | `:295-307` | read-only |
 | 26 | hyg | `result \|= ret` on a bool | `:135` | read-only |
@@ -1205,14 +1209,23 @@ calls in the header with `std::println`. Nothing in `async.hpp` uses it any more
 
 **Verified:** 35/35; `async_smoke_test` exit 0; clang-format clean.
 
-### Step 23 · hygiene — `actuator` forward-declared after its own `#include`
-`async.hpp:16-23`
+### Step 23 · hygiene — the whole forward-declaration block goes — DONE
+`async.hpp:24` (where it was) · verified by reading the code, 2026-09-19
 
-The forward declaration of `untangle::actuator` sits below `#include <actuator/actuator.hpp>`, so it
-redeclares an already-complete type. The forward declaration of `execution` in the same block is
-genuine and stays.
+The forward declaration of `untangle::actuator` sat below `#include <actuator/actuator.hpp>`, which
+defines it at `actuator/actuator.hpp:56-57`, so it redeclared an already-complete type.
 
-> Delete the `actuator` forward declaration.
+**The entry's other claim did not hold: the `execution` declaration was dead too**, and the user
+took it out with the first on 2026-09-19. Nothing between the block and the definition named
+`execution` in code; the only mentions are `\ref` in comments, which doxygen resolves against the
+definition. Probed before removing: both binaries compile, 35/35 pass, and doxygen emits the
+identical set of `.tex` files - equal but for the source listing, which is the header itself.
+
+> Both declarations deleted; the block is gone and the includes now run straight into
+> `namespace untangle { namespace async {`.
+
+**Verified:** 35/35; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings,
+41 pages.
 
 ### Step 24 · hygiene — `other_this = this` is pointless indirection
 `async.hpp:176`, `:449`
