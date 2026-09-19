@@ -1,27 +1,28 @@
 # async.hpp — fix plan
 
-**Status (2026-09-17):** 25 of 32 steps done and committed; only this plan update is not.
-Steps 1-10 landed in one
-commit — the queue race and the worker lifetime, which were the four critical findings and two of the five high ones. Step 11
-landed in `cfa245d` (`async.hpp` — a mutex on `execution_poll`; two new tests). Step 12 landed in
-`c4843cd` (`bind()` now holds the execution weakly; two new tests).
-Step 13 landed in `2e3a8d0` (`attach()` takes a `shared_ptr`, gains `detach()` and refuses cycles;
-seven new tests), closing group 2. Step 27 landed in `f251acf`, closing group 8. Steps 14 and 15 landed in
-`f37ee83` (a `results` vector filled by `run()`; five new tests), closing group 3. **Step 16 is
-applied and green in the working tree, not yet committed.**
-**Tests:** 26/26 green — `ctest --test-dir test/build` (baseline was 2/5). AddressSanitizer 26/26;
-ThreadSanitizer 25/26, the one failure being `async_smoke_test`'s own `std::cout` race, which is
-step 19 and predates all of this. 30x repeat of the whole suite, no flakes.
-**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 37 pages (was 31), rebuilt with
-`tools/make_doc.sh`.
+**Status (2026-09-19):** 26 of 33 steps done — 1 to 21, plus 27, 28, 29, 30 and 31 out of order.
+25 of them are committed, HEAD `e25a26f`. The per-step commits are in the table under **Progress**;
+this line no longer restates them, because that is how it kept drifting.
+**Uncommitted:** step 29, closed by documenting the three connection points rather than making them
+private, plus this plan update. Step 33 was added by the same decision.
+**Tests:** 35 of 35 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
+clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
+and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
+flakes.
+**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with `tools/make_doc.sh`
+at step 29.
 **Source:** audit of 2026-09-10 (4 critical, 5 high, 5 medium, 8 hygiene), findings 1, 2, 3 and 5
 reproduced under TSan/ASan. Items lettered A onwards were found while fixing, and are read from the
 code unless marked otherwise.
 
 ## Progress
 
-Done — steps 1 to 19, 27, and 30 and 31 out of order. Step 11 finished what step 4 left of the
-poll, step 12 closed the dangling `bind()` capture, and step 13 closed `attach()`. **Group 2 is
+Done — steps 1 to 21, plus 27, 28, 30 and 31 out of order. Step 20 counts as done by having been
+**declined**: the rule of five was applied, measured and reverted, and what landed was the reasoning
+and a guard.
+
+Step 11 finished what step 4 left of the poll, step 12 closed the dangling `bind()` capture, and
+step 13 closed `attach()`. **Group 2 is
 complete**: every place the header held a raw pointer into another object now learns when that
 object dies.
 **Group 8 is complete** too, forced early by a red CI run, and **group 3** with steps 14 and 15.
@@ -32,6 +33,11 @@ passes through, so an execution reached through `attach()` reports its own batch
 It cost half of step 16's contract: `on_finished` now sees `is_running()` true, deliberately.
 **Group 5 closed the same day**, with 18 and 19: every `std::cout` in the repo is a `std::println`,
 and both binaries are ThreadSanitizer-clean, which had never been true before.
+
+**Group 6 is under way**: 20 declined, 21 and 28 landed, 29 closed by documenting rather than by
+changing access. 21 and 28 were meant to settle "what happened to the action I gave you" together,
+and each answered it only for the direct caller — see the note under NEXT. **Step 32 is all that
+remains of the group**, and step 33 joins group 7.
 
 | Commit | Step |
 |---|---|
@@ -55,13 +61,13 @@ and both binaries are ThreadSanitizer-clean, which had never been true before.
 | `5408eff` | 17 — `execute_actions()` raises the notification, so a driven execution reports |
 | `86f343a` | 18, 19 — every `std::cout` becomes `std::println`; the repo is TSan-clean |
 | `91c6112` | 31 — the unreachable tail notification goes; `actions_run_` resets in the pass |
-| `9404816` | 20 — **declined**; the reasoning recorded instead, plus a guard |
+| `f59c19d` | 20 — **declined**; the reasoning recorded instead, plus a guard |
 | `f8472c0` | 21 — `add_action()` returns bool; the bound path stays untold |
 | `b14373e` | 28 — a throwing action is caught in three arms; the worker survives |
+| *(uncommitted)* | 29 — **declined**; the three connection points are documented instead |
 
-**NEXT: step 29** — item H, the `action_*` members are public internal seams. Probed and tested on
-2026-09-17; the fix is not written and its test is the only thing in the working tree. Group 6 then
-has 32 left; group 7 has 22 to 26.
+**NEXT: group 7**, steps 22 to 26 and the new 33 — all hygiene, all read-only findings. Step 32 is
+the only investigation left, and nothing blocks it any more.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -93,7 +99,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 7 steps.** Groups 6 and 7 below; groups 1, 2, 3, 4, 5 and 8 are closed.
+**Remaining: 7 steps.** Step 32, and group 7's 22 to 26 and 33; groups 1 to 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -102,10 +108,10 @@ the ubuntu job could not compile `<print>` at all, so nothing else could be veri
 back to attached executions having their own list and no way to notify the attacher, but redesigning
 that is a feature decision, not a fix. It is called out where it bites and left alone otherwise.
 
-32 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
+33 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
 one. The audit's numbering is preserved so items stay traceable; findings added while fixing are
-lettered. Step 28 was added on 2026-09-14, steps 29 to 31 on 2026-09-15 and step 32 on
-2026-09-16, after the others.
+lettered. Step 28 was added on 2026-09-14, steps 29 to 31 on 2026-09-15, step 32 on 2026-09-16 and
+step 33 on 2026-09-19, after the others.
 The letter D is unused and skipped:
 nothing in this file or in the history ever claimed it, and reusing a letter that may have meant
 something in the original audit would cost more than the gap does.
@@ -151,7 +157,7 @@ of atomic.
 | 20 ✅ | B | `~execution()` suppressed the implicit moves | `:255` | declined, see step |
 | 21 ✅ | C | a refused action is reported but not returned | `:440-480` | CONFIRMED (probe) |
 | 28 ✅ | G | an action that throws anything but `invalid_action` terminates | `:670-690` | CONFIRMED (terminate) |
-| 29 | H | the `action_*` members are public internal seams | `:565-567` | read-only |
+| 29 ✅ | H | the `action_*` members are public internal seams | `:600-624` | declined, documented |
 | 32 | K | `finishing_` and `running_` may collapse into one state | `:353`, `:732`, `:830` | investigation |
 | **Group 7 — hygiene** |
 | 22 | hyg | five more headers used but not included | `:8-14` | read-only |
@@ -159,6 +165,7 @@ of atomic.
 | 24 | hyg | `other_this = this` is pointless indirection | `:176`, `:449` | read-only |
 | 25 | hyg | `add_action` copies the action and every argument twice | `:295-307` | read-only |
 | 26 | hyg | `result \|= ret` on a bool | `:135` | read-only |
+| 33 | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
 | **Group 8 — build (closed)** |
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 
@@ -930,11 +937,12 @@ to relocate one, and four things hold pointers into a live execution that a move
 `&other.action_execute` and `&actuator_execute_`, and the detached worker reading `this`. The
 remark on `~execution()` says this where the question arises, and reaches the generated docs.
 
-**Guard:** `execution_special_members.cannot_be_copied_or_moved`, four `static_assert`s.
-**It cannot fail against this defect and no case can** - all four traits read false before and after,
-because item B's whole effect is on diagnostic text, which no trait reports. What it does earn:
-nothing in the class states that an execution must not be copied; the members merely happen to
-prevent it. This is the only executable statement of the intent, and fails if that stops being true.
+**The guard that came with this step was removed on 2026-09-19**, by the user's call:
+`execution_special_members.cannot_be_copied_or_moved` asserted four traits that `std::thread`,
+`std::atomic` and `std::mutex` already enforce, so it tested the standard library rather than this
+code. It could not have failed against item B either - the defect's whole effect is on diagnostic
+text, which no trait reports. The intent it was meant to state lives in the remark on
+`~execution()`.
 
 A `try_compile` test asserting the diagnostic text *would* go red until the fix landed, and was
 rejected: it introduces a test mechanism this repo does not have, and matches on compiler message
@@ -1079,39 +1087,49 @@ Verified: 36/36; 30x repeat, no failures; ThreadSanitizer 0 warnings and Address
 on both binaries; `async_smoke_test` exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings,
 41 pages.
 
-### Step 29 · item H — the `action_*` members are public internal seams
-`async.hpp:565-567`
+### Step 29 · item H — the `action_*` members are public internal seams — DONE, by documenting them
+`async.hpp:600-624` · raised by the user on 2026-09-15, while reviewing the step 17 tests. Not an
+audit finding.
 
-Raised by the user on 2026-09-15, while reviewing the step 17 tests. Not an audit finding, and not
-derived from one.
+`action_execute`, `action_stop` and `action_is_running` are public `std::function`s wired by the
+constructor at `:229-231`. A caller who assigns to one silently unwires the attachment or the poll.
+**Probed 2026-09-17:** overwriting an attached execution's `action_execute` with an empty lambda and
+driving its attacher left the queued action **unrun** while `is_busy()` went on reporting `true` —
+work queued, nothing left that will ever run it, and no sign of it except that nothing happens.
 
-`action_execute`, `action_stop` and `action_is_running` are public data members. They are not
-interface: each is a `std::function` the constructor wires up from `untangle::bind(other_this_, ...)`
-at `:229-231`, and they exist so that `attach()` and `execution_poll` can reach one execution from
-another. A caller who assigns to one silently unwires the attachment or the poll, and nothing
-reports it. `on_finished` and `name` are genuine interface and stay public; this is about the three
-that are not.
+**Closed without changing the access, by the user's decision on 2026-09-19.** They are *connection
+points*, not internal seams: an actuator belonging to another object connects by taking a member's
+address, so being reachable is what they are for. Making them private would mean granting friendship
+to every object that may ever connect — `execution_poll` today, anything tomorrow — and assigning to
+one is gross misuse rather than an accident waiting to happen. What landed is a short doc comment on
+each of the three, plus one on `on_finished`, naming what it is bound to and warning that assigning
+unwires silently.
 
-Distinct from the naming pass in `f20119f`, which suffixed the private members with `_` and left
-these alone deliberately. That pass could only rename what was already private — changing the access
-is the follow-up it could not make.
+**What was written and then dropped**, recorded so it is not rediscovered:
 
-> Move the three to the private section. Read from the code on 2026-09-15, the blast radius is
-> small:
->
-> - `attach()` and `detach()` need nothing. `template <typename otherActionT> friend class
->   execution;` at `:184` already makes every specialisation a friend of every other, which is why
->   they can reach `attachment_lifetime_` today.
-> - `execution_poll::add()` and `remove()` take `&async_exec.action_is_running` and are **not**
->   friends. This is the one real dependency: it needs friendship, or a seam that does not hand out
->   the address of a member.
-> - `test/async_tests.cpp` drives `action_execute()` directly at six sites — the attach cases use it
->   as the public seam onto `execute_actions()`, with no worker to wait on. Those cases need another
->   way in, and a test-only friend is the cheapest one.
-> - `async_smoke_test.cpp`, `README.md` and `prototypes/` do not touch any of the three.
+- A detection trait asserting the members are unreachable. It pinned the wrong property — the harm
+  is *assignment*, not reachability — and was removed with the decision. The idiom itself works:
+  access checking happens during substitution, so a private member makes such a trait SFINAE away
+  rather than fail to compile.
+- The seam survey the access change would have needed. `attach()`/`detach()` need nothing
+  (`template <typename otherActionT> friend class execution;` at `:184`); `execution_poll::add()`
+  and `remove()` take `&async_exec.action_is_running` and are not friends; `async_tests.cpp` drives
+  `action_execute()` at **five** sites — `does_not_reach_an_attached_execution_that_has_been_destroyed`,
+  `detach_stops_an_attached_execution_from_being_triggered`, `detach_unwires_the_stop_path_as_well`,
+  `allows_a_chain_of_attached_executions` and `refuses_a_cycle_that_closes_through_a_third_execution`
+  — as the only way to drain on the calling thread with no worker to wait on. Four of those five
+  could be driven by a real worker; the first cannot, because ASan must attribute the dangling read
+  to the test thread.
 
-**Order:** after step 17, not before. Three of those six call sites are step 17's own tests, and
-redesigning the test seam and the reporting contract in one pass is two concerns in one step.
+**A finding for the `actuator` submodule, not for this repo.** `actuator<action_t>` does not require
+`action_t` to be a `std::function`. Read from `actuator/actuator.hpp`, it needs only
+`action_t::result_type` (`:67`), `(*action)(args...)` (`:141`), `!*action` (`:135`) and
+`*action == nullptr` in `connect()` (`:260`). A callable, addressable, **non-assignable** wrapper
+therefore satisfies every connection this header makes — probed 2026-09-19 against the real header
+with the project compiler: `connect()`, `add()`, `remove()`, void and `bool` results and the
+dead-binding drop all worked, while assignment stopped compiling. Not taken here: `std::function`
+stays this repo's accepted callable. The user's note is that the actuator's "works only with
+`std::function`" statement could be reworked there instead.
 
 ### Step 32 · item K — `finishing_` and `running_` may collapse into one state
 `async.hpp:353` (`is_running()`), `:732` (`running_`), `:830` (`finishing_`) · **investigation, not
@@ -1196,6 +1214,26 @@ is a stale-pointer trap the moment the class gains a copy or move — see step 2
 Bitwise-or on a bool in `execution_poll::is_running()`, where logical-or is meant.
 
 > `result = result || ret;`
+
+### Step 33 · hygiene — doc comments carry plan-sized narrative
+`async.hpp` (throughout) · added 2026-09-19, the user's own
+
+512 of the header's 958 lines are comment. The volume is not the complaint; the altitude is. Several
+comments explain how a defect was found, what was tried and rejected, and which test pins the
+result — `~execution()` spends 21 lines on why there is no rule of five, `attach()` 25, `add_action()`
+30, `is_busy()` 20. A reader of the API wants what a thing is and what it does. The reasoning is
+already in this plan and in the git history, and saying it twice means it drifts in one of the two.
+
+> Trim each comment to what the entity is, what it does, and what a caller must not do. Keep the
+> `@attention` and `@remark` lines that state a **contract** — `on_finished` sees `is_running()`
+> true, `stop()` is final, a false `is_busy()` is durable only for the caller adding the actions.
+> Drop the rest rather than relocating it: it is written here already.
+
+**Not a rewrite of every comment.** The four longest are the place to start, and the rule is worth
+applying to whatever a later step touches anyway.
+
+**Check:** `tools/make_doc.sh` after, since dropping text can leave a `\ref` unresolved and that
+fails the whole PDF build.
 
 ---
 

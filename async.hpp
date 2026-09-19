@@ -250,7 +250,7 @@ class execution {
    * and the copy operations are deleted several times over - by std::thread, by every atomic, by
    * both mutexes and by the condition variable, each on its own. Spelling the four out would only
    * restate that, and would start earning its keep only if all of those members were replaced by
-   * copyable ones at once. `execution_special_members.cannot_be_copied_or_moved` pins the result.
+   * copyable ones at once.
    */
   ~execution() {
     // Out of the attacher first, before the worker is even asked to stop: from here on nothing
@@ -598,9 +598,37 @@ class execution {
 
   static constexpr auto default_name = "default_name";  //!< Name of an execution built unnamed.
 
+  /**
+   * @brief Connection point that runs this execution's queued actions. Bound to execute_actions().
+   *
+   * @attention Wired by the constructor. Assigning to it unwires whatever is connected, silently.
+   */
   std::function<void(void)> action_execute;
+
+  /**
+   * @brief Connection point that stops this execution. Bound to \ref stop().
+   *
+   * \ref attach() wires it together with \ref action_execute, and \ref detach() unwires both.
+   *
+   * @attention Wired by the constructor. Assigning to it unwires whatever is connected, silently.
+   */
   std::function<void(void)> action_stop;
+
+  /**
+   * @brief Connection point that reports whether this execution is running. Bound to
+   * \ref is_running().
+   *
+   * \ref execution_poll holds its address, and ~execution() takes it back out.
+   *
+   * @attention Wired by the constructor. Assigning to it unwires whatever is connected, silently.
+   */
   std::function<bool(void)> action_is_running;
+
+  /**
+   * @brief Called on the worker's thread once the action list has drained. Assigned by the caller.
+   *
+   * \ref results() is complete by the time it runs, and \ref is_running() reads true there.
+   */
   std::function<void(void)> on_finished;
   std::string name = default_name;
 
