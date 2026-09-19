@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 34 of 37 steps done — 1 to 26, plus 27 to 33 and 36. 33 are committed,
+**Status (2026-09-19):** 35 of 37 steps done — 1 to 26, plus 27 to 33 and 36. 33 are committed,
 HEAD `26f91ed`; step 32 is in the working tree. **Groups 1 to 8 are complete**; what remains is two
 investigations.
 The per-step
@@ -79,9 +79,8 @@ remains of the group**, and step 33 joins group 7.
 | `26f91ed` | 36 — `run()` and `start()` wait for a resident worker to leave |
 | *(uncommitted)* | 32 — `finishing_` is gone; `is_running()` is `running_` |
 
-**NEXT: step 37**, the test-comment sweep, then the investigations 34 and 35 - both out of step
-25's measurements, and both really the same question: what the queue should hold. Nothing left is a
-known defect.
+**NEXT: the investigations 34 and 35**, both out of step 25's measurements, and both really the
+same question: what the queue should hold. Nothing left is a known defect.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -114,8 +113,8 @@ default-constructed result, so an async call to an `int`-returning method yields
 argument still will not compile, and never could have here: the queue stores `std::function`, which
 needs a copy-constructible target. See step 25.
 
-**Remaining: 3 steps**, none a known defect: the investigations 34 and 35, and the test-comment
-sweep 37. Every group is closed.
+**Remaining: 2 steps**, neither a known defect: the investigations 34 and 35. Every group is
+closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -185,7 +184,7 @@ of atomic.
 | 34 | perf | a bound action is copied once per invocation | `:264`, `:294` | CONFIRMED (counted) |
 | 35 | api | a second entry point for actions the caller gives up | `:394`, `:836` | investigation |
 | 36 ✅ | bug | two workers in one execution, and one handshake between them | `:341`, `:359` | CONFIRMED (ASan) |
-| 37 | hyg | test comments carry plan-sized narrative | `test/async_tests.cpp` | read-only |
+| 37 ✅ | hyg | test comments carry plan-sized narrative | `test/async_tests.cpp` | read-only |
 | **Group 8 — build (closed)** |
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 
@@ -1490,21 +1489,32 @@ ThreadSanitizer, 10x repeat each with no failures; `async_smoke_test` exit 0 on 
 **0 of 40 batches** of 50 TSan repeats, where it was 21 of 40; clang-format clean;
 `tools/make_doc.sh` 0 warnings.
 
-### Step 37 · hygiene — test comments carry plan-sized narrative
-`test/async_tests.cpp` (throughout) · added 2026-09-19, the user's own · **open**
+### Step 37 · hygiene — test comments carry plan-sized narrative — DONE
+`test/async_tests.cpp` (throughout) · added and done 2026-09-19, the user's own
 
-Step 33 did this for `async.hpp`; the test file was not swept and reads the way the header used to.
-591 of its 1456 lines are comment, the longest case comments run 22 to 29 lines, and **17 lines name
-a step number, an item number or a date** - how the defect was found, what the plan said, which
-contract moved on which day.
+Step 33 did this for `async.hpp` and left the test file reading the way the header used to: 591 of
+1456 lines comment, case comments of 22 to 29 lines, and 17 lines naming a step, an item or a date.
 
-> Same rule as step 33: say briefly and accurately **what the case does and what it asserts**.
-> Keep what a reader of the case cannot get from its code - that a case aborts rather than fails
-> under a sanitizer, that counters are read as deltas because the binary may run every case in one
-> process, that a case is a guard rather than a reproduction. Drop the history: it is in this file
-> and in the git log.
+> Every one of the 40 case comments rewritten to say what the case does and what it asserts. Kept:
+> what a reader cannot get from the code - that a case is sanitizer-sensitive, that counters are
+> read as deltas because one process may run every case, that a case is a guard rather than a
+> reproduction, why a case drives synchronously or waits. Dropped: how the defect was found, what it
+> measured on which date, which step moved which contract.
 
-**Not a rename of any case.** The names are the contract and stay as they are.
+**352 comment lines of 1217**, down from 591 of 1456. No case comment is over 12 lines, and no
+inline comment over two. No case was renamed: the names are the contract.
+
+**Two comments were not just long but wrong**, and that is what a sweep is for:
+
+- The **file's own header** still said the suite was "expected to FAIL against the current header",
+  describing `action_list` as a bare `std::list` with nothing between the caller and the worker.
+  True before step 1, which was 36 steps ago.
+- `wait_until_poll_idle()` explained that "execution_poll::add() has no inverse, so an execution
+  stays registered after it has been destroyed". Step 4 gave it `remove()` and ~execution() has
+  called it ever since.
+
+**Verified:** 41/41 Debug with a 30x repeat; 41/41 under AddressSanitizer and under
+ThreadSanitizer; `async_smoke_test` exit 0; clang-format clean.
 
 ### Step 33 · hygiene — doc comments carry plan-sized narrative — DONE
 `async.hpp` (throughout) · added and done 2026-09-19, the user's own

@@ -6,13 +6,8 @@
  * Unlike async_smoke_test.cpp, which drives the interface by hand and prints what happened, every
  * case here states an expectation and fails when it does not hold.
  *
- * @remark These tests are written against the queue contract: an action handed to add_action() runs
- * exactly once on the worker thread, and stop() ends the worker. They are expected to FAIL against
- * the current header - execution::action_list is a bare std::list shared by the caller thread and
- * the worker with nothing between them, so the contract holds only by luck.
- *
- * @remark A short count is the symptom, not the diagnosis. Configure with -DASYNC_SANITIZE=thread
- * and ThreadSanitizer names the two racing accesses directly.
+ * @remark A few cases are sanitizer-sensitive and say so. Configure with -DASYNC_SANITIZE=thread or
+ * =address to run them where a race or a dangling read is named rather than inferred.
  */
 #include <gtest/gtest.h>
 
@@ -52,9 +47,9 @@ bool wait_for(predicateT predicate, std::chrono::milliseconds limit) {
 }
 
 /**
- * @brief Counts how many times its bound method was actually invoked.
+ * @brief Counts how many times its bound method was invoked.
  *
- * The counter is atomic so that the queue under test is the only unsynchronised thing in the test.
+ * The counter is atomic, so the queue under test is the only unsynchronised thing here.
  */
 struct sink {
   void count(int) { calls.fetch_add(1, std::memory_order_relaxed); }
@@ -66,15 +61,9 @@ struct sink {
 /**
  * @brief Waits for the polled executions to finish, the way async_smoke_test.cpp does.
  *
- * The worker thread is detached and keeps reading the object's members, so returning from a test
- * while it is still running would replace a reported failure with a use-after-free. Waiting on the
- * poll is the interface's own answer to that - execution is not joinable, so a registered object
- * and execution_poll::is_running() are what stand in for a join.
- *
- * @remark execution_poll::add() has no inverse, so an execution stays registered after it has been
- * destroyed and the singleton goes on calling into it. gtest_discover_tests gives every case its
- * own process, which is what keeps a stale registration from reaching the next case; running the
- * binary directly with more than one case does not.
+ * A detached worker goes on reading its execution, so returning from a case while one is still
+ * running would replace a reported failure with a use-after-free. An execution is not joinable, so
+ * the poll is what stands in for a join.
  *
  * @return true - the poll reported idle before the limit elapsed.
  */
@@ -126,14 +115,10 @@ using counting_execution = untangle::async::execution<counting_action_t>;
 }  // namespace
 
 /**
- * @brief An action the caller keeps is copied once, and its arguments once, not twice.
+ * @brief An action the caller keeps is copied once on its way to the queue, and so is its argument.
  *
- * The queue has to own what it is given, so one copy of an action the caller goes on holding is the
- * price of queueing it. A second copy was not: it came from taking the parameters by value and then
- * handing those copies to std::bind, which copies again.
- *
- * @remark The action is queued and never run - running it would copy for its own reasons, and the
- * question here is what queueing costs.
+ * The queue owns what it is given, so one copy each is the price of queueing; a second is not. The
+ * action is queued and never run - running it would copy for its own reasons.
  */
 TEST(execution_queue, queueing_copies_the_action_and_its_arguments_once) {
   auto exec = counting_execution::create_instance("copies");
@@ -159,9 +144,8 @@ TEST(execution_queue, queueing_copies_the_action_and_its_arguments_once) {
 /**
  * @brief An action the caller gives up is not copied at all.
  *
- * add_action() takes the action by value, which makes it a sink: std::move() at the call site, a
- * temporary, and a lambda all hand it straight to the queue. That is the shape most callers use -
- * every lambda in this file arrives this way - and it is why there is no second overload for it.
+ * add_action() takes the action by value, so std::move() at the call site and a temporary - the
+ * shape every lambda arrives in - both reach the queue without a copy.
  */
 TEST(execution_queue, queueing_an_action_the_caller_gives_up_copies_it_not_at_all) {
   auto exec = counting_execution::create_instance("given_up");
@@ -184,11 +168,10 @@ TEST(execution_queue, queueing_an_action_the_caller_gives_up_copies_it_not_at_al
 }
 
 /**
- * @brief An argument handed to a bound action is copied once too.
+ * @brief An argument passed through a binding is copied once, not twice.
  *
- * bind_action_and_method() wraps the call in a lambda that passes the arguments on to
- * add_action(). A lambda taking them by value copies once before add_action() has seen them, which
- * puts the second copy back however add_action() is written.
+ * The binding forwards its arguments to add_action() rather than taking them by value, so the only
+ * copy left is the queue's own.
  */
 TEST(execution_queue, queueing_through_a_binding_copies_the_argument_once) {
   auto target = std::make_shared<counting_target>();
@@ -208,10 +191,10 @@ TEST(execution_queue, queueing_through_a_binding_copies_the_argument_once) {
 }
 
 /**
- * @brief The queue works at all: one action, queued before the worker exists, runs once.
+ * @brief An action queued before run() runs exactly once.
  *
- * Nothing races here - the push happens before run() spawns anything - so this case passes against
- * the current header. It is what tells the failures below apart from a broken test.
+ * The simplest path through the queue, and the control that tells the cases below apart from a
+ * broken test.
  */
 TEST(execution_queue, runs_an_action_queued_before_the_worker_starts) {
   auto s = std::make_shared<sink>();
@@ -230,16 +213,10 @@ TEST(execution_queue, runs_an_action_queued_before_the_worker_starts) {
 }
 
 /**
- * @brief Every action pushed while the worker drains runs.
+ * @brief Every action queued while the worker drains runs.
  *
- * This is what the class exists to do: the caller thread pushes through add_action() while the
- * worker pops in execute_actions(), and neither side takes a lock. It fails one of two ways, and
- * which one comes up is a matter of timing rather than of how many actions are queued:
- *
- * - the count comes out short, because a push landed against a concurrent pop_front() - roughly 1
- *   action in 10 goes missing at this size;
- * - the process aborts, because the worker reached a std::function that was still being
- *   constructed, and invoking it threw std::bad_function_call out of the thread function.
+ * A thousand actions pushed from this thread while the worker pops them, which is what the class
+ * exists to do. A short count means a push was lost against a concurrent pop.
  */
 TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
   constexpr int queued = 1000;
@@ -263,11 +240,10 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
 }
 
 /**
- * @brief An action queued after stop() is refused, not silently stranded.
+ * @brief An action queued after stop() never runs.
  *
- * stop() ends this execution's working life: the worker drains what was queued before it and then
- * leaves. An action handed to add_action() after that point would never run, so it is dropped where
- * the caller can see the count stand still, rather than left in the list looking pending.
+ * stop() ends the execution's working life: the worker drains what was queued before it and leaves,
+ * so anything offered afterwards is dropped rather than left in the list looking pending.
  */
 TEST(execution_queue, refuses_an_action_queued_after_the_worker_stops) {
   auto s = std::make_shared<sink>();
@@ -290,32 +266,16 @@ TEST(execution_queue, refuses_an_action_queued_after_the_worker_stops) {
 }
 
 /**
- * @brief A refused action tells the caller, rather than only stderr.
+ * @brief add_action() answers the caller: true when it queued the action, false when it refused.
  *
- * The case above pins that a refused action does not run. This one pins that the caller finds out.
- * add_action() prints `warning: execution '...' is stopped_, action not added` and returns void, so
- * there is nothing for a caller to check.
+ * A refusal is a return value rather than an exception - untangle::invalid_action means a binding
+ * whose target has died, which is a different question - and rather than only a line on stderr.
  *
- * @attention Measured 2026-09-17. On an execution<function<int(int)>>, a bound call that was queued
- * and really ran returned 0, and a bound call refused after stop() also returned 0 - the two are
- * indistinguishable. The accepted one had produced a result; results() held it.
+ * @remark The direct caller only. The lambdas from bind() return actionT::result_type, which has no
+ * room for an answer, so a caller arriving that way is still not told.
  *
- * @remark **A bool, not an exception.** untangle::invalid_action means a binding whose target has
- * died - the action itself is broken. A refusal is not that: the action is perfectly good and the
- * execution is simply closed to new work. Throwing it here would make both a catch site and the
- * exception's own meaning ambiguous. The two cases stay separate answers to two separate questions.
- *
- * @remark **This case covers the direct caller only, and cannot cover the bound one.** The lambdas
- * from bind() return `actionT::result_type`, fixed by the specialisation - void here, int for an
- * int-returning execution - so a bool cannot be threaded back through them, and the plan's
- * instruction to do so is not implementable as written. A caller reaching add_action() through
- * bind() therefore stays untold, which is the half of item 8 carried forward from step 12 and is
- * the same ground step 28 has to cover for an action that throws.
- *
- * @remark The type is asserted rather than assumed so that this case **builds** against the current
- * header: decltype of a void call is well-formed, so the defect shows up as a failed expectation
- * instead of a compile error that would take the whole suite down with it. The behaviour below it
- * is guarded on the same condition, and starts testing once the return type is there to test.
+ * @remark The return type is asserted first and the behaviour checked inside a templated lambda, so
+ * that a header returning void fails this case instead of failing to compile the suite.
  */
 TEST(execution_queue, tells_the_caller_when_an_action_is_refused) {
   using answer_t = decltype(std::declval<int_execution&>().add_action(
@@ -324,9 +284,8 @@ TEST(execution_queue, tells_the_caller_when_an_action_is_refused) {
   EXPECT_TRUE((std::is_same_v<answer_t, bool>))
       << "add_action() returns void, so a caller cannot learn that its action was refused";
 
-  // In a templated lambda because a discarded `if constexpr` branch is still instantiated outside a
-  // template: written directly in this function, the calls below would fail to compile against the
-  // current void return and take the whole suite down with them.
+  // In a templated lambda because a discarded `if constexpr` branch is still instantiated outside
+  // a template, and these calls must not stop the suite compiling if the answer goes away.
   [&]<typename execT = int_execution>() {
     if constexpr (std::is_same_v<decltype(std::declval<execT&>().add_action(
                                      std::declval<std::function<void(int)>>(), 0)),
@@ -356,33 +315,11 @@ TEST(execution_queue, tells_the_caller_when_an_action_is_refused) {
 }
 
 /**
- * @brief An action whose own body throws does not kill the worker.
+ * @brief An action whose own body throws does not take the worker with it.
  *
- * execute_actions() wraps each action in a try that catches untangle::invalid_action and nothing
- * else. That exception is the header's own - a binding whose target has died - and step 2 added the
- * catch for it. An action's body is caller code, and nothing constrains what comes out of it: any
- * other exception leaves the worker's thread function and calls std::terminate.
- *
- * @attention Measured 2026-09-17. An action throwing std::runtime_error killed the process on both
- * paths - `run()` and `start()` alike - with `libc++abi: terminating due to uncaught exception` and
- * exit 134, SIGABRT. Nothing queued behind it ran. This is not a latent defect; it is one line of
- * caller code away.
- *
- * @attention **This case aborts rather than fails against the current header**, because that is
- * what the defect does. gtest_discover_tests gives every case its own process, so it takes down
- * this one and not the suite - the same arrangement
- * execution_attach.does_not_reach_an_attached_execution_that_has_been_destroyed relies on. Expect
- * ctest to report it as a crash until the fix lands.
- *
- * @remark The contract asserted is the one the header already applies to a dead binding: the
- * exception is swallowed, a warning names the execution, the action is counted as having come off
- * the queue, and the worker carries on with what is behind it. Same shape, same place - a throwing
- * action is not a special kind of failure, it is the second kind the worker has to survive.
- *
- * @remark What this case deliberately does not assert is the caller being *told*, which is the half
- * step 21 answered with a bool return. There is no synchronous caller here to return anything to -
- * the submitter is long gone by the time the action runs - so the warning on stderr is the floor,
- * and anything better is the results question from steps 14 and 15 reappearing for failures.
+ * The worker is a detached thread function, so an exception escaping it would call std::terminate.
+ * The throwing action is dropped with a warning naming the execution, the actions before and behind
+ * it still run, and the batch still reports that it drained.
  */
 TEST(execution_queue, an_action_that_throws_does_not_kill_the_worker) {
   auto exec = void_execution::create_instance("throwing_action");
@@ -409,15 +346,15 @@ TEST(execution_queue, an_action_that_throws_does_not_kill_the_worker) {
 /**
  * @brief stop() ends a worker that has only just been started.
  *
- * loop() sets `started` from inside the worker thread; stop() clears it from the caller. Nothing
- * orders the two, so a stop() that lands first is overwritten by the worker, and the loop spins on
- * forever at 100% of a core.
+ * The worker sets `started_` from its own thread and stop() clears it from the caller's, so a
+ * stop() that lands first must not be overwritten by a worker still coming up.
+ *
+ * @remark The execution is leaked deliberately if it wedges: the detached worker still holds it, so
+ * destroying it would turn a reported failure into a use-after-free.
  */
 TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
-  // Deliberately leaked when it wedges: the worker is detached and still holds this object, so
-  // destroying it would turn a reported failure into a use-after-free. The execution is
-  // shared-owned like every other, so leaking means keeping an owner alive for the rest of the
-  // process rather than dropping a raw pointer on the floor.
+  // Kept alive when it wedges: the detached worker still holds this object, so destroying it would
+  // turn a reported failure into a use-after-free.
   static std::vector<std::shared_ptr<void_execution>> wedged;
 
   auto exec = void_execution::create_instance("stop_after_start");
@@ -435,26 +372,14 @@ TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
 }
 
 /**
- * @brief An execution still running actions on its way out does not report itself finished.
+ * @brief An execution still running actions does not report itself finished.
  *
- * A guard, not a reproduction: it passes against the current header and has to keep passing.
+ * A guard, not a reproduction. The sample is taken from an attached execution's action during the
+ * attacher's final drain, after its loop has broken - that drain still runs work, because
+ * execute_actions() ends by driving the attachments.
  *
- * An execution that is running actions is running, whichever path it is on and however near the
- * end. The rule was once carried by a second flag, `finishing_`, which step 32 removed as
- * redundant; what it protected is this case, and this case still holds: the drain after loop()
- * breaks still runs work, because execute_actions() ends by driving the attacher's actuator.
- *
- * @remark The sample is taken from an attached execution's action, run by the attacher's worker
- * during the final drain after the loop has broken. `trigger` arms `shutdown_probe` and then stops
- * the worker, both from the attacher's own thread, which leaves the probe's action for that drain.
- * The two are attached in this order on purpose: the actuator invokes in attachment order - a
- * std::list walked front to back - so `shutdown_probe` is passed over while still empty and is
- * armed only afterwards by `trigger`.
- *
- * @remark Reversed, or driven mid-loop, the answer is the same true, so this case does not pin
- * *where* the sample was taken and is not evidence about the shutdown window itself. Step 30's
- * defect had no black-box test either: nothing caller-written runs between the end of the drain
- * and `running_` being cleared.
+ * @remark The two are attached in this order on purpose: the actuator invokes in attachment order,
+ * so shutdown_probe is passed over while still empty and armed only afterwards by trigger.
  */
 TEST(execution_lifecycle, an_execution_running_its_last_actions_does_not_report_itself_finished) {
   auto attacher = void_execution::create_instance("attacher");
@@ -467,9 +392,8 @@ TEST(execution_lifecycle, an_execution_running_its_last_actions_does_not_report_
   std::atomic_bool running_during_last_drain = {false};
   std::atomic_int sampled = {0};
 
-  // Runs on the attacher's worker, in the last pass before the loop breaks. The probe is armed
-  // before stop() because add_action() refuses once stopped, and attacher->stop() stops every
-  // execution it has attached.
+  // Armed before stop(), because add_action() refuses once stopped and stopping the attacher stops
+  // everything it has attached.
   trigger->add_action([&] {
     shutdown_probe->add_action([&] {
       running_during_last_drain = attacher->is_running();
@@ -494,22 +418,12 @@ TEST(execution_lifecycle, an_execution_running_its_last_actions_does_not_report_
 /**
  * @brief A second run() does not leave two workers inside one execution.
  *
- * run() spawns a worker and takes `running_`, which is also the handshake ~execution() waits on.
- * Before step 36 nothing checked whether a worker was already there, so a second run() started a
- * second one and both shared that single flag: whichever finished first cleared it, the
- * destructor's wait was satisfied while the other was still inside the object, and the object was
- * freed under it.
+ * run() takes `running_`, which is also the handshake ~execution() waits on. Two workers sharing it
+ * would let the first to finish satisfy that wait while the second was still inside the object.
+ * Twenty double runs, each let go at once so the destructor meets both.
  *
- * @attention This case **aborts rather than fails** under AddressSanitizer, which is what the
- * defect does - `heap-use-after-free` at async.hpp:629, written by the surviving worker into the
- * block the destructor has already returned. gtest_discover_tests gives every case its own process,
- * so it takes down this one and not the suite. In a plain Debug build it passes silently: nothing
- * observable goes wrong, which is exactly why the case is written this way.
- *
- * @remark `execution_results.are_cleared_between_runs` used to be flaky for the same reason,
- * through a narrower door: is_running() went false while the worker was still in its tail, so a
- * caller told the run was over started its second run into it. Step 32 closed that door by
- * removing the flag that opened it; this case is the deterministic one.
+ * @attention Sanitizer-sensitive: this aborts rather than fails when the defect is present, and a
+ * plain Debug build reports nothing either way.
  */
 TEST(execution_lifecycle, a_second_run_does_not_leave_two_workers_in_one_execution) {
   // Repeated, because the window is the instant between one worker clearing `running_` and the
@@ -526,24 +440,13 @@ TEST(execution_lifecycle, a_second_run_does_not_leave_two_workers_in_one_executi
 }
 
 /**
- * @brief The poll does not report idle while an execution is still running.
+ * @brief The poll does not report idle while an execution is running.
  *
- * execution_poll is a singleton, and waiting on it is what the interface offers in place of a join,
- * so more than one thread waits on it as a matter of course. is_running() invokes its actuator,
- * which clears one shared results vector and refills it. Two callers therefore walk over each
- * other, and the loser iterates a vector the winner has just emptied and reports idle.
+ * Two threads poll 200000 times each while the execution holds an action open, so it provably
+ * cannot finish mid-measurement and every idle answer is a wrong one.
  *
- * The action is held open for the whole measurement, so the execution provably cannot finish while
- * the poll is being asked. That matters: a waiter that checks exec->is_running() and then asks the
- * poll has a time-of-check to time-of-use gap of its own, and an execution that finishes inside it
- * makes the poll's "idle" correct rather than wrong. Such a reading is legitimate and this test
- * must not count it, so the possibility is removed rather than tolerated. It can only ever happen
- * once per waiter in any case - the loop would exit straight after - which is why it never
- * accounted for the counts seen here.
- *
- * One waiter is the control, and reports 0. Two waiters report roughly 15% wrong in a Debug build,
- * where is_running() is slow enough to leave the results vector cleared for longer, and about
- * 0.005% at -O1. The rate is build dependent; the count is not, so the assertion is on the count.
+ * @remark is_running() is read once more before the action is released: if that were false, the
+ * execution had finished early and the measurement would mean nothing.
  */
 TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
   std::atomic_bool action_started = {false};
@@ -601,9 +504,8 @@ TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
 /**
  * @brief The poll reports running while any one of the executions it holds is.
  *
- * This is what the poll is for: is_running() invokes every execution it holds and folds the
- * answers, so one busy execution among idle ones has to come back as running. Nothing else in this
- * file registers more than one at a time, which left the fold itself untested.
+ * is_running() invokes every execution it holds and folds the answers. The idle one is registered
+ * first, so the fold starts from false.
  */
 TEST(execution_poll, reports_running_while_one_of_several_executions_is) {
   std::atomic_bool action_started = {false};
@@ -642,14 +544,10 @@ TEST(execution_poll, reports_running_while_one_of_several_executions_is) {
 }
 
 /**
- * @brief The poll survives executions registering and withdrawing while another thread waits on it.
+ * @brief The poll survives executions registering and withdrawing while another thread walks it.
  *
- * Every execution adds itself to the poll and withdraws in its destructor, and waiting on the poll
- * is what a caller does in the meantime. Neither side takes a lock, and add() move-assigns the
- * actuator whenever the poll was empty - out from under a thread walking its action list.
- *
- * This one does not return a wrong answer, it crashes: the walking thread follows a pointer into a
- * list that has just been replaced.
+ * Two hundred executions register and are destroyed while a second thread polls without stopping.
+ * The failure here is a crash, not a wrong answer.
  */
 TEST(execution_poll, survives_executions_registering_while_another_thread_waits) {
   std::atomic_bool done = {false};
@@ -672,21 +570,13 @@ TEST(execution_poll, survives_executions_registering_while_another_thread_waits)
 }
 
 /**
- * @brief An action does not reach an execution that has been destroyed.
+ * @brief An action outliving its execution reports a dead binding instead of following it.
  *
- * Both bind() overloads hand the caller a lambda to store - here on the sink, whose lifetime has
- * nothing to do with the execution's. The sink outliving the execution is the ordinary shape rather
- * than a contrived one: an action is a member of the bound object, and the execution is typically a
- * local or a member somewhere else.
+ * bind() hands the caller a lambda to store on the bound object, whose lifetime has nothing to do
+ * with the execution's. Invoking it afterwards throws untangle::invalid_action.
  *
- * The contract asserted here is the one actuator::bind already follows: the binding holds weak
- * ownership, and invoking it after its target has gone throws untangle::invalid_action rather than
- * touching freed memory. execute_actions() catches exactly that exception, so an action that comes
- * in late through the worker is dropped with a warning instead of ending the process.
- *
- * @remark The throw is asserted, not just the absence of a side effect. EXPECT_EQ(calls, 0) alone
- * would also pass against a broken header that pushed onto a destroyed list, because a queue no
- * worker is draining never runs anything either.
+ * @remark The throw is asserted, not just the absence of a side effect: a queue that no worker
+ * drains would leave the count at zero as well.
  */
 TEST(execution_binding, an_action_does_not_reach_a_destroyed_execution) {
   auto s = std::make_shared<sink>();
@@ -703,14 +593,10 @@ TEST(execution_binding, an_action_does_not_reach_a_destroyed_execution) {
 }
 
 /**
- * @brief The plain-function overload holds the same reference, and must not follow it either.
+ * @brief The plain-function overload answers the same way.
  *
- * bind(T& Fn, execution&) holds the execution exactly as the method overload does, so a function
- * action outliving its execution must report the same way. Kept as its own case because the two
- * overloads are separate code paths: a fix applied to one and not the other would leave the header
- * half repaired and this suite still green.
- *
- * The action is declared outside the scope so that it, rather than the execution, is what survives.
+ * Its own case because the two overloads are separate code paths: a fix applied to one and not the
+ * other would leave the header half repaired and this suite still green.
  */
 TEST(execution_binding, a_function_action_does_not_reach_a_destroyed_execution) {
   std::atomic_int calls = {0};
@@ -732,13 +618,11 @@ TEST(execution_binding, a_function_action_does_not_reach_a_destroyed_execution) 
 /**
  * @brief Building a binding copies the callable only if the caller keeps it.
  *
- * bind_action_and_function() takes the callable by value and moves it into the action it builds,
- * and the action is moved into the lambda that carries it. Neither step copies, so a caller who
- * hands over a temporary - or moves one in - pays nothing to be bound.
+ * The callable is taken by value and moved into the action, which is moved again into the lambda
+ * that carries it, so a temporary costs nothing and an lvalue costs the one copy of keeping it.
  *
- * @remark This is about building the binding, not about calling it. What one call costs is
- * queueing_through_a_binding_copies_the_argument_once, and the action copy it still makes is step
- * 34.
+ * @remark About building the binding, not calling it; what a call costs is
+ * queueing_through_a_binding_copies_the_argument_once.
  */
 TEST(execution_binding, building_a_binding_copies_a_callable_the_caller_gives_up_not_at_all) {
   auto exec = counting_execution::create_instance("bind_cost");
@@ -763,27 +647,12 @@ TEST(execution_binding, building_a_binding_copies_a_callable_the_caller_gives_up
 /**
  * @brief An attacher does not reach into an attached execution that has been destroyed.
  *
- * attach() hands the attacher's actuator a raw `&other.action_execute` - a pointer into the
- * attached object. There is no detach(), and ~execution() withdraws from execution_poll but not
- * from anything that attached it, so the attacher goes on holding that pointer after the target
- * is gone. Driving the attacher then dereferences it: actuator::operator() reads `*action` to test
- * the std::function for emptiness before invoking it, and that read lands in freed memory.
+ * attach() hands the attacher's actuator a pointer into the attached object, so a destroyed
+ * attachment has to drop out of its attacher and leave the rest of the list working. The dead entry
+ * is attached first, so the survivor behind it can only run if the dead one is stepped over.
  *
- * The contract asserted here is the one step 4 applied to execution_poll and step 12 to bind():
- * an object that holds a pointer into another must learn when that other dies. A destroyed
- * attached execution must simply drop out of its attacher, leaving the rest of the attachment
- * list working.
- *
- * @attention Measured 2026-09-14. Under -DASYNC_SANITIZE=address this case fails 3/3, exit 134,
- * as `heap-use-after-free` - a READ of size 8 at actuator.hpp:134, the `!*action` emptiness test,
- * reached from execution::execute_actions() (async.hpp:410). That is the reproduction, and it is
- * deterministic.
- *
- * In a plain Debug build the same read is undefined rather than diagnosed, and it behaves like it:
- * 5 runs gave SIGSEGV, SIGBUS, clean, SIGBUS, clean. So this case does fail without a sanitizer,
- * but only about three times in five and as a crashed process rather than a reported expectation.
- * Configure with the sanitizer to see it named. The two expectations below are what must hold once
- * the dead entry is dropped; neither of them is what fails today.
+ * @remark Driven through action_execute() on this thread rather than by a worker, so that a
+ * dangling read is attributed to this line by the sanitizer instead of crashing a worker thread.
  */
 TEST(execution_attach, does_not_reach_an_attached_execution_that_has_been_destroyed) {
   auto attacher = void_execution::create_instance("attacher");
@@ -807,9 +676,8 @@ TEST(execution_attach, does_not_reach_an_attached_execution_that_has_been_destro
   survivor->add_action([&survivor_ran] { survivor_ran.fetch_add(1, std::memory_order_relaxed); });
   attacher->attach(survivor);
 
-  // action_execute is the public seam onto execute_actions(), which is what triggers the attached
-  // executions. Driving it directly keeps the case synchronous - no worker, no waiting, and the
-  // dangling read happens on this thread where the sanitizer attributes it to this line.
+  // Driven directly, so the pass is synchronous and a dangling read lands on this thread where the
+  // sanitizer attributes it to this line.
   attacher->action_execute();
 
   EXPECT_EQ(short_lived_ran->load(), 0)
@@ -820,26 +688,14 @@ TEST(execution_attach, does_not_reach_an_attached_execution_that_has_been_destro
 }
 
 /**
- * @brief attach() refuses an attachment that would close a cycle.
+ * @brief attach() refuses an attachment that would close a cycle, an execution onto itself
+ * included.
  *
- * `a.attach(b); b.attach(a);` is accepted today, and driving either one recurses until the stack
- * is gone: execute_actions() triggers the attached action_execute, which is execute_actions() on
- * the other object, which triggers this one. Probed 2026-09-14 - SIGSEGV, exit 139 in a plain
- * Debug build, and `stack-overflow` under AddressSanitizer. Self-attachment is the same defect
- * with one object and fails the same way, exit 139.
+ * Driving a cycle recurses until the stack is gone, so it is refused where the caller still has a
+ * stack to be told on. The legitimate first direction must keep working.
  *
- * A cycle is a caller error at attach() time, not a run-time condition to be survived, so the
- * contract asserted is that attach() rejects it there - where the caller still has a stack to be
- * told on - rather than that the recursion is somehow bounded later.
- *
- * @remark The cycle is deliberately never driven. Today both calls succeed, so on failure this
- * case leaves two mutually attached executions behind; letting the worker or a direct
- * action_execute() reach them would replace a reported failure with a crashed test process.
- * ~execution() does not trigger the attachment, so returning from here is safe.
- *
- * @remark untangle::async::invalid_attachment is the type asserted, deliberately not
- * untangle::invalid_action: that one reports a binding whose target has died, and
- * execute_actions() swallows it by design. A cycle is a caller error and must not be swallowed.
+ * @remark invalid_attachment, deliberately not invalid_action: the worker swallows that one by
+ * design, and a cycle is a caller error that must not be swallowed.
  */
 TEST(execution_attach, refuses_an_attach_that_would_close_a_cycle) {
   auto a = void_execution::create_instance("a");
@@ -859,14 +715,8 @@ TEST(execution_attach, refuses_an_attach_that_would_close_a_cycle) {
 /**
  * @brief detach() is attach()'s inverse: a detached execution stops being triggered.
  *
- * attach() had no inverse at all, which is half of why a destroyed attached execution could not
- * get out of its attacher. An explicit detach() is the other half of that fix, and is the contract
- * a caller needs in its own right - an attachment that can only ever be added is a leak of
- * behaviour, not just of memory.
- *
  * The action is queued on the attached execution and never drained by a worker of its own, so the
- * only thing that can run it is the attacher reaching in. That makes the count a direct reading of
- * whether the attachment is still live.
+ * count reads whether the attachment is still live.
  */
 TEST(execution_attach, detach_stops_an_attached_execution_from_being_triggered) {
   auto attacher = void_execution::create_instance("attacher");
@@ -888,11 +738,8 @@ TEST(execution_attach, detach_stops_an_attached_execution_from_being_triggered) 
 /**
  * @brief detach() unwires the stop path too, not only the execute path.
  *
- * attach() wires two actuators - actuator_execute and actuator_stop - so an inverse that forgot
- * the second would leave the attacher still able to stop an execution it no longer drives. That
- * is observable without reaching into the header: stop() is final for an execution, because
- * add_action() refuses everything once stopped is set. So an execution that still accepts and runs
- * an action after its former attacher has stopped is one the stop did not reach.
+ * stop() is final for an execution, so one that still accepts and runs an action after its former
+ * attacher has stopped is one the stop did not reach.
  */
 TEST(execution_attach, detach_unwires_the_stop_path_as_well) {
   auto attacher = void_execution::create_instance("attacher");
@@ -914,13 +761,8 @@ TEST(execution_attach, detach_unwires_the_stop_path_as_well) {
 /**
  * @brief Detaching an execution that was never attached is answered, not an error.
  *
- * The caller gets false rather than an exception: asking to remove an attachment that is not there
- * leaves exactly the state the caller wanted, so there is nothing to report as a failure. Stated
- * as its own case because it is the boundary an implementation is most likely to get wrong once
- * detach() starts erasing from the actuator's list.
- *
- * @remark This case passes against the stub, which returns false for everything. It is here to
- * pin the contract, not to reproduce the defect.
+ * The caller gets false rather than an exception: the state asked for already holds. A guard on the
+ * boundary an implementation is most likely to get wrong once detach() erases from a list.
  */
 TEST(execution_attach, detaching_an_execution_that_was_never_attached_reports_false) {
   auto attacher = void_execution::create_instance("attacher");
@@ -931,15 +773,9 @@ TEST(execution_attach, detaching_an_execution_that_was_never_attached_reports_fa
 }
 
 /**
- * @brief A chain of attachments is legitimate, and the whole of it runs.
+ * @brief A chain of attachments is legitimate, and driving its head runs the whole chain.
  *
- * a -> b -> c is not a cycle and must keep working: nothing in the cycle check may refuse it, and
- * driving the head has to reach all the way down. execute_actions() runs this execution's own
- * actions and then triggers whatever is attached, so each link in turn drains its own queue - which
- * is what the two counts below read.
- *
- * This is the case the cycle check has to leave alone, so it is stated on its own rather than as a
- * setup step inside the refusal case.
+ * a -> b -> c, driven once at a. This is the case the cycle check has to leave alone.
  */
 TEST(execution_attach, allows_a_chain_of_attached_executions) {
   auto a = void_execution::create_instance("a");
@@ -961,19 +797,10 @@ TEST(execution_attach, allows_a_chain_of_attached_executions) {
 }
 
 /**
- * @brief Closing that chain into a cycle is refused.
+ * @brief A cycle that closes through a third execution is refused, and the chain survives it.
  *
- * The two-object case is the one that is easy to spot by eye, and it was the only one caught while
- * attach() compared an execution against its own attacher and stopped there. A chain that comes
- * back round is the same defect and recurses the same way.
- *
- * Refusing an execution that already has an attacher leaves every execution with at most one, so
- * the attachment graph is a forest and the only cycle that can be built is one that attaches the
- * root of its own chain - every other ancestor is refused as attached already. attach() therefore
- * walks up the chain of attachers rather than looking one step back.
- *
- * @remark Three deep on purpose. With a -> b -> c, `c` attaching `a` has to walk past `b` to find
- * it, which a one-step check cannot do.
+ * Three deep on purpose: with a -> b -> c, c attaching a can only be caught by walking up the chain
+ * of attachers, which a one-step check cannot do. A refused attach may leave nothing half done.
  */
 TEST(execution_attach, refuses_a_cycle_that_closes_through_a_third_execution) {
   auto a = void_execution::create_instance("a");
@@ -995,28 +822,13 @@ TEST(execution_attach, refuses_a_cycle_that_closes_through_a_third_execution) {
 }
 
 /**
- * @brief An attached execution tells on_finished that its batch has drained.
+ * @brief An attached execution tells on_finished that its own batch has drained.
  *
- * notify_finished() is called from execute() and from loop(), and an attached execution is in
- * neither: its actions are run straight out of execute_actions() by the attacher's worker. So its
- * on_finished never fires, however much work it does. Probed 2026-09-15: 0 firings across a full
- * run, driven both synchronously and by a started attacher.
+ * Its actions are run by the attacher's worker, so the notification has to come from the drain
+ * itself: a batch that drained is reported once, and a pass that ran nothing reports nothing.
  *
- * The rule the existing notification cases set is the one that has to hold here too - a batch that
- * drained is reported once, and a pass that ran nothing reports nothing. See
- * execution_notification.on_finished_fires_each_time_a_batch_drains, whose contract this extends to
- * the executions an attacher drives.
- *
- * @remark Driven by a real start()ed attacher rather than by action_execute() from this thread, as
- * the attach cases above it are. on_finished is signalled only from a worker thread, and for an
- * attached execution the worker in question is the attacher's - so the notification's thread is
- * part of the contract, not an incidental detail, and the case asserts it. A synchronous drive
- * would exercise the same code and prove the wrong thing about who sent the notification.
- *
- * @remark is_running() is deliberately not asserted here. It reports whether this execution's own
- * worker thread is alive - see its comment on async.hpp - and an attached execution has no worker,
- * so false is the right answer rather than the defect. on_finished is a different promise: it is
- * about a queue draining, and this queue drains.
+ * @remark Driven by a real start()ed attacher rather than from this thread, because which thread
+ * raises the callback is part of the contract.
  */
 TEST(execution_attach, on_finished_fires_when_an_attached_batch_drains) {
   auto attacher = void_execution::create_instance("attacher");
@@ -1061,16 +873,9 @@ TEST(execution_attach, on_finished_fires_when_an_attached_batch_drains) {
 }
 
 /**
- * @brief A fresh execution has no results, rather than one indeterminate value.
+ * @brief A fresh execution has no results at all.
  *
- * `_result` was a bare `typename resultT::type` with no initialiser, and no constructor touched it,
- * so reading it before any action had run was undefined behaviour for every scalar result type -
- * and for the `int` that stands in when the action returns void. On the heap it read 0 and looked
- * innocent; built on a stack that had been written over first, it read back 0xabababab, 3 times out
- * of 3. An execution may be built on the stack: only bind() and attach() require shared ownership.
- *
- * A vector of results has no such state to read. That is the point of this case - not that the
- * value is now zero, but that there is no value until an action has produced one.
+ * Not that the value reads zero - that there is no value until an action has produced one.
  */
 TEST(execution_results, are_empty_before_any_action_runs) {
   const auto exec = int_ret_execution::create_instance("fresh");
@@ -1079,14 +884,9 @@ TEST(execution_results, are_empty_before_any_action_runs) {
 }
 
 /**
- * @brief Every action's return value is kept, not just the last one.
+ * @brief Every action's return value is kept, in the order they ran.
  *
- * `_result` was a single value that each action overwrote, so queueing three actions lost two
- * return values: 1, 2 and 3 queued left `result()` reporting 3. This is the case that fails against
- * that header, and it is why the single value becomes a vector rather than gaining a lock.
- *
- * The actions are queued before run(), so the worker drains all three in one pass and the run is
- * over when it reports itself finished.
+ * The three actions are queued before run(), so one pass drains them all.
  */
 TEST(execution_results, keep_every_action_result) {
   const auto exec = int_ret_execution::create_instance("three_actions");
@@ -1107,10 +907,8 @@ TEST(execution_results, keep_every_action_result) {
 /**
  * @brief on_finished is where a caller reads the results of a run.
  *
- * That is the contract this step is written to: run() collects, on_finished hands over. It fires
- * after the queue has drained and before the execution reports itself finished, so the results are
- * complete by the time the callback can see them - the assertion is on what the callback read, not
- * on what is readable afterwards.
+ * It fires once the queue has drained, so the results are complete by the time it can see them.
+ * The assertion is on what the callback read, not on what is readable afterwards.
  */
 TEST(execution_results, are_available_to_on_finished) {
   const auto exec = int_ret_execution::create_instance("notifying");
@@ -1133,8 +931,7 @@ TEST(execution_results, are_available_to_on_finished) {
 /**
  * @brief A run reports its own results, not those of the run before it.
  *
- * The results belong to one run, so the second run has to start from empty. Stated separately
- * because an implementation that only ever appends passes the case above and fails this one.
+ * Stated separately because an implementation that only ever appends passes the case above.
  */
 TEST(execution_results, are_cleared_between_runs) {
   const auto exec = int_ret_execution::create_instance("twice");
@@ -1156,9 +953,8 @@ TEST(execution_results, are_cleared_between_runs) {
 /**
  * @brief The continuous worker does not collect results, deliberately.
  *
- * start() has no point at which a run is over, so there is nothing to hand back and nowhere to
- * clear; collecting there would grow without bound. This is a decision rather than an oversight,
- * and it is pinned here so that it is changed on purpose if a use case ever wants it.
+ * start() has no point at which a run is over, so collecting would grow without bound. Pinned here
+ * so that it is changed on purpose if a use case ever wants it.
  */
 TEST(execution_results, are_not_filled_by_the_continuous_worker) {
   const auto exec = int_ret_execution::create_instance("continuous");
@@ -1178,18 +974,11 @@ TEST(execution_results, are_not_filled_by_the_continuous_worker) {
 /**
  * @brief on_finished fires each time a batch of actions drains, not only after run().
  *
- * It was called from execute(), the one-shot path, and from nowhere else - so a caller driving the
- * execution with start() and stop() never heard from it. Probed 2026-09-14: fired 0 times out of 3
- * runs in that mode, against 1 out of 1 for run().
+ * "Finished" means the queue this worker was given has drained, which is the signal for firing the
+ * next batch - so it is per batch and not per worker.
  *
- * "Finished" means the queue this worker was given has drained, which is the signal a caller needs
- * to fire the next batch once the previous one is done. It is therefore per batch and not per
- * worker: a callback that only arrived when the worker ended would be useless for that, since
- * getting it would mean calling stop() and having no worker left to fire the next batch at.
- *
- * The batches are kept one pass apart on purpose. execute_actions() drains everything queued in a
- * single call, so the two actions queued before start() are one batch and one notification; the
- * third, queued after that notification arrives, is a second batch.
+ * @remark The batches are kept one pass apart on purpose: execute_actions() drains everything
+ * queued in a single call, so the third action is queued only after the first notification.
  */
 TEST(execution_notification, on_finished_fires_each_time_a_batch_drains) {
   const auto exec = void_execution::create_instance("continuous");
@@ -1220,12 +1009,8 @@ TEST(execution_notification, on_finished_fires_each_time_a_batch_drains) {
 /**
  * @brief An idle worker reports nothing.
  *
- * loop() does not wait on the condition variable indefinitely - it wakes every 10ms so that it can
- * look in on attached executions - and it calls execute_actions() on every pass whether or not
- * anything was queued. A notification per pass would therefore arrive about a hundred times a
- * second on a completely idle execution, each one reporting that nothing had finished.
- *
- * 200ms is twenty of those passes, which is enough for the difference to be unmistakable.
+ * loop() wakes every 10ms to look in on its attachments and calls execute_actions() each time.
+ * 200ms is twenty such passes, none of which finished anything.
  */
 TEST(execution_notification, an_idle_worker_reports_nothing) {
   const auto exec = void_execution::create_instance("idle");
@@ -1246,9 +1031,7 @@ TEST(execution_notification, an_idle_worker_reports_nothing) {
 /**
  * @brief run() reports finished exactly once.
  *
- * The one-shot path drains once and leaves, so per-batch and per-worker are the same thing here.
- * Stated so that the cases above are telling us about the continuous worker rather than about a
- * callback that never fires anywhere.
+ * The one-shot path drains once and leaves, so per batch and per worker are the same thing here.
  */
 TEST(execution_notification, on_finished_fires_once_per_run) {
   const auto exec = void_execution::create_instance("one_shot");
@@ -1268,21 +1051,8 @@ TEST(execution_notification, on_finished_fires_once_per_run) {
 /**
  * @brief run()'s callback is told the execution is still running, because it is.
  *
- * on_finished is raised from inside the drain, on the worker's own thread, at the moment the list
- * empties. The worker has not finished at that point - it is standing in the callback, and has the
- * rest of execute() still to do - so is_running() answering true is the honest answer rather than a
- * stale one. A callback is not a place to ask whether the work is over; it *is* the notification
- * that the batch is over.
- *
- * @remark This case asserted the opposite until 2026-09-17, when the notification moved into
- * execute_actions() so that an attached execution could be told its own batch had drained (item 12
- * / step 17). The old contract came from step 16, when a second flag was set before the callback;
- * the callback is now raised earlier than any such store, and the ordering it described no longer
- * exists to be tested.
- *
- * With this, both worker paths say the same thing, and this case and the one below it are two
- * halves of one contract rather than opposites - see
- * execution_notification.a_drained_batch_does_not_claim_the_worker_stopped.
+ * on_finished is raised from inside the drain, on the worker's own thread, with the rest of the
+ * path still to go. Once the worker has left, is_running() reads false; both halves are checked.
  */
 TEST(execution_notification, a_run_batch_does_not_claim_the_worker_stopped) {
   const auto exec = void_execution::create_instance("one_shot");
@@ -1310,13 +1080,10 @@ TEST(execution_notification, a_run_batch_does_not_claim_the_worker_stopped) {
 }
 
 /**
- * @brief A drained batch does not claim the worker has stopped.
+ * @brief The same from the continuous side: a drained batch says nothing about the worker.
  *
- * The counterpart of the case above, and since 2026-09-17 the same contract seen from the
- * continuous side: a drained batch says nothing about the worker, which is still there and waiting
- * for the next one. is_running() must keep saying so, or a caller waiting for the execution to
- * finish would be told it had, mid-life. The two cases are kept apart because the paths are - one
- * worker leaves after its batch and the other does not - not because they disagree.
+ * start()'s worker is still there and waiting for the next batch, so is_running() must keep saying
+ * so. Kept apart from the case above because the paths differ, not because the answers do.
  */
 TEST(execution_notification, a_drained_batch_does_not_claim_the_worker_stopped) {
   const auto exec = void_execution::create_instance("continuous");
@@ -1354,8 +1121,8 @@ TEST(execution_busy, a_fresh_execution_is_not_busy) {
 /**
  * @brief A queued action makes an execution busy before any worker has touched it.
  *
- * add_action() can be called before run() or start(), so "busy" cannot mean "a worker is running".
- * It means there is work outstanding.
+ * Actions may be queued before run() or start(), so busy means work outstanding, not a worker
+ * running.
  */
 TEST(execution_busy, a_queued_action_makes_an_execution_busy) {
   const auto exec = void_execution::create_instance("queued");
@@ -1368,13 +1135,9 @@ TEST(execution_busy, a_queued_action_makes_an_execution_busy) {
 /**
  * @brief An execution is busy while an action is running, not only while one is queued.
  *
- * This is the case that makes is_busy() more than a test for an empty list. The worker pops an
- * action under the lock and runs it with the lock released, so between those two the list is empty
- * and the execution is anything but idle. An implementation that only asked whether the list was
- * empty would report this execution free and invite a caller to hand it more work.
- *
- * The action is held open until the assertion has been made, so the reading cannot be a race
- * against the action finishing early.
+ * The worker pops an action under the lock and runs it with the lock released, so between those two
+ * the list is empty and the execution is anything but idle. The action is held open until the
+ * reading has been taken, so it cannot race the action finishing early.
  */
 TEST(execution_busy, an_execution_is_busy_while_its_last_action_runs) {
   const auto exec = void_execution::create_instance("running");
@@ -1433,10 +1196,8 @@ TEST(execution_busy, an_execution_is_not_busy_once_its_actions_have_run) {
 /**
  * @brief A continuous worker is running whether or not it is busy.
  *
- * The two are different questions, and this is the case that says so. is_running() is about the
- * worker thread and stays true from start() until after stop(); is_busy() is about the work. An
- * execution that conflated them could not be asked whether it had room for more, which is the
- * question a pool of executions has to ask.
+ * is_running() is about the worker and stays true from start() until after stop(); is_busy() is
+ * about the work. An execution that conflated them could not be asked whether it had room.
  */
 TEST(execution_busy, a_continuous_worker_runs_while_idle) {
   const auto exec = void_execution::create_instance("idle_but_running");
