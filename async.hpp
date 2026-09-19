@@ -34,16 +34,10 @@ namespace async {
  */
 
 /**
- * @brief Invalid attachment exception.
+ * @brief Raised by \ref execution::attach() when the attachment asked for is refused.
  *
- * @remark Raised by \ref execution::attach() when the attachment asked for would close a cycle -
- * either between two executions that each attach the other, or an execution attached to itself.
- * Driving such a cycle recurses until the stack is gone, so it is refused where the caller can
- * still be told about it.
- *
- * @remark Deliberately not an untangle::invalid_action. That one reports a binding whose target has
- * died, and execution::execute_actions() swallows it by design; a cycle is a caller error and
- * must not be swallowed.
+ * @remark Not an untangle::invalid_action: that one reports a binding whose target has died and is
+ * swallowed by the worker, while this is a caller error and must not be.
  */
 struct invalid_attachment : std::exception {
   /**
@@ -67,14 +61,10 @@ struct invalid_attachment : std::exception {
 /**
  * @brief One execution's place in the attachment graph: who attached it, if anyone.
  *
- * Deliberately at namespace scope rather than nested in \ref execution, so that it is one type
- * rather than one per specialisation. An execution may be attached by an execution of any
- * specialisation, and the whole point of this record is that the chain can be walked without
- * knowing what any link's action type is.
- *
- * An execution holds one of these by std::shared_ptr and it dies with the execution, so it doubles
- * as the liveness token the attached side needs: a link whose weak reference still locks belongs to
- * an execution that is still there.
+ * At namespace scope, so it is one type rather than one per specialisation: an execution may be
+ * attached by an execution of any specialisation, and the chain is walked without knowing any
+ * link's action type. It dies with its execution, so it doubles as a liveness token - a link that
+ * still locks belongs to an execution that is still there.
  */
 struct attachment {
   //! The link of the execution that attached this one; empty when nothing has.
@@ -82,18 +72,10 @@ struct attachment {
 };
 
 /**
- * @brief Execution poll class.
+ * @brief Single-tone poll that reports whether any \ref execution added to it is still running.
  *
- * A single-tone class that may be used to verify if the polled \ref execution objects have finished
- * their processing. If at least one \ref execution object is running then this poll has the
- * "running" state.
- *
- * @remark An \ref execution object runs in a detached thread, hence it is not joinable.
- * The caller can wait for an \ref execution to be finished only by checking the "running"
- * state(\ref execution::is_running()). This class represents a convenient way to check any number
- * of
- * \ref execution objects.
- *
+ * @remark An execution runs in a detached thread and cannot be joined, so checking the "running"
+ * state is the only way to wait for one. This checks any number of them at once.
  */
 class execution_poll {
  public:
@@ -116,8 +98,8 @@ class execution_poll {
   /**
    * @brief Removes an \ref execution object from the poll.
    *
-   * add() stores a pointer to the object's action_is_running, so an execution destroyed while still
-   * registered leaves the poll calling into freed memory. ~execution() calls this.
+   * @attention \ref add() stores a pointer into the object, so one destroyed while still added
+   * would leave the poll calling into freed memory. ~execution() calls this.
    *
    * @param async_exec An \ref execution object.
    */
@@ -176,10 +158,8 @@ class execution_poll {
  */
 template <typename actionT>
 class execution {
-  // An execution may attach one of a different specialisation - the smoke test attaches an
-  // execution<function<void(int)>> to an execution<function<void(void)>> - and that is a different
-  // class with no access to this one's members. attach() and detach() need to read and write
-  // attachment_lifetime_ on it.
+  // An execution may attach one of a different specialisation, which is a different class;
+  // attach() and detach() reach into its attachment_lifetime_.
   template <typename otherActionT>
   friend class execution;
 
@@ -187,15 +167,8 @@ class execution {
   /**
    * @brief Creates an execution owned by a std::shared_ptr, which is what binding to it requires.
    *
-   * \ref bind_action_and_method() and \ref bind_action_and_function() take the execution as a
-   * std::shared_ptr and hold it weakly, so an execution that is to be bound has to be created this
-   * way. One built on the stack, as a data member, or through a bare new is still a usable
-   * execution
-   * - actions can be handed to \ref add_action() directly - it simply cannot be bound, and the
-   * attempt does not compile.
-   *
-   * The arguments are forwarded to a constructor, so this factory does not have to be revisited
-   * when one is added.
+   * An execution built any other way is still usable - \ref add_action() takes actions directly -
+   * but cannot be bound, and the attempt does not compile.
    *
    * @param args - Constructor arguments: a name, or nothing for the default name.
    * @return - A std::shared_ptr owning the new execution.
@@ -206,21 +179,14 @@ class execution {
   }
 
   /**
-   * @brief Constructs a new execution object with the default name. Call \ref create_instance()
-   * instead.
+   * @brief Constructs an execution with the default name. Call \ref create_instance() instead.
    *
-   * The name identifies an execution in the warnings it reports, and is otherwise unused. An
-   * execution built without one keeps the default name rather than an empty one, so a warning
-   * always names something.
+   * The name identifies this execution in the warnings it reports, and is otherwise unused.
    */
   execution() : execution(std::string(default_name)) {}
 
   /**
-   * @brief Constructs a new named execution object.
-   *
-   * An execution constructed directly cannot be bound to - \ref bind_action_and_method() and
-   * \ref bind_action_and_function() require a std::shared_ptr. Use \ref create_instance() for one
-   * that is going to carry bound actions.
+   * @brief Constructs a named execution. Use \ref create_instance() for one that is to be bound.
    *
    * @param exec_name - A name for this execution.
    */
@@ -232,25 +198,18 @@ class execution {
   }
 
   /**
-   * @brief Destroys the execution object, once its worker has left.
+   * @brief Destroys the execution, once its worker has left.
    *
-   * The worker is detached and cannot be joined, so this waits on the same "running" state that
-   * \ref execution_poll reports - the only handle a detached worker offers. It returns at once for
-   * an execution that was never started, or that the caller has already polled to a stop.
+   * The worker is detached and cannot be joined, so this waits on the "running" state instead. It
+   * detaches this execution from whatever attached it first, and returns at once for one that was
+   * never started.
    *
-   * @remark It first takes this execution out of whatever attached it, which is the inverse of
-   * \ref attach() and the counterpart of the execution_poll::remove() below.
+   * @attention Safe only because `running_` is cleared as the very last thing the worker does:
+   * this object may be freed the moment it reads false, so nothing may follow it in execute() or
+   * loop().
    *
-   * @remark This is safe only because running_ is cleared as the very last thing the worker does.
-   * Nothing may be added after it in execute() or loop(): the object can be freed the moment it
-   * reads false.
-   *
-   * @remark **No rule of five, deliberately.** An execution is declared once and used in place; it
-   * is never copied, moved or assigned. Declaring this destructor suppresses the implicit moves,
-   * and the copy operations are deleted several times over - by std::thread, by every atomic, by
-   * both mutexes and by the condition variable, each on its own. Spelling the four out would only
-   * restate that, and would start earning its keep only if all of those members were replaced by
-   * copyable ones at once.
+   * @remark **No rule of five, deliberately.** An execution is declared once and used in place;
+   * the members already delete the copy operations several times over.
    */
   ~execution() {
     // Out of the attacher first, before the worker is even asked to stop: from here on nothing
@@ -281,14 +240,11 @@ class execution {
    * @brief Binds asynchronously an external action to a class function member.
    *
    * It creates an action as a binding to a class method (by untangle::bind()), and assigns to
-   * \p action a callable that passes it to \ref add_action(). The execution is taken as a
-   * std::shared_ptr and held as a std::weak_ptr, exactly as untangle::bind() holds the bound
-   * object: the action can therefore outlive the execution and report a dead binding rather than
-   * following a dangling reference.
+   * \p action a callable that passes it to \ref add_action(). The execution is held weakly, so the
+   * action may outlive it.
    *
    * @attention Invoking \p action after the execution has been destroyed throws
-   * untangle::invalid_action. execute_actions() catches it, so such an action is dropped with a
-   * warning rather than ending the worker thread.
+   * untangle::invalid_action. The worker catches it and drops the action with a warning.
    *
    * @param action [in,out] - An action of type std::function<...>.
    * @param obj - A std::shared_ptr that wraps the bound class object.
@@ -318,9 +274,8 @@ class execution {
   /**
    * @brief Binds asynchronously an external action to a plain function.
    *
-   * It wraps \p Fn in an action and assigns to \p action a callable that passes it to \ref
-   * add_action(). The execution is held weakly, for the reason given on \ref
-   * bind_action_and_method().
+   * It wraps \p Fn in an action and assigns to \p action a callable that passes it to
+   * \ref add_action(). The execution is held weakly, as in \ref bind_action_and_method().
    *
    * @param action [in,out] - An action of type std::function<...>.
    * @param Fn - A plain function.
@@ -343,44 +298,30 @@ class execution {
   }
 
   /**
-   * @brief Checks if this execution has finished.
-   *
-   * @return true - The execution has not finished.
-   * @return false - The execution has finished.
-   */
-  /**
    * @brief Is this execution still working?
    *
-   * False from the moment the worker starts reporting itself finished, which is before `running_`
-   * is cleared - the two answer different questions. This one is for callers, and says whether
-   * there is still work going on; `running_` is the handshake ~execution() waits on, and says
-   * whether the worker is still touching this object. A caller polling this one therefore learns
-   * that a run is over without having to wait for the object to be safe to destroy.
+   * False from the moment the worker starts reporting itself finished, so a caller polling it
+   * learns a run is over without waiting for the object to become safe to destroy.
    *
-   * @remark A callback is not such a caller. on_finished is raised from inside the drain, on
-   * the worker's own thread, and this reads true there - the worker is standing in the callback
-   * with the rest of its path still to go. That a batch drained says nothing about the worker on
-   * either path, and is not meant to.
+   * @remark \ref on_finished is raised from inside the drain and reads this as **true** - the
+   * worker is standing in the callback with the rest of its path still to go.
+   *
+   * @return true - the execution is still working.
    */
   bool is_running() const { return running_.load() && !finishing_.load(); }
 
   /**
    * @brief Is this execution working through its action list?
    *
-   * True while anything is queued, and while an action taken off the queue is still running - the
-   * gap between those two is why this is not simply a test for an empty list. An execution is busy
-   * from the moment an action is added until the last one has returned.
+   * True from the moment an action is added until the last one has returned. Unlike
+   * \ref is_running(), which is about the worker thread, this answers "has it room for more work"
+   * - a worker started by \ref start() is running for its whole life whether busy or idle.
    *
-   * Distinct from is_running(), which is about the worker thread. A continuous worker started by
-   * start() is running for its whole life whether or not it has anything to do, so is_running()
-   * cannot answer "has this one got room for more work"; this can. A one-shot run() is both.
+   * @remark Answers for this execution's own actions, not for those it triggers through
+   * \ref attach().
    *
-   * @remark Answers for this execution's own actions. An execution that is triggering others
-   * through attach() reports on its own list, not on theirs - see item 12.
-   *
-   * @remark A true answer is a fact about the instant it was taken, and the execution may drain the
-   * moment after. A false answer is durable only if the caller is the one adding the actions, which
-   * is the case this is written for: asking whether a worker has room before handing it more.
+   * @remark A false answer is durable only for the caller that is itself adding the actions; a
+   * true one may stop being true the moment after.
    *
    * @return true - actions are queued, or one is running.
    */
@@ -389,6 +330,12 @@ class execution {
     return !action_list_.empty() || executing_action_.load();
   }
 
+  /**
+   * @brief Runs what is queued on a worker of its own, once, and keeps the results.
+   *
+   * The worker is detached: wait for it with \ref is_running() or \ref execution_poll. Actions
+   * queued while it is draining are run by it too. \ref results() is filled by this path only.
+   */
   void run() {
     running_ = true;
     finishing_ = false;
@@ -397,6 +344,12 @@ class execution {
     this_thread_.detach();
   }
 
+  /**
+   * @brief Starts a continuous worker that runs whatever is queued until \ref stop().
+   *
+   * Unlike \ref run(), the worker stays for the life of the execution, so \ref is_running() is
+   * true whether or not there is work; ask \ref is_busy() instead. Results are not collected.
+   */
   void start() {
     running_ = true;
     finishing_ = false;
@@ -434,34 +387,25 @@ class execution {
   }
 
   /**
-   * @brief Queues an action for this execution's worker, and says whether it was taken.
+   * @brief Queues an action, bound to \p args, and says whether it was taken.
    *
-   * The action is bound to \p args here and runs later, on whichever thread drives this execution -
-   * its own worker, or an attacher's. Queueing before run() or start() is normal; the
-   * actions already in the list are what the worker drains first.
+   * It runs later, on whichever thread drives this execution - its own worker, or an attacher's.
+   * Queueing before \ref run() or \ref start() is normal.
    *
-   * @attention An execution that has been stopped refuses. \ref stop() ends its working life, so an
-   * action accepted afterwards would sit in the list looking pending and never run. **The refusal
-   * is the return value**, and a caller that ignores it loses the action silently - a warning on
-   * stderr is what this used to offer instead, and it is no substitute for an answer.
-   *
-   * @remark A refusal is not untangle::invalid_action, and is deliberately not reported as one.
-   * That
-   * exception means a binding whose target has died - the action itself is broken. Here the action
-   * is sound and the execution is simply closed to new work, which is an answer, not a fault.
+   * @attention A stopped execution refuses and drops the action, silently for a caller that
+   * ignores the answer. Nothing is thrown: untangle::invalid_action means a dead binding, while a
+   * refused action is sound and merely too late.
    *
    * @remark A caller arriving through \ref bind_action_and_method() or
-   * \ref bind_action_and_function() does **not** see this. Those lambdas return
-   * `actionT::result_type`, fixed by the specialisation, so there is nowhere to put a bool; they
-   * still swallow the outcome. Telling that caller is unfinished business, and the same question as
-   * what becomes of an action whose body throws.
+   * \ref bind_action_and_function() never sees the answer: those lambdas return
+   * `actionT::result_type`, which has no room for it.
    *
    * @tparam Args - The argument types the action is bound to.
    * @param action - The action to queue.
    * @param args - The arguments to bind to \p action.
    *
-   * @return true - The action was queued and this execution's worker will run it.
-   * @return false - The execution is stopped and the action was dropped.
+   * @return true - queued, and this execution's worker will run it.
+   * @return false - the execution is stopped and the action was dropped.
    */
   template <typename... Args>
   bool add_action(actionT action, Args... args) {
@@ -486,26 +430,20 @@ class execution {
    * @brief Attaches another execution, so that this one triggers it.
    *
    * The attached execution's pending actions are run by this one's worker, and stopping this one
-   * stops that one too.
+   * stops that one too. Actions of different types can be run on one thread this way.
    *
-   * The actuators are given \p other's own actions, so the attachment is a pointer into \p other.
-   * What makes that safe is the record left on the other side: \p other is told which actuators
-   * hold it, and ~execution() takes itself back out of them. The attacher's lifetime token guards
-   * those pointers, so an attached execution outliving its attacher follows nothing.
+   * The attachment is a pointer into \p other; what makes that safe is the record left on the
+   * other side, which ~execution() and \ref detach() use to take it back out.
    *
-   * @param other - A std::shared_ptr owning the execution to trigger. Requiring it here is what
-   * keeps an execution that no std::shared_ptr owns from being attached at all, exactly as
-   * \ref bind_action_and_method() requires one to bind. Attaching the same execution twice adds
-   * it twice; a single \ref detach() still removes it completely, because
-   * untangle::actuator::remove() erases every match.
+   * @param other - A std::shared_ptr owning the execution to trigger; requiring one keeps an
+   * unowned execution from being attached at all. Attaching the same execution twice adds it
+   * twice, and one \ref detach() still removes it completely.
    *
    * @throw invalid_attachment - if \p other is attached already. An execution has at most one
-   * attacher, which is what keeps the attachment graph a forest and the cycle check below a walk
-   * rather than a search.
+   * attacher, which keeps the graph a forest and the cycle check a walk rather than a search.
    *
-   * @throw invalid_attachment - if the attachment would close a cycle, which includes attaching an
-   * execution to itself. Driving a cycle recurses until the stack is gone, so it is refused here,
-   * where the caller still has a stack to be told on.
+   * @throw invalid_attachment - if the attachment would close a cycle, itself included. Driving a
+   * cycle recurses until the stack is gone, so it is refused where the caller can still be told.
    */
   template <typename otherT>
   void attach(const std::shared_ptr<otherT>& other) {
@@ -517,9 +455,8 @@ class execution {
       throw invalid_attachment("attach: that execution is attached already");
     }
 
-    // Refusing an execution that has an attacher already leaves every execution with at most one,
-    // so the graph is a forest and this new edge closes a cycle exactly when other is somewhere up
-    // this execution's own chain of attachers. Walking it is the whole check.
+    // At most one attacher each makes the graph a forest, so a cycle closes exactly when other is
+    // somewhere up this chain. Walking it is the whole check.
     for (auto link = attachment_lifetime_->attacher.lock(); link; link = link->attacher.lock()) {
       if (link == other->attachment_lifetime_) {
         throw invalid_attachment("attach: the attachment would close a cycle");
@@ -548,8 +485,7 @@ class execution {
   /**
    * @brief Detaches an execution previously attached by \ref attach().
    *
-   * Both paths are unwired, the triggering one and the stopping one: an attachment that could only
-   * be half undone would leave this execution still able to stop one it no longer drives.
+   * Both paths are unwired together, the triggering one and the stopping one.
    *
    * @param other - The execution to stop triggering. Detaching one that was never attached is not
    * an error: the caller asked for a state that already holds.
@@ -579,15 +515,11 @@ class execution {
   /**
    * @brief The return values of the actions run by run(), in the order they ran.
    *
-   * Read it from on_finished, which fires once the queue has drained and before the execution
-   * reports itself finished, so the results are complete by the time the callback can see them.
+   * Read it from \ref on_finished, which fires once the queue has drained, so the results are
+   * complete by the time the callback sees them. Returned by value: the worker is appending to it.
    *
-   * Returned by value, under results_mutex_ - the worker appends to the vector as it goes, so
-   * handing out a reference would hand out something being written.
-   *
-   * @remark Only run() fills this. The continuous worker started by start() does not:
-   * it has no point at which a run is over, so there is nothing to hand back and nowhere to clear,
-   * and filling it would grow without bound. Deferred until there is a use case that wants it.
+   * @remark Only \ref run() fills this. A continuous worker has no point at which a run is over,
+   * so \ref start() collects nothing.
    *
    * @return The results of the most recent run, or empty if none has produced any.
    */
@@ -636,12 +568,10 @@ class execution {
   using queued_action_t = std::function<typename actionT::result_type(void)>;
 
   /**
-   * @brief Runs one action, keeping its return value when the action type has one.
+   * @brief Runs one action, keeping its return value when the action type has one and run() asked.
    *
-   * The value is kept only while collecting_results_ is set, which run() does and start() clears.
-   * The worker invokes actions with action_mutex_ released, and takes results_mutex_ only here,
-   * after the action has returned - so an action that calls add_action() never meets this lock
-   * held.
+   * results_mutex_ is taken only here, after the action has returned, so an action that calls
+   * add_action() never meets it held.
    */
   void execute_action(queued_action_t& action) {
     if constexpr (std::is_void_v<typename actionT::result_type>) {
@@ -657,18 +587,13 @@ class execution {
   }
 
   /**
-   * @brief Runs everything queued, and records how much that was in \ref actions_run_.
+   * @brief Runs everything queued, then drives the attached executions.
    *
-   * The count is what tells loop() whether a batch actually drained or whether it just woke on the
-   * 10ms tick with nothing to do - the difference between a notification worth sending and a
-   * hundred a second saying nothing happened. Every action that came off the list is counted,
-   * including one that reported a dead binding.
+   * Counts what it ran in \ref actions_run_, which is how \ref notify_finished() tells a batch
+   * that drained from a worker that woke with nothing to do. Every action that came off the list
+   * counts, including one that reported a dead binding.
    *
-   * It is kept on the object rather than returned because it outlives this call: \ref
-   * notify_finished() reads it afterwards, and does so wherever it happens to be called from.
-   *
-   * @remark The count is of this execution's own actions. Attached executions are driven from here
-   * as well, and each records its own; none of them add to this one.
+   * @remark The count is of this execution's own actions; an attached execution records its own.
    */
   void execute_actions() {
     actions_run_ = 0;
@@ -687,21 +612,13 @@ class execution {
         action = std::move(action_list_.front());
         action_list_.pop_front();
 
-        // Set here, under the lock that emptied the list, so that there is no instant in which the
-        // list reads empty while this action has not yet run. is_busy() takes the same lock, so it
-        // sees the pop and this together or neither.
+        // Under the lock that emptied the list, so is_busy() sees the pop and this together or
+        // neither.
         executing_action_ = true;
       }
 
-      // Nothing may leave this loop. The worker is a detached thread function, so an exception
-      // escaping it calls std::terminate and gives no one anywhere to catch it - and an execution
-      // exists to run code the header did not write, which can throw anything at all.
-      //
-      // Two kinds arrive here. invalid_action is the header's own: a binding whose target has died,
-      // which the actuator drops and so does this. Anything else came out of the action's body and
-      // is the caller's, and the answer is the same - name the execution, drop the action, and go
-      // on to the next one. A worker that died with the first task that threw could not be given
-      // work it did not write.
+      // Nothing may leave this loop: an exception escaping a detached thread function calls
+      // std::terminate.
       try {
         execute_action(action);
       } catch (const invalid_action& ia) {
@@ -721,9 +638,8 @@ class execution {
       // and the queue is what the notification is about.
       ++actions_run_;
 
-      // Whether the list emptied is read under the lock; the notification is raised without it.
-      // on_finished is caller code and may call add_action(), which takes this same mutex - holding
-      // it across the callback would deadlock the worker against itself.
+      // The notification is raised without the lock: on_finished may call add_action(), which
+      // takes it.
       bool drained = false;
       {
         std::lock_guard<std::mutex> lock(action_mutex_);
@@ -743,10 +659,8 @@ class execution {
   }
 
   /**
-   * @brief Tells the caller that the queue this worker was given has drained.
-   *
-   * Reads \ref actions_run_, which the \ref execute_actions() pass just before it filled in.
-   * Nothing is reported for a pass that ran none: an idle worker has not finished anything.
+   * @brief Raises \ref on_finished, unless the pass ran nothing: an idle worker has finished
+   * nothing.
    */
   void notify_finished() {
     if (actions_run_ == 0 || !on_finished) {
@@ -766,8 +680,7 @@ class execution {
   }
 
   void execute() {
-    // The results belong to this run: an execution that is run twice reports the second run's
-    // results, not both runs' appended together.
+    // The results belong to this run, not to this run and the last one.
     {
       std::lock_guard<std::mutex> lock(results_mutex_);
       results_.clear();
@@ -775,14 +688,12 @@ class execution {
 
     execute_actions();
 
-    // After the drain, and after the callback it raised: from here on there is no more work, and a
-    // caller polling is_running() should be told so. `running_` cannot serve instead - ~execution()
-    // waits on it and may free this object the moment it reads false, so it has to stay the last
-    // thing this worker touches.
+    // After the drain and the callback it raised: there is no more work to be told about.
     finishing_ = true;
 
     std::println("execution '{}' finishing thread", name);
 
+    // Must stay last: ~execution() may free this object the moment it reads false.
     running_ = false;
   }
 
@@ -791,8 +702,8 @@ class execution {
       {
         std::unique_lock<std::mutex> lock(action_mutex_);
 
-        // A bounded wait rather than a plain one: an attached execution has its own list and no way
-        // to notify this condition variable, so the worker still has to look in on it periodically.
+        // Bounded: an attached execution has its own list and cannot notify this condition
+        // variable.
         action_cv_.wait_for(lock, std::chrono::milliseconds(10),
                             [this] { return !action_list_.empty() || !started_; });
 
@@ -803,17 +714,10 @@ class execution {
       execute_actions();
     }
 
-    // A last pass over the attachments, not a last batch of this execution's own. The loop above
-    // leaves only when this list is already empty, and add_action() refuses once stopped, so
-    // nothing of ours can be waiting here and this pass reports nothing. What can be waiting is an
-    // attached execution with actions queued: execute_actions() ends by driving them, and each
-    // reports its own batch as it drains.
+    // A last pass for the attachments; this execution's own list is already empty here.
     execute_actions();
 
-    // Set here for the same reason execute() sets it, and in the same place: after the last pass,
-    // because that pass still runs work - the attachments above - and a caller polling is_running()
-    // may only be told the work is over once it is. `running_` cannot serve instead; it is the
-    // handshake ~execution() waits on and has to stay the last thing this worker touches.
+    // After the last pass, because that pass still runs work.
     finishing_ = true;
 
     std::println("execution '{}' thread finished", name);
@@ -832,21 +736,18 @@ class execution {
   std::atomic_bool stopped_ = {false};
 
   // action_list_, started_ and stopped_ are written by every thread that calls add_action() or
-  // stop() and read by the worker; nothing touches them outside this mutex. action_cv_ is what
-  // replaced the
-  // spin in loop() and in stop().
+  // stop() and read by the worker; nothing touches them outside this mutex.
   mutable std::mutex action_mutex_;
   std::condition_variable action_cv_;
 
   std::list<std::function<typename actionT::result_type(void)>> action_list_;
 
   /**
-   * @brief The actuator type used for attachments.
+   * @brief The actuator type used for attachments: the one type here that does not depend on
+   * actionT.
    *
-   * Named because it is the one type here that does not depend on actionT: \ref action_execute and
-   * \ref action_stop are std::function<void(void)> whatever this execution's action type is. That
-   * is what lets \ref attacher_execute_ and \ref attacher_stop_ point at an attacher of any
-   * specialisation.
+   * \ref action_execute and \ref action_stop are std::function<void(void)> whatever actionT is,
+   * which is what lets an attacher of any specialisation be named.
    */
   using void_actuator = actuator<std::function<void(void)>>;
 
@@ -856,30 +757,26 @@ class execution {
   /**
    * @brief This execution's link in the attachment graph, and its liveness token.
    *
-   * Two jobs in one object. `attachment_lifetime_->attacher` is the execution that attached this
-   * one, which \ref attach() walks up to find a cycle and ~execution() reads to know whether it is
-   * still attached to anything. And because it dies with this execution, the std::weak_ptr an
-   * attacher holds to it expires exactly then - an execution cannot take a std::weak_ptr to itself,
-   * since it need not be owned by a std::shared_ptr at all and \ref bind_action_and_method()
-   * deliberately kept it that way.
+   * Two jobs in one object: it names the attacher, which \ref attach() walks up to find a cycle,
+   * and it dies with this execution, so the std::weak_ptr an attacher holds expires exactly then.
+   * An execution cannot take a std::weak_ptr to itself - it need not be owned by a std::shared_ptr
+   * at all.
    *
-   * It also serves as this execution's identity when comparing links, which is why it is never
-   * null: it is created with the execution and never reset.
+   * Never null: it is created with the execution and never reset, and serves as its identity when
+   * links are compared.
    */
   std::shared_ptr<attachment> attachment_lifetime_ = std::make_shared<attachment>();
 
   /**
    * @brief The attacher's own actuators, the ones holding this execution's two actions.
    *
-   * The attacher is *not* held as an execution*: that would mean execution<actionT>*, the same
-   * specialisation as this one, and an execution may be attached by one of any specialisation -
-   * the smoke test attaches an execution<function<void(int)>> to an execution<function<void()>>.
-   * A \ref void_actuator is the same type whatever actionT is, which is what makes these two able
-   * to name an attacher of any kind.
+   * Not held as an execution*, which would mean this specialisation only: an execution may be
+   * attached by one of any specialisation, and a \ref void_actuator is the same type whatever
+   * actionT is.
    *
-   * Raw, and safe only in company: they are followed just once, by ~execution(), and only while
-   * `attachment_lifetime_->attacher` has not expired - which is exactly while the attacher, and
-   * therefore the actuators that are its members, are still there.
+   * @attention Raw, and safe only in company: followed once, by ~execution(), and only while
+   * `attachment_lifetime_->attacher` has not expired - which is exactly while the attacher, and so
+   * these actuators, are still there.
    */
   void_actuator* attacher_execute_ = nullptr;
   void_actuator* attacher_stop_ = nullptr;
@@ -890,28 +787,19 @@ class execution {
 
   /**
    * @brief The return values of the current run, in the order the actions ran.
-   *
-   * A vector rather than the single value this used to be: one value meant each action overwrote
-   * the one before it, so a run of three actions reported one result and lost two. It also has no
-   * uninitialised state to read - the single value had no initialiser, and reading it before any
-   * action had run was undefined behaviour for every scalar result type.
    */
   std::vector<typename resultT::type> results_;
 
   /**
-   * @brief Guards results_, and only that.
-   *
-   * Separate from action_mutex_ on purpose: the queue and the results are two different things, and
-   * the worker holds this one only for the push, after an action has returned.
+   * @brief Guards results_, and only that: the worker holds it for the push and nothing else.
    */
   mutable std::mutex results_mutex_;
 
   /**
-   * @brief Whether the worker keeps what the actions return.
+   * @brief Whether the worker keeps what the actions return. Set by run(), cleared by start().
    *
-   * Set by run() and cleared by start(), rather than inferred from `started_`: which
-   * worker is running is not the same question as whether a run is going to hand anything back, and
-   * reading one as the other would be a trap for whoever changes the other next.
+   * Kept apart from `started_`: which worker is running is a different question from whether a run
+   * hands anything back.
    */
   std::atomic_bool collecting_results_ = {false};
 
@@ -919,36 +807,29 @@ class execution {
    * @brief Set by the worker once it is reporting itself finished, and read only by is_running().
    *
    * It exists because the worker cannot clear `running_` as soon as its work is done - ~execution()
-   * waits on that and may free the object the moment it reads false, so it has to stay the last
-   * thing the worker touches. Splitting the two answers is what lets a caller polling is_running()
-   * learn that the work is over while the object is still guaranteed to be there.
+   * waits on that and may free the object the moment it reads false. Splitting the two lets a
+   * caller learn the work is over while the object is still guaranteed to be there.
    *
-   * @remark It is not what tells on_finished anything. That is raised from inside the drain,
-   * before this is set, and sees is_running() true - see the remark on is_running(). This was the
-   * original reason for the split, and stopped being so on 2026-09-17 when the notification moved
-   * into \ref execute_actions(); the reason above is the one that remains.
+   * @remark Not what tells \ref on_finished anything: that is raised from inside the drain,
+   * before this is set.
    */
   std::atomic_bool finishing_ = {false};
 
   /**
    * @brief Whether an action that has already left the list is still running.
    *
-   * The worker pops an action under action_mutex_ and then runs it with the lock released, because
-   * an action is caller code that may take a while and may itself queue more. That leaves a window
-   * in which the list is empty and the execution is anything but idle, and this is what closes it
-   * for is_busy().
+   * The worker pops under action_mutex_ and runs with the lock released, leaving a window in which
+   * the list is empty and the execution is anything but idle. This is what closes it for
+   * \ref is_busy().
    */
   std::atomic_bool executing_action_ = {false};
 
   /**
    * @brief How many of this execution's own actions the last \ref execute_actions() pass ran.
    *
-   * It outlives that pass on purpose. \ref notify_finished() is its only reader, and keeping the
-   * count on the object rather than handing it along means the notification can be raised from
-   * wherever the pass was driven, without the count having to be carried there.
-   *
-   * Atomic because the pass and the reader need not be on the same thread: an execution driven
-   * through \ref attach() runs on its attacher's worker rather than on one of its own.
+   * On the object rather than returned, so \ref notify_finished() can be raised wherever the pass
+   * was driven. Atomic because that need not be this execution's own worker: one driven through
+   * \ref attach() runs on its attacher's.
    */
   std::atomic_size_t actions_run_ = {0};
 

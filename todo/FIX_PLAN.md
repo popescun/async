@@ -1,16 +1,15 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 26 of 33 steps done — 1 to 21, plus 27, 28, 29, 30 and 31 out of order.
-25 of them are committed, HEAD `e25a26f`. The per-step commits are in the table under **Progress**;
-this line no longer restates them, because that is how it kept drifting.
-**Uncommitted:** step 29, closed by documenting the three connection points rather than making them
-private, plus this plan update. Step 33 was added by the same decision.
+**Status (2026-09-19):** 27 of 33 steps done — 1 to 21, plus 27 to 31 and 33. 26 of them are
+committed, HEAD `622660b`. The per-step commits are in the table under **Progress**; this line no
+longer restates them, because that is how it kept drifting.
+**Uncommitted:** step 33, the doc-comment sweep over `async.hpp`, plus this plan update.
 **Tests:** 35 of 35 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
 and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
 flakes.
-**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with `tools/make_doc.sh`
-at step 29.
+**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 41 pages (was 31), rebuilt with `tools/make_doc.sh`
+at step 33.
 **Source:** audit of 2026-09-10 (4 critical, 5 high, 5 medium, 8 hygiene), findings 1, 2, 3 and 5
 reproduced under TSan/ASan. Items lettered A onwards were found while fixing, and are read from the
 code unless marked otherwise.
@@ -35,7 +34,7 @@ It cost half of step 16's contract: `on_finished` now sees `is_running()` true, 
 and both binaries are ThreadSanitizer-clean, which had never been true before.
 
 **Group 6 is under way**: 20 declined, 21 and 28 landed, 29 closed by documenting rather than by
-changing access. 21 and 28 were meant to settle "what happened to the action I gave you" together,
+changing access, and the sweep it prompted is step 33, done. 21 and 28 were meant to settle "what happened to the action I gave you" together,
 and each answered it only for the direct caller — see the note under NEXT. **Step 32 is all that
 remains of the group**, and step 33 joins group 7.
 
@@ -64,10 +63,11 @@ remains of the group**, and step 33 joins group 7.
 | `f59c19d` | 20 — **declined**; the reasoning recorded instead, plus a guard |
 | `f8472c0` | 21 — `add_action()` returns bool; the bound path stays untold |
 | `b14373e` | 28 — a throwing action is caught in three arms; the worker survives |
-| *(uncommitted)* | 29 — **declined**; the three connection points are documented instead |
+| `622660b` | 29 — **declined**; the three connection points are documented instead |
+| *(uncommitted)* | 33 — the header's doc comments cut to what each entity is and does |
 
-**NEXT: group 7**, steps 22 to 26 and the new 33 — all hygiene, all read-only findings. Step 32 is
-the only investigation left, and nothing blocks it any more.
+**NEXT: group 7**, steps 22 to 26 — all hygiene, all read-only findings; 33 is done. Step 32 is the
+only investigation left, and nothing blocks it any more.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -99,7 +99,7 @@ argument will not compile, and they return a default-constructed result, so an a
 `int`-returning method yields 0. It touches the same lines as steps 21 and 25 — land the three
 together, or accept three passes over the same two lambdas.
 
-**Remaining: 7 steps.** Step 32, and group 7's 22 to 26 and 33; groups 1 to 5 and 8 are closed.
+**Remaining: 6 steps.** Step 32, and group 7's 22 to 26; groups 1 to 5 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -165,7 +165,7 @@ of atomic.
 | 24 | hyg | `other_this = this` is pointless indirection | `:176`, `:449` | read-only |
 | 25 | hyg | `add_action` copies the action and every argument twice | `:295-307` | read-only |
 | 26 | hyg | `result \|= ret` on a bool | `:135` | read-only |
-| 33 | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
+| 33 ✅ | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
 | **Group 8 — build (closed)** |
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 
@@ -1215,25 +1215,39 @@ Bitwise-or on a bool in `execution_poll::is_running()`, where logical-or is mean
 
 > `result = result || ret;`
 
-### Step 33 · hygiene — doc comments carry plan-sized narrative
-`async.hpp` (throughout) · added 2026-09-19, the user's own
+### Step 33 · hygiene — doc comments carry plan-sized narrative — DONE
+`async.hpp` (throughout) · added and done 2026-09-19, the user's own
 
-512 of the header's 958 lines are comment. The volume is not the complaint; the altitude is. Several
-comments explain how a defect was found, what was tried and rejected, and which test pins the
-result — `~execution()` spends 21 lines on why there is no rule of five, `attach()` 25, `add_action()`
-30, `is_busy()` 20. A reader of the API wants what a thing is and what it does. The reasoning is
-already in this plan and in the git history, and saying it twice means it drifts in one of the two.
+512 of the header's 958 lines were comment. The volume was not the complaint; the altitude was.
+Several comments explained how a defect was found, what was tried and rejected, and which test
+pinned the result — `~execution()` spent 21 lines on why there is no rule of five, `attach()` 25,
+`add_action()` 30, `is_busy()` 20. A reader of the API wants what a thing is and what it does; the
+reasoning is here and in the git history, and saying it twice means it drifts in one of the two.
 
-> Trim each comment to what the entity is, what it does, and what a caller must not do. Keep the
-> `@attention` and `@remark` lines that state a **contract** — `on_finished` sees `is_running()`
-> true, `stop()` is final, a false `is_busy()` is durable only for the caller adding the actions.
-> Drop the rest rather than relocating it: it is written here already.
+> Every comment trimmed to what the entity is, what it does, and what a caller must not do. The
+> `@attention` and `@remark` lines that state a **contract** stay: `on_finished` sees
+> `is_running()` true, a refusal is the return value of `add_action()`, a false `is_busy()` is
+> durable only for the caller adding the actions, `running_` is cleared last and the object may be
+> freed the instant it reads false. The implementation comments that explain why the code is
+> *ordered* as it is stay too — they are contracts of another kind.
 
-**Not a rewrite of every comment.** The four longest are the place to start, and the rule is worth
-applying to whatever a later step touches anyway.
+**393 comment lines of 839.** The longest blocks are `add_action()` and `attach()` at 21 and 19
+lines, of which 7 and 6 are `@param`/`@return`/`@throw`; nothing else is over 17. **No implementation comment runs
+more than two lines** — the second pass cut those too, after the first left five of them at three to
+five lines. A `//` comment inside a function says the one thing the code cannot: why an order, a
+lock or a bound is what it is.
 
-**Check:** `tools/make_doc.sh` after, since dropping text can leave a `\ref` unresolved and that
-fails the whole PDF build.
+**Two real defects found while sweeping, not just prose:**
+
+- `is_running()` carried **two** doc comments, stacked. The first was a leftover — "Checks if this
+  execution has finished", with `@return true - The execution has not finished` — contradicting the
+  live one below it. Doxygen takes the last, so the generated docs were right and the header was
+  not.
+- `run()` and `start()`, the two ways to start a worker, had **no documentation at all**. Each now
+  has a brief: `run()` is one-shot and fills `results()`; `start()` is continuous, reports
+  `is_running()` true for its whole life, and collects nothing.
+
+**Verified:** 35/35; `tools/make_doc.sh` 0 warnings, 41 pages; clang-format clean.
 
 ---
 
