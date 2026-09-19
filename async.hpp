@@ -116,7 +116,7 @@ class execution_poll {
 
     auto result = false;
     for (const auto& ret : actuator_is_running_.results) {
-      result |= ret;
+      result = result || ret;
     }
     return result;
   }

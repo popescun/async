@@ -1,9 +1,10 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 31 of 35 steps done — 1 to 25, plus 27 to 31 and 33 out of order. 30 are
-committed, HEAD `d20640f`; step 25 is in the working tree. The per-step commits are in the
-table under **Progress**; this line no longer restates them, because that is how it kept drifting.
-**Tests:** 39 of 39 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
+**Status (2026-09-19):** 32 of 36 steps done — 1 to 26, plus 27 to 31 and 33 out of order. 31 are
+committed, HEAD `5d4a4ee`; step 26 is in the working tree. **Group 7 is complete.** The per-step
+commits are in the table under **Progress**; this line no longer restates them, because that is how
+it kept drifting.
+**Tests:** 40 of 40 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
 clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
 and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
 flakes.
@@ -36,7 +37,8 @@ It cost half of step 16's contract: `on_finished` now sees `is_running()` true, 
 and both binaries are ThreadSanitizer-clean, which had never been true before.
 
 **Group 6 is under way**: 20 declined, 21 and 28 landed, 29 closed by documenting rather than by
-changing access, and the sweep it prompted is step 33, done. 21 and 28 were meant to settle "what happened to the action I gave you" together,
+changing access, and the sweep it prompted is step 33, done. 21 and 28 were meant to settle "what
+happened to the action I gave you" together,
 and each answered it only for the direct caller — see the note under NEXT. **Step 32 is all that
 remains of the group**, and step 33 joins group 7.
 
@@ -70,10 +72,12 @@ remains of the group**, and step 33 joins group 7.
 | `5f09f17` | 22 — five headers the header uses and did not include |
 | `686b7e5` | 23 — both dead forward declarations go |
 | `d20640f` | 24 — the three connection points bind through `this` |
-| *(uncommitted)* | 25 — `add_action()` and both `bind()` lambdas forward |
+| `5d4a4ee` | 25 — `add_action()` and both `bind()` lambdas forward |
+| *(uncommitted)* | 26 — `\|=` on a bool becomes `\|\|`, and the poll's fold gains a test |
 
-**NEXT: step 26**, the last of group 7; 22 to 25 and 33 are done. Then the three that are left are
-all open questions rather than defects: 32, and 34 and 35, both out of step 25's measurements.
+**NEXT: step 36**, the one outright defect left - a flaky case that points at a real race between a
+second `run()` and the first worker's tail. Then step 32, whose single state may be the answer to
+it, and the investigations 34 and 35 out of step 25's measurements.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -106,8 +110,8 @@ default-constructed result, so an async call to an `int`-returning method yields
 argument still will not compile, and never could have here: the queue stores `std::function`, which
 needs a copy-constructible target. See step 25.
 
-**Remaining: 4 steps.** Step 32, group 7's 26, and the new 34 and 35; groups 1 to 5 and 8 are
-closed.
+**Remaining: 4 steps.** Step 32, the investigations 34 and 35, and the flake in 36; groups 1 to 5,
+7 and 8 are closed.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -116,10 +120,10 @@ the ubuntu job could not compile `<print>` at all, so nothing else could be veri
 back to attached executions having their own list and no way to notify the attacher, but redesigning
 that is a feature decision, not a fix. It is called out where it bites and left alone otherwise.
 
-35 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
+36 atomic steps. **One step = one commit = one concern**, and the suite must be green after every
 one. The audit's numbering is preserved so items stay traceable; findings added while fixing are
 lettered. Step 28 was added on 2026-09-14, steps 29 to 31 on 2026-09-15, step 32 on 2026-09-16 and
-steps 33, 34 and 35 on 2026-09-19, after the others.
+steps 33 to 36 on 2026-09-19, after the others.
 The letter D is unused and skipped:
 nothing in this file or in the history ever claimed it, and reusing a letter that may have meant
 something in the original audit would cost more than the gap does.
@@ -172,10 +176,11 @@ of atomic.
 | 23 ✅ | hyg | a forward-declaration block in which both declarations were dead | `:24` | read-only |
 | 24 ✅ | hyg | `other_this_ = this` was pointless indirection | `:188-192` | read-only |
 | 25 ✅ | hyg | `add_action` copied the action and every argument twice | `:394` | CONFIRMED (counted) |
-| 26 | hyg | `result \|= ret` on a bool | `:135` | read-only |
+| 26 ✅ | hyg | `result \|= ret` on a bool | `:135` | read-only |
 | 33 ✅ | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
 | 34 | perf | a bound action is copied once per invocation | `:264`, `:294` | CONFIRMED (counted) |
 | 35 | api | a second entry point for actions the caller gives up | `:394`, `:836` | investigation |
+| 36 | bug | `are_cleared_between_runs` is flaky: a second `run()` races the first worker's tail | `test:1108` | CONFIRMED (repeats) |
 | **Group 8 — build (closed)** |
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 
@@ -1397,12 +1402,55 @@ substitution failure, and `std::move_only_function` does not exist in this libc+
 `shared_ptr`, and steps 14, 15 and 21 all turn on what the queue can report back. Any change to the
 element type should be weighed against all three at once rather than one at a time.
 
-### Step 26 · hygiene — `result |= ret` on a bool
-`async.hpp:135`
+### Step 26 · hygiene — `result |= ret` on a bool — DONE
+`async.hpp:135` · verified by reading the code, 2026-09-19
 
-Bitwise-or on a bool in `execution_poll::is_running()`, where logical-or is meant.
+Bitwise-or on a bool in `execution_poll::is_running()`, where logical-or is meant. **Behaviour was
+never wrong** - `|=` and `||` agree on two bools, and the loop's `ret` is a `std::vector<bool>`
+proxy that converts to one - so no test could fail on this and none does. It is a readability fix,
+and `||` also stops evaluating once the answer is known.
 
 > `result = result || ret;`
+
+**Coverage added while here, because the fold had none.** Nothing in the suite registered more than
+one execution with the poll at a time, so "reports running while any one of them is" - the whole
+point of the class - was never asserted.
+`execution_poll.reports_running_while_one_of_several_executions_is` holds one execution's action
+open, registers an idle one first so the fold starts from `false`, and expects the poll to report
+running, then idle once released. It passes before and after the change, as it must; it is coverage,
+not a reproduction.
+
+**Verified:** 40/40 Debug, 40/40 under AddressSanitizer; `async_smoke_test` exit 0; clang-format
+clean; `tools/make_doc.sh` 0 warnings, 41 pages. ThreadSanitizer is 40/40 too, but see step 36:
+one case there is flaky for reasons that predate this step.
+
+### Step 36 · `are_cleared_between_runs` is flaky — an execution that is run twice
+`test/async_tests.cpp:1108`, `async.hpp:365` (`is_running()`), `:749`, `:763` (`execute()`'s tail) ·
+CONFIRMED by repetition, 2026-09-19 · **open**
+
+`execution_results.are_cleared_between_runs` fails intermittently. Found when a ThreadSanitizer ctest
+run came back 39/40 and the rerun was green; hunted down by repetition rather than left as noise.
+
+**Rate, measured 2026-09-19** with `--gtest_repeat=50` batches under TSan: **21 of 40 batches** in
+the working tree, 13 of 20 at HEAD, so roughly one iteration in a hundred. It reports
+`exec->results()` as `{}`, and once as `{1}` - the *previous* run's result.
+
+**The suspected mechanism, not yet proven**, and it is step 32's ground: `is_running()` is
+`running_ && !finishing_`, and the worker sets `finishing_` **before** clearing `running_`. So a
+caller that waits for `!is_running()` is released while the first worker is still in its tail. It
+calls `run()` again, which sets `running_ = true` and spawns a second worker - and the departing
+first worker then writes `running_ = false` over it. The second wait returns at once, before the new
+worker has run anything, and the results vector is read empty or still holding the old value.
+
+> If that is right, the defect is not in the test: **an execution cannot safely be run again at the
+> moment it says it has finished**, which is precisely what `results()` invites a caller to do.
+> Confirm the mechanism first - a probe that logs the two flags around both runs will settle it -
+> then decide whether the answer is step 32's single state, or `run()` refusing to start while a
+> previous worker is still resident.
+
+**Not caused by the hygiene steps.** The case was green where it was introduced (`f37ee83`, 0 of 20)
+and the rate rises across the notification work; where exactly does not matter, and the bisect was
+stopped on the user's call. Nothing in steps 22 to 26 touches these flags.
 
 ### Step 33 · hygiene — doc comments carry plan-sized narrative — DONE
 `async.hpp` (throughout) · added and done 2026-09-19, the user's own
@@ -1421,8 +1469,8 @@ reasoning is here and in the git history, and saying it twice means it drifts in
 > *ordered* as it is stay too — they are contracts of another kind.
 
 **393 comment lines of 839.** The longest blocks are `add_action()` and `attach()` at 21 and 19
-lines, of which 7 and 6 are `@param`/`@return`/`@throw`; nothing else is over 17. **No implementation comment runs
-more than two lines** — the second pass cut those too, after the first left five of them at three to
+lines, of which 7 and 6 are `@param`/`@return`/`@throw`; nothing else is over 17. **No
+implementation comment runs more than two lines** — the second pass cut those too, after the first left five of them at three to
 five lines. A `//` comment inside a function says the one thing the code cannot: why an order, a
 lock or a bound is what it is.
 

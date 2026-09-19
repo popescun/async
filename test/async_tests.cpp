@@ -568,6 +568,49 @@ TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
 }
 
 /**
+ * @brief The poll reports running while any one of the executions it holds is.
+ *
+ * This is what the poll is for: is_running() invokes every execution it holds and folds the
+ * answers, so one busy execution among idle ones has to come back as running. Nothing else in this
+ * file registers more than one at a time, which left the fold itself untested.
+ */
+TEST(execution_poll, reports_running_while_one_of_several_executions_is) {
+  std::atomic_bool action_started = {false};
+  std::atomic_bool release_action = {false};
+
+  auto hold_until_released = [&action_started, &release_action] {
+    action_started = true;
+    while (!release_action) {
+      std::this_thread::yield();
+    }
+  };
+
+  auto idle = void_execution::create_instance("idle");
+  auto busy = void_execution::create_instance("busy");
+
+  std::function<void(void)> action;
+  void_execution::bind_action_and_function(action, hold_until_released, busy);
+  action();
+
+  // The idle one is added first, so its false answer is the one the fold starts from.
+  untangle::async::execution_poll::get().add(*idle);
+  untangle::async::execution_poll::get().add(*busy);
+
+  busy->run();
+  while (!action_started) {
+    std::this_thread::yield();
+  }
+
+  EXPECT_TRUE(untangle::async::execution_poll::get().is_running())
+      << "the poll reported idle while one of the executions it holds was running";
+
+  release_action = true;
+
+  EXPECT_TRUE(wait_until_poll_idle(5000ms))
+      << "the poll never reported idle after the running execution finished";
+}
+
+/**
  * @brief The poll survives executions registering and withdrawing while another thread waits on it.
  *
  * Every execution adds itself to the poll and withdraws in its destructor, and waiting on the poll
