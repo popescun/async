@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 36 of 37 steps done — 1 to 26, plus 27 to 33 and 36. 33 are committed,
+**Status (2026-09-19):** 36 of 37 steps done, and the last one part-done — 1 to 26, plus 27 to 33 and 36. 33 are committed,
 HEAD `26f91ed`; step 32 is in the working tree. **Groups 1 to 8 are complete**; what remains is two
 investigations.
 The per-step
@@ -79,8 +79,9 @@ remains of the group**, and step 33 joins group 7.
 | `26f91ed` | 36 — `run()` and `start()` wait for a resident worker to leave |
 | *(uncommitted)* | 32 — `finishing_` is gone; `is_running()` is `running_` |
 
-**NEXT: step 35**, the last one open: whether the queue should hold something other than
-`std::function`. Step 34 left two allocations per call that only that can remove.
+**NEXT: nothing is outstanding.** Step 35's B and C are recorded and deliberately not taken: B is
+40 lines of new apparatus for the last allocation per action and for move-only work, C only pays off
+once B exists. Take them when move-only work is wanted.
 
 **Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
 through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
@@ -113,7 +114,9 @@ default-constructed result, so an async call to an `int`-returning method yields
 argument still will not compile, and never could have here: the queue stores `std::function`, which
 needs a copy-constructible target. See step 25.
 
-**Remaining: 1 step**, and not a defect: the investigation 35. Every group is closed.
+**Remaining: step 35's B and C**, neither a defect: a move-only holder for the queue's element, and
+the public entry point that only becomes useful with it. Every group is closed and nothing else is
+open.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -181,7 +184,7 @@ of atomic.
 | 26 ✅ | hyg | `result \|= ret` on a bool | `:135` | read-only |
 | 33 ✅ | hyg | doc comments carry plan-sized narrative | `async.hpp` (throughout) | read-only |
 | 34 ✅ | perf | a bound action was copied once per invocation | `:573`, `:262`, `:296` | CONFIRMED (counted) |
-| 35 | api | a second entry point for actions the caller gives up | `:394`, `:836` | investigation |
+| 35 | api | what the queue holds: A done, B and C open | `:778`, `:573` | investigation |
 | 36 ✅ | bug | two workers in one execution, and one handshake between them | `:341`, `:359` | CONFIRMED (ASan) |
 | 37 ✅ | hyg | test comments carry plan-sized narrative | `test/async_tests.cpp` | read-only |
 | **Group 8 — build (closed)** |
@@ -1404,35 +1407,75 @@ overflows the 24-byte small buffer. Both need the queue's container or element t
 ThreadSanitizer; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean;
 `tools/make_doc.sh` 0 warnings, 43 pages.
 
-### Step 35 · a second entry point for actions the caller gives up
-`async.hpp:394` (`add_action`), `:836` (the queue) · **investigation, not a defect**
+### Step 35 · what the queue holds — A DONE, B and C recorded
+`async.hpp:778` (the action queue), `:573` (`add_queued_action()`) · investigation, prototyped
+2026-09-19
 
-Raised by the user on 2026-09-19, out of step 25: should `add_action()` become private, used only by
-the two `bind()` statics, with a separate public entry point - an overload, or an
-`add_movable_action()` - for lambdas and movable actions?
+Raised by the user on 2026-09-19 out of step 25: should `add_action()` become private, with a
+separate public entry point for lambdas and movable actions? Step 25 answered the first half - the
+by-value parameter already makes `add_action()` a sink, so `std::move()`, a temporary and a lambda
+all reach the queue with **zero** copies, and a second overload could not improve on that. What was
+left is the real question: **what the queue holds**.
 
-**What is already true, measured in step 25.** `add_action(actionT action, ...)` takes the action by
-value, which makes it a sink: `std::move(action)`, a temporary and a lambda all reach the queue with
-**zero** copies, and only an lvalue the caller keeps costs one. So a second entry point cannot
-improve the copyable case, and an `actionT&&` overload beside a by-value parameter would be
-ambiguous for every rvalue call. Making the current one private would also take away the lvalue
-case, which 30 call sites in `async_tests.cpp`, the smoke test and the README all use.
+**Prototyped outside the header**, 200k queue-and-drain operations at `-O2` with a counting
+`operator new`, four combinations of element type and container:
 
-**What a second entry point could add, and what it would cost.** The one thing out of reach today is
-a **move-only** action - a lambda capturing a `unique_ptr`, say. That is blocked twice over, and not
-by the parameter: the caller cannot even form `actionT`, because `actionT` is a `std::function`; and
-the queue element is `std::function<result_type(void)>`, which needs a copy-constructible target.
-Probed 2026-09-19: storing a move-only callable is a hard error inside libc++'s `__clone`, not a
-substitution failure, and `std::move_only_function` does not exist in this libc++ (Apple clang 21).
+| queue element / container | allocations/op | queue | drain |
+|---|---|---|---|
+| `std::function` in `std::list` - before | 2.00 | 16 ns | 26 ns |
+| `std::function` in `std::deque` | 1.01 | 11 ns | 17 ns |
+| a move-only holder in `std::list` | 1.00 | 8 ns | 10 ns |
+| a move-only holder in `std::deque` | **0.01** | **5 ns** | **5 ns** |
 
-> So the question is not really about `add_action()`'s signature. It is whether the queue should
-> hold something other than `std::function` - `std::move_only_function` when the toolchain has it,
-> or a small hand-rolled holder - and whether move-only work is wanted at all. Decide that first;
-> the entry point follows from it.
+Two allocations per queued action, and they come off independently.
 
-**Related:** step 34 wants the same queue to hold a callable that owns its action through a
-`shared_ptr`, and steps 14, 15 and 21 all turn on what the queue can report back. Any change to the
-element type should be weighed against all three at once rather than one at a time.
+#### A - `std::list` becomes `std::deque` — DONE
+
+The list was used for exactly four things: `empty()`, `push_back()`, `front()`, `pop_front()`. All
+four are `std::deque`'s as well, so this is a one-line change with no interface and no semantic
+difference, and `<list>` came off the includes with it. The member is `action_queue_` now, at the
+user's call - it had been `action_list_` after the container it no longer is.
+
+**Measured on the header**, 1000 calls through a binding: **1.01 allocations per call, down from
+2.00** - the node allocation is amortised across a deque block. Queue-and-drain of 200k calls,
+medians of nine runs: 56 ns per action against 58 ns, which is within the noise; the win here is
+allocation count rather than time, and it compounds with B.
+
+**Verified:** 42/42 Debug with a 30x repeat; 42/42 under AddressSanitizer and under
+ThreadSanitizer; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean;
+`tools/make_doc.sh` 0 warnings, 43 pages.
+
+#### B - a move-only holder in place of `std::function` — **open, recorded 2026-09-19**
+
+About 40 lines: an inline buffer, a call pointer, a destroy pointer. It removes the remaining
+allocation - the queued callable's target, where a 16-byte `std::shared_ptr` plus the bound
+arguments plus libc++'s vptr overflows the 24-byte small buffer - and it is the only thing that
+makes **move-only work storable at all**: `std::function` requires a copy-constructible target, and
+`std::move_only_function` does not exist in this libc++ (Apple clang 21), re-checked 2026-09-19.
+
+> Two caveats from the prototype, both real. Its move constructor used `memcpy`, which is valid only
+> for trivially relocatable callables - a real holder needs a move function pointer, so the 5 ns
+> above would rise. And it is 40 bytes against `std::function`'s 32: fewer allocations, larger
+> elements, which a deque absorbs better than a list did.
+
+**The case against is not performance but apparatus.** This header has so far preferred to have
+none, and B is a type of its own to maintain. Land it only if move-only work is wanted, or if the
+last allocation per action is worth 40 lines.
+
+#### C - `add_queued_action()` becomes public — **open, recorded 2026-09-19**
+
+Step 34 already built the seam. Making it public is the second entry point this step started from:
+a caller who has bound their own work hands over a ready-made nullary callable and pays no copy,
+while `add_action()` stays exactly as it is for callers who want the library to bind for them.
+
+**Only interesting with B.** Without it the public path already costs nothing for an action the
+caller gives up, and the entry point would buy only the `std::bind` call. With B it becomes the way
+move-only work is queued.
+
+**No test can fail for any of the three.** A is invisible from outside; C adds a name; and a case
+that queues a move-only lambda does not fail today, it fails to **compile**, which would take the
+suite with it. When B lands, its test is a new case that only compiles once the element type allows
+it.
 
 ### Step 26 · hygiene — `result |= ret` on a bool — DONE
 `async.hpp:135` · verified by reading the code, 2026-09-19

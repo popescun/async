@@ -243,7 +243,7 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
  * @brief An action queued after stop() never runs.
  *
  * stop() ends the execution's working life: the worker drains what was queued before it and leaves,
- * so anything offered afterwards is dropped rather than left in the list looking pending.
+ * so anything offered afterwards is dropped rather than left in the queue looking pending.
  */
 TEST(execution_queue, refuses_an_action_queued_after_the_worker_stops) {
   auto s = std::make_shared<sink>();
@@ -672,8 +672,8 @@ TEST(execution_binding, calling_a_binding_does_not_copy_the_action) {
  * @brief An attacher does not reach into an attached execution that has been destroyed.
  *
  * attach() hands the attacher's actuator a pointer into the attached object, so a destroyed
- * attachment has to drop out of its attacher and leave the rest of the list working. The dead entry
- * is attached first, so the survivor behind it can only run if the dead one is stepped over.
+ * attachment has to drop out of its attacher and leave the other attachments working. The dead
+ * entry is attached first, so the survivor behind it can only run if the dead one is stepped over.
  *
  * @remark Driven through action_execute() on this thread rather than by a worker, so that a
  * dangling read is attributed to this line by the sanitizer instead of crashing a worker thread.
@@ -786,7 +786,8 @@ TEST(execution_attach, detach_unwires_the_stop_path_as_well) {
  * @brief Detaching an execution that was never attached is answered, not an error.
  *
  * The caller gets false rather than an exception: the state asked for already holds. A guard on the
- * boundary an implementation is most likely to get wrong once detach() erases from a list.
+ * boundary an implementation is most likely to get wrong once detach() erases from the actuator's
+ * list.
  */
 TEST(execution_attach, detaching_an_execution_that_was_never_attached_reports_false) {
   auto attacher = void_execution::create_instance("attacher");
@@ -1160,7 +1161,7 @@ TEST(execution_busy, a_queued_action_makes_an_execution_busy) {
  * @brief An execution is busy while an action is running, not only while one is queued.
  *
  * The worker pops an action under the lock and runs it with the lock released, so between those two
- * the list is empty and the execution is anything but idle. The action is held open until the
+ * the queue is empty and the execution is anything but idle. The action is held open until the
  * reading has been taken, so it cannot race the action finishing early.
  */
 TEST(execution_busy, an_execution_is_busy_while_its_last_action_runs) {
@@ -1181,7 +1182,7 @@ TEST(execution_busy, an_execution_is_busy_while_its_last_action_runs) {
   ASSERT_TRUE(wait_for([&action_started] { return action_started.load(); }, 2000ms))
       << "the action never started";
 
-  // The list is empty by now - the worker took the only action off it - and the action is still
+  // The queue is empty by now - the worker took the only action off it - and the action is still
   // running, which is exactly the window under test.
   EXPECT_TRUE(exec->is_busy()) << "an execution running its last action reported itself idle";
 

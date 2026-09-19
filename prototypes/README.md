@@ -58,8 +58,8 @@ With one or two executions this is a latent nuisance. With a pool it is guarante
 ### Gap 3 — an execution could not say whether it was free *(closed: `is_busy()`)*
 
 There was no way to ask. `is_running()` reports the *worker thread*, which in continuous mode is
-true from `start()` until after `stop()` whether or not there is anything to do, and `action_list`
-is private. So the first version of this pool kept a `busy` flag per worker and a `busy_count_`,
+true from `start()` until after `stop()` whether or not there is anything to do, and the action
+queue is private. So the first version of this pool kept a `busy` flag per worker and a `busy_count_`,
 booked at dispatch and cleared in the callback — the pool's belief about its workers rather than
 anything read back from them.
 
@@ -68,9 +68,9 @@ pool asks, and the answer cannot drift from the truth.
 
 It is not simply a test for an empty list, which is what makes it worth having in the header rather
 than approximated here. The worker pops an action under `action_mutex` and runs it with the lock
-released, so there is a window in which the list is empty and the execution is anything but idle. A
+released, so there is a window in which the queue is empty and the execution is anything but idle. A
 list-only check reports such a worker free and invites the pool to pile more on it. `is_busy()`
-covers the window with `executing_action`, set under the same lock that empties the list.
+covers the window with `executing_action`, set under the same lock that empties the queue.
 
 `on_finished` firing per drained batch — step 16 — is still what tells the pool *the moment* a
 worker frees up, so nothing has to poll.

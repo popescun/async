@@ -4,7 +4,7 @@
 
 *c++ mechanism to run queued callables in an asynchronous fashion*
 
-The interface consists of one header file that exposes a generic execution class. It is a wrapper of a list of callables that are invoked on other thread. The callables are pumped into the list by invoking an action from the caller thread.
+The interface consists of one header file that exposes a generic execution class. It is a wrapper of a queue of callables that are invoked on other thread. The callables are pumped into the queue by invoking an action from the caller thread.
 
 The implementation is using the [actuator](https://github.com/popescun/actuator) callable, and therefore it exemplifies how a generic callable may 
 improve the code structure, by easily creating `interfaces` inside a class instead of using external ones.
@@ -41,7 +41,7 @@ int main()
   // create async binding between the action and f; the execution is passed as a shared pointer,
   // which the binding holds weakly - that is what lets the action outlive it safely
   void_execution::bind_action_and_function(action, f, execution);
-  // whenever the action is invoked, a new callable wrapping f will be added to the execution's action list
+  // whenever the action is invoked, a new callable wrapping f will be added to the execution's action queue
   action();
   // run the execution
   execution->run();
@@ -84,7 +84,7 @@ int main()
   auto execution = int_execution::create_instance("oneoff_method");
   // note both the bound object and the execution must be shared pointers
   int_execution::bind_action_and_method(a->action, a, &A::f, execution);
-  // whenever the action is invoked, a new callable wrapping f will be added to the execution's action list
+  // whenever the action is invoked, a new callable wrapping f will be added to the execution's action queue
   a->action(10);
   // run the execution
   execution->run();
