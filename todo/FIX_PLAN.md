@@ -1,20 +1,17 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19):** 36 of 37 steps done, and the last one part-done — 1 to 26, plus 27 to 33 and 36. 33 are committed,
-HEAD `26f91ed`; step 32 is in the working tree. **Groups 1 to 8 are complete**; what remains is two
-investigations.
-The per-step
-commits are in the table under **Progress**; this line no longer restates them, because that is how
-it kept drifting.
-**Tests:** 42 of 42 green — `ctest --test-dir test/build`, run 2026-09-19 (baseline was 2/5);
-clang-format clean. Sanitizers were last measured at step 28 (`b14373e`): ThreadSanitizer 0 warnings
-and AddressSanitizer 0 errors on both binaries, `async_smoke_test` exit 0, 30x repeat with no
-flakes.
-**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with `tools/make_doc.sh`
-at step 23. **The PDF embeds the header's own source listing** - there is no separate file page - so
-the page count tracks `async.hpp`'s length, and a few lines either way can move it by a page or two
-at a boundary. Measured 2026-09-19: the five includes of step 22 are worth two pages, and so is the
-six-line forward-declaration block. Do not read a page count as a content change.
+**Status (2026-09-19) — concluded for now.** 36 of 37 steps done, and the last one part-done:
+1 to 34 landed or declined with the reasoning recorded, 35 part-done (A landed; B and C measured and
+deferred), 36 and 37 landed. **Everything is committed**, HEAD `a5f2579`, working tree clean. The
+per-step commits are in the table under **Progress**; this line no longer restates them, because
+that is how it kept drifting.
+**Tests:** 42 of 42 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
+step 35 on 2026-09-19; 30x repeat with no failures; `async_smoke_test` exit 0 on all three, 0 TSan
+warnings; clang-format clean.
+**Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
+`tools/make_doc.sh`. **The PDF embeds the header's own source listing** - there is no separate file
+page - so the page count tracks `async.hpp`'s length, and a few lines either way can move it by a
+page or two at a boundary. Do not read a page count as a content change.
 **Source:** audit of 2026-09-10 (4 critical, 5 high, 5 medium, 8 hygiene), findings 1, 2, 3 and 5
 reproduced under TSan/ASan. Items lettered A onwards were found while fixing, and are read from the
 code unless marked otherwise.
@@ -117,6 +114,15 @@ needs a copy-constructible target. See step 25.
 **Remaining: step 35's B and C**, neither a defect: a move-only holder for the queue's element, and
 the public entry point that only becomes useful with it. Every group is closed and nothing else is
 open.
+
+**The plan is concluded for now, 2026-09-19.** Every audit finding and every item found while fixing
+has landed, been declined with the reasoning recorded, or - for B and C - been measured, written up
+and deliberately deferred. What the header looks like at the end: the queue is guarded and drains
+through one path; nothing holds a raw pointer into an object that can die without learning of it;
+a worker is one per execution, `running_` says so and is the only flag that does; an action that
+throws or is refused is answered rather than dropped silently; and a call through a binding costs
+one allocation instead of three. The suite is 42 cases, green in Debug, under AddressSanitizer and
+under ThreadSanitizer.
 
 **Out of order:** step 27 was taken early, ahead of steps 14-26, because a CI run failed on it —
 the ubuntu job could not compile `<print>` at all, so nothing else could be verified there.
@@ -1139,7 +1145,8 @@ unwires silently.
 - The seam survey the access change would have needed. `attach()`/`detach()` need nothing
   (`template <typename otherActionT> friend class execution;` at `:184`); `execution_poll::add()`
   and `remove()` take `&async_exec.action_is_running` and are not friends; `async_tests.cpp` drives
-  `action_execute()` at **five** sites — `does_not_reach_an_attached_execution_that_has_been_destroyed`,
+  `action_execute()` at **five** sites —
+  `does_not_reach_an_attached_execution_that_has_been_destroyed`,
   `detach_stops_an_attached_execution_from_being_triggered`, `detach_unwires_the_stop_path_as_well`,
   `allows_a_chain_of_attached_executions` and `refuses_a_cycle_that_closes_through_a_third_execution`
   — as the only way to drain on the calling thread with no worker to wait on. Four of those five
@@ -1453,6 +1460,24 @@ arguments plus libc++'s vptr overflows the 24-byte small buffer - and it is the 
 makes **move-only work storable at all**: `std::function` requires a copy-constructible target, and
 `std::move_only_function` does not exist in this libc++ (Apple clang 21), re-checked 2026-09-19.
 
+**What A left, and what B would take.** The first two rows are measured on the header itself, 1000
+calls through a binding at `-O1` and 200k queue-and-drain at `-O2` (medians of nine runs). The third
+is a projection, not a measurement - see below:
+
+| | allocations per queued action | queue + drain |
+|---|---|---|
+| before step 34 | 3.00 | 75 ns |
+| after step 34 (action shared) | 2.00 | 58 ns |
+| **after A (deque)** - where the header is now | **1.01** | **56 ns** |
+| after B (move-only holder) - projected | ~0.01 | ~35-40 ns |
+
+The projection comes from the prototype's own two rows, which isolate the element type with the
+container held at `deque`: `std::function` 28 ns per operation against the holder's 10 ns. The
+header's 56 ns is that same work plus a mutex, a condition-variable notify and the results check, so
+B can only take the element's share of it - call it 18 ns of the 56, and less once the holder carries
+a real move function pointer instead of the prototype's `memcpy`. **Anyone taking B should re-measure
+rather than trust this row.**
+
 > Two caveats from the prototype, both real. Its move constructor used `memcpy`, which is valid only
 > for trivially relocatable callables - a real holder needs a move function pointer, so the 5 ns
 > above would rise. And it is 40 bytes against `std::function`'s 32: fewer allocations, larger
@@ -1549,7 +1574,8 @@ a state rather than a flag shared by two meanings, and `run()`'s wait becomes a 
 does not block that; it closes the use-after-free in the meantime.
 
 **Verified:** 41/41 Debug, 30x repeat with no failures; 41/41 under AddressSanitizer and under
-ThreadSanitizer, 10x repeat each with no failures; `async_smoke_test` exit 0 on all three, 0 TSan warnings; the original flake
+ThreadSanitizer, 10x repeat each with no failures; `async_smoke_test` exit 0 on all three, 0 TSan
+warnings; the original flake
 **0 of 40 batches** of 50 TSan repeats, where it was 21 of 40; clang-format clean;
 `tools/make_doc.sh` 0 warnings.
 
@@ -1598,8 +1624,9 @@ reasoning is here and in the git history, and saying it twice means it drifts in
 
 **393 comment lines of 839.** The longest blocks are `add_action()` and `attach()` at 21 and 19
 lines, of which 7 and 6 are `@param`/`@return`/`@throw`; nothing else is over 17. **No
-implementation comment runs more than two lines** — the second pass cut those too, after the first left five of them at three to
-five lines. A `//` comment inside a function says the one thing the code cannot: why an order, a
+implementation comment runs more than two lines** — the second pass cut those too, after the first
+left five of them at three to five lines. A `//` comment inside a function says the one thing the
+code cannot: why an order, a
 lock or a bound is what it is.
 
 **Two real defects found while sweeping, not just prose:**
