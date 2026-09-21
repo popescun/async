@@ -544,6 +544,120 @@ TEST(execution_poll, reports_running_while_one_of_several_executions_is) {
 }
 
 /**
+ * @brief A poll of one's own answers for what was added to it, and for nothing else.
+ *
+ * The case execution_poll was made instantiable for: an owner of a set of workers - a thread pool -
+ * wants to wait for its own and not for whatever else the process happens to be running. Two polls
+ * are constructed here and only one is given the running execution.
+ *
+ * @remark The second poll never has anything added to it, so its is_running() also covers a poll
+ * that was never connected to anything - which before this was a state no caller could reach.
+ */
+TEST(execution_poll, an_instance_answers_only_for_what_was_added_to_it) {
+  std::atomic_bool action_started = {false};
+  std::atomic_bool release_action = {false};
+
+  auto hold_until_released = [&action_started, &release_action] {
+    action_started = true;
+    while (!release_action) {
+      std::this_thread::yield();
+    }
+  };
+
+  auto busy = void_execution::create_instance("owned_by_one_poll");
+  std::function<void(void)> action;
+  void_execution::bind_action_and_function(action, hold_until_released, busy);
+  action();
+
+  untangle::async::execution_poll holding;
+  untangle::async::execution_poll empty;
+  holding.add(*busy);
+
+  busy->run();
+  while (!action_started) {
+    std::this_thread::yield();
+  }
+
+  EXPECT_TRUE(holding.is_running())
+      << "a poll reported idle while the execution it holds was running";
+  EXPECT_FALSE(empty.is_running()) << "a poll reported an execution that was never added to it";
+
+  release_action = true;
+
+  EXPECT_TRUE(wait_for([&holding] { return !holding.is_running(); }, 5000ms))
+      << "the poll never reported idle after the execution it holds finished";
+}
+
+/**
+ * @brief An execution takes itself out of every poll holding it, not just the process-wide one.
+ *
+ * add() stores the address of the execution's action_is_running, so a poll still holding one after
+ * the execution has died calls into freed memory - the defect step 4 closed for the singleton. An
+ * instantiable poll means an execution can be in several at once, and withdrawing from get() alone
+ * would leave the others dangling.
+ *
+ * @attention The failure here is a crash or a wrong answer rather than a failed expectation, and
+ * -fsanitize=address is what names it. The expectations below are what a poll with nothing left in
+ * it should say.
+ */
+TEST(execution_poll, an_execution_withdraws_from_every_poll_holding_it) {
+  untangle::async::execution_poll first;
+  untangle::async::execution_poll second;
+
+  {
+    auto exec = void_execution::create_instance("in_two_polls");
+    first.add(*exec);
+    second.add(*exec);
+    untangle::async::execution_poll::get().add(*exec);
+  }
+
+  EXPECT_FALSE(first.is_running()) << "the first poll still holds a destroyed execution";
+  EXPECT_FALSE(second.is_running()) << "the second poll still holds a destroyed execution";
+  EXPECT_FALSE(untangle::async::execution_poll::get().is_running())
+      << "the process-wide poll still holds a destroyed execution";
+}
+
+/**
+ * @brief remove() withdraws from one poll and leaves the others holding the execution.
+ */
+TEST(execution_poll, remove_withdraws_from_only_the_poll_it_was_called_on) {
+  std::atomic_bool action_started = {false};
+  std::atomic_bool release_action = {false};
+
+  auto hold_until_released = [&action_started, &release_action] {
+    action_started = true;
+    while (!release_action) {
+      std::this_thread::yield();
+    }
+  };
+
+  auto busy = void_execution::create_instance("removed_from_one");
+  std::function<void(void)> action;
+  void_execution::bind_action_and_function(action, hold_until_released, busy);
+  action();
+
+  untangle::async::execution_poll kept;
+  untangle::async::execution_poll dropped;
+  kept.add(*busy);
+  dropped.add(*busy);
+
+  busy->run();
+  while (!action_started) {
+    std::this_thread::yield();
+  }
+
+  dropped.remove(*busy);
+
+  EXPECT_TRUE(kept.is_running()) << "removing from one poll withdrew the execution from another";
+  EXPECT_FALSE(dropped.is_running()) << "the execution was still reported after it was removed";
+
+  release_action = true;
+
+  EXPECT_TRUE(wait_for([&kept] { return !kept.is_running(); }, 5000ms))
+      << "the poll never reported idle after the execution it holds finished";
+}
+
+/**
  * @brief The poll survives executions registering and withdrawing while another thread walks it.
  *
  * Two hundred executions register and are destroyed while a second thread polls without stopping.

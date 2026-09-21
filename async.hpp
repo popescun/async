@@ -67,13 +67,45 @@ struct attachment {
 };
 
 /**
- * @brief Single-tone poll that reports whether any \ref execution added to it is still running.
+ * @brief Poll that reports whether any \ref execution added to it is still running.
  *
  * @remark An execution runs in a detached thread and cannot be joined, so checking the "running"
  * state is the only way to wait for one. This checks any number of them at once.
+ *
+ * @remark **Instantiable, and \ref get() is one instance rather than the only one.** A caller that
+ * owns a set of workers - a thread pool is the case this was written for - wants to wait for its
+ * own and not for whatever else the process is running, and that is a poll of its own. The
+ * singleton stays for callers with nothing to separate themselves from.
  */
 class execution_poll {
  public:
+  /**
+   * @brief Constructs an empty poll. \ref add() is what puts anything in it.
+   */
+  execution_poll() = default;
+
+  /**
+   * @brief Destroys the poll, releasing every execution still in it.
+   *
+   * @remark The record runs both ways, and it has to: each side holds a pointer into the other, so
+   * whichever dies first takes itself out of the other. ~execution() withdraws from every poll
+   * holding it; this tells every execution it holds that this poll is gone. Neither order leaves a
+   * dangling pointer, which is what lets a poll be a local rather than only a singleton.
+   */
+  ~execution_poll() {
+    std::vector<registration> held;
+
+    {
+      std::lock_guard<std::mutex> lock(actuator_mutex_);
+      held.swap(registrations_);
+    }
+
+    // Outside the lock: each of these takes the execution's own, and ~execution() takes them in
+    // the opposite order. Releasing this one first is what keeps the two from meeting in a cycle.
+    for (auto& one : held) {
+      one.forget();
+    }
+  }
   /**
    * @brief Adds an \ref execution object to the poll
    *
@@ -81,13 +113,23 @@ class execution_poll {
    */
   template <typename asyncexecT>
   void add(asyncexecT& async_exec) {
-    std::lock_guard<std::mutex> lock(actuator_mutex_);
+    {
+      std::lock_guard<std::mutex> lock(actuator_mutex_);
 
-    if (!actuator_is_running_.is_connected()) {
-      actuator_is_running_ = untangle::connect(async_exec.action_is_running);
-    } else {
-      actuator_is_running_.add(&async_exec.action_is_running);
+      if (!actuator_is_running_.is_connected()) {
+        actuator_is_running_ = untangle::connect(async_exec.action_is_running);
+      } else {
+        actuator_is_running_.add(&async_exec.action_is_running);
+      }
+
+      registrations_.emplace_back(&async_exec.action_is_running,
+                                  [this, &async_exec] { async_exec.forget_poll(*this); });
     }
+
+    // Outside the lock, and deliberately: this takes the execution's own. The execution has to
+    // know which polls hold a pointer into it, because ~execution() is what takes it back out and
+    // there is now more than one poll it could be in.
+    async_exec.remember_poll(*this);
   }
 
   /**
@@ -100,9 +142,24 @@ class execution_poll {
    */
   template <typename asyncexecT>
   void remove(asyncexecT& async_exec) {
+    withdraw(&async_exec.action_is_running);
+    async_exec.forget_poll(*this);
+  }
+
+  /**
+   * @brief Takes one action pointer out, without touching the execution it came from.
+   *
+   * What ~execution() calls for each poll holding it: by then the object is being destroyed and
+   * must not be called back into, so the two halves of \ref remove() are separated here.
+   *
+   * @param action - The address \ref add() stored.
+   */
+  void withdraw(const std::function<bool(void)>* action) {
     std::lock_guard<std::mutex> lock(actuator_mutex_);
 
-    actuator_is_running_.remove(&async_exec.action_is_running);
+    actuator_is_running_.remove(action);
+    std::erase_if(registrations_,
+                  [action](const registration& one) { return one.action == action; });
   }
 
   /**
@@ -122,9 +179,13 @@ class execution_poll {
   }
 
   /**
-   * @brief Gets the single-tone instance.
+   * @brief Gets the process-wide instance.
    *
-   * @return execution_poll An \ref execution_poll instance.
+   * @remark One poll among however many are constructed, not the only one there can be. It answers
+   * for every execution added to *it*; an owner that wants an answer about its own workers alone
+   * constructs a poll and adds them to that.
+   *
+   * @return execution_poll The process-wide \ref execution_poll instance.
    */
   static execution_poll& get() {
     static execution_poll instance;
@@ -132,9 +193,17 @@ class execution_poll {
   }
 
  private:
-  execution_poll() = default;
-  ~execution_poll() = default;
+  /**
+   * @brief One execution's presence in this poll: what the actuator holds, and how to tell the
+   * execution that this poll is gone.
+   */
+  struct registration {
+    const std::function<bool(void)>* action;
+    std::function<void()> forget;
+  };
+
   actuator<std::function<bool(void)>> actuator_is_running_;
+  std::vector<registration> registrations_;
   mutable std::mutex actuator_mutex_;
 };
 
@@ -157,6 +226,9 @@ class execution {
   // attach() and detach() reach into its attachment_lifetime_.
   template <typename otherActionT>
   friend class execution;
+
+  // add() and remove() keep the record this object holds of the polls that hold it.
+  friend class execution_poll;
 
  public:
   /**
@@ -226,8 +298,23 @@ class execution {
     }
 
     // time of use: this object is freed once the destructor returns, so the check above is only
-    // safe because running_ is the last thing the worker touches
-    execution_poll::get().remove(*this);
+    // safe because running_ is the last thing the worker touches.
+    //
+    // Out of every poll that holds a pointer into this object. Withdrawing from the singleton
+    // alone was enough while it was the only poll there could be; now that a caller may own one,
+    // an execution can be in several, and an address left in any of them outlives the object.
+    // Taken by swap so nothing else can be added to the record while this walks it, and withdrawn
+    // rather than removed because remove() would call back into an object that is going away.
+    std::vector<execution_poll*> holding_polls;
+
+    {
+      std::lock_guard<std::mutex> lock(polls_mutex_);
+      holding_polls.swap(polls_);
+    }
+
+    for (auto* poll : holding_polls) {
+      poll->withdraw(&action_is_running);
+    }
   }
 
   /**
@@ -566,6 +653,25 @@ class execution {
   using queued_action_t = std::function<typename actionT::result_type(void)>;
 
   /**
+   * @brief Records a poll that now holds this execution's \ref action_is_running. Called by
+   * execution_poll::add().
+   */
+  void remember_poll(execution_poll& poll) {
+    std::lock_guard<std::mutex> lock(polls_mutex_);
+
+    polls_.push_back(&poll);
+  }
+
+  /**
+   * @brief Drops that record. Called by execution_poll::remove().
+   */
+  void forget_poll(execution_poll& poll) {
+    std::lock_guard<std::mutex> lock(polls_mutex_);
+
+    std::erase(polls_, &poll);
+  }
+
+  /**
    * @brief Queues a callable already bound to its arguments, and says whether it was taken.
    *
    * What \ref add_action() does once it has bound one, and what a binding queues directly: a
@@ -845,6 +951,10 @@ class execution {
    * \ref is_busy().
    */
   std::atomic_bool executing_action_ = {false};
+
+  //! The polls holding this execution's address, so ~execution() can take it out of each of them.
+  std::vector<execution_poll*> polls_;
+  mutable std::mutex polls_mutex_;
 
   /**
    * @brief How many of this execution's own actions the last \ref execute_actions() pass ran.
