@@ -59,7 +59,7 @@ struct sink {
 };
 
 /**
- * @brief Waits for the polled executions to finish, the way async_smoke_test.cpp does.
+ * @brief Waits for the executions added to \p poll to finish, the way async_smoke_test.cpp does.
  *
  * A detached worker goes on reading its execution, so returning from a case while one is still
  * running would replace a reported failure with a use-after-free. An execution is not joinable, so
@@ -67,10 +67,10 @@ struct sink {
  *
  * @return true - the poll reported idle before the limit elapsed.
  */
-bool wait_until_poll_idle(std::chrono::milliseconds limit) {
+bool wait_until_poll_idle(untangle::async::execution_poll& poll, std::chrono::milliseconds limit) {
   // time of check; the time of use is the caller's next statement, and for every caller here that
   // is letting the execution go out of scope
-  return wait_for([] { return !untangle::async::execution_poll::get().is_running(); }, limit);
+  return wait_for([&poll] { return !poll.is_running(); }, limit);
 }
 
 /**
@@ -198,9 +198,10 @@ TEST(execution_queue, queueing_through_a_binding_copies_the_argument_once) {
  */
 TEST(execution_queue, runs_an_action_queued_before_the_worker_starts) {
   auto s = std::make_shared<sink>();
+  untangle::async::execution_poll poll;
   auto exec = int_execution::create_instance("queued_before_start");
   int_execution::bind_action_and_method(s->action, s, &sink::count, exec);
-  untangle::async::execution_poll::get().add(*exec);
+  poll.add(*exec);
 
   s->action(1);
   exec->run();
@@ -208,7 +209,7 @@ TEST(execution_queue, runs_an_action_queued_before_the_worker_starts) {
   EXPECT_TRUE(wait_for([&s] { return s->calls.load() == 1; }, 2000ms));
   EXPECT_EQ(s->calls.load(), 1);
 
-  ASSERT_TRUE(wait_until_poll_idle(5000ms))
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms))
       << "the worker was still running 5s later; the object cannot be destroyed safely";
 }
 
@@ -222,9 +223,10 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
   constexpr int queued = 1000;
 
   auto s = std::make_shared<sink>();
+  untangle::async::execution_poll poll;
   auto exec = int_execution::create_instance("queued_while_draining");
   int_execution::bind_action_and_method(s->action, s, &sink::count, exec);
-  untangle::async::execution_poll::get().add(*exec);
+  poll.add(*exec);
 
   exec->start();
   for (int i = 0; i < queued; ++i) {
@@ -235,7 +237,7 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
   EXPECT_EQ(s->calls.load(), queued) << "actions were dropped between push_back and pop_front";
 
   exec->stop();
-  ASSERT_TRUE(wait_until_poll_idle(5000ms))
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms))
       << "the worker was still running 5s after stop(); the object cannot be destroyed safely";
 }
 
@@ -247,9 +249,10 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
  */
 TEST(execution_queue, refuses_an_action_queued_after_the_worker_stops) {
   auto s = std::make_shared<sink>();
+  untangle::async::execution_poll poll;
   auto exec = int_execution::create_instance("queued_after_stop");
   int_execution::bind_action_and_method(s->action, s, &sink::count, exec);
-  untangle::async::execution_poll::get().add(*exec);
+  poll.add(*exec);
 
   exec->start();
   s->action(1);
@@ -258,7 +261,7 @@ TEST(execution_queue, refuses_an_action_queued_after_the_worker_stops) {
   exec->stop();
   s->action(2);
 
-  ASSERT_TRUE(wait_until_poll_idle(5000ms))
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms))
       << "the worker was still running 5s after stop(); the object cannot be destroyed safely";
 
   // The worker has left, so the count is final rather than merely not there yet.
@@ -357,13 +360,14 @@ TEST(execution_lifecycle, stop_ends_a_worker_that_just_started) {
   // turn a reported failure into a use-after-free.
   static std::vector<std::shared_ptr<void_execution>> wedged;
 
+  untangle::async::execution_poll poll;
   auto exec = void_execution::create_instance("stop_after_start");
-  untangle::async::execution_poll::get().add(*exec);
+  poll.add(*exec);
 
   exec->start();
   exec->stop();
 
-  const auto stopped = wait_until_poll_idle(2000ms);
+  const auto stopped = wait_until_poll_idle(poll, 2000ms);
   EXPECT_TRUE(stopped) << "the worker was still spinning 2s after stop()";
 
   if (!stopped) {
@@ -459,12 +463,13 @@ TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
     }
   };
 
+  untangle::async::execution_poll poll;
   auto exec = void_execution::create_instance("held_open");
   std::function<void(void)> action;
   void_execution::bind_action_and_function(action, hold_until_released, exec);
 
   action();
-  untangle::async::execution_poll::get().add(*exec);
+  poll.add(*exec);
   exec->run();
 
   // Past this point the action is mid-flight and cannot return, so the execution is running for
@@ -476,10 +481,10 @@ TEST(execution_poll, does_not_report_idle_while_an_execution_runs) {
   constexpr auto polls_per_waiter = 200000;
   std::atomic_int idle_reports = {0};
 
-  auto wait_on_the_poll = [&exec, &idle_reports] {
+  auto wait_on_the_poll = [&exec, &poll, &idle_reports] {
     for (auto i = 0; i < polls_per_waiter; ++i) {
-      assert(exec->is_running());                                  //  time of check
-      if (!untangle::async::execution_poll::get().is_running()) {  // time of use
+      assert(exec->is_running());  // time of check
+      if (!poll.is_running()) {    // time of use
         idle_reports.fetch_add(1, std::memory_order_relaxed);
       }
     }
@@ -518,6 +523,7 @@ TEST(execution_poll, reports_running_while_one_of_several_executions_is) {
     }
   };
 
+  untangle::async::execution_poll poll;
   auto idle = void_execution::create_instance("idle");
   auto busy = void_execution::create_instance("busy");
 
@@ -526,32 +532,32 @@ TEST(execution_poll, reports_running_while_one_of_several_executions_is) {
   action();
 
   // The idle one is added first, so its false answer is the one the fold starts from.
-  untangle::async::execution_poll::get().add(*idle);
-  untangle::async::execution_poll::get().add(*busy);
+  poll.add(*idle);
+  poll.add(*busy);
 
   busy->run();
   while (!action_started) {
     std::this_thread::yield();
   }
 
-  EXPECT_TRUE(untangle::async::execution_poll::get().is_running())
+  EXPECT_TRUE(poll.is_running())
       << "the poll reported idle while one of the executions it holds was running";
 
   release_action = true;
 
-  EXPECT_TRUE(wait_until_poll_idle(5000ms))
+  EXPECT_TRUE(wait_until_poll_idle(poll, 5000ms))
       << "the poll never reported idle after the running execution finished";
 }
 
 /**
  * @brief A poll of one's own answers for what was added to it, and for nothing else.
  *
- * The case execution_poll was made instantiable for: an owner of a set of workers - a thread pool -
- * wants to wait for its own and not for whatever else the process happens to be running. Two polls
- * are constructed here and only one is given the running execution.
+ * The case execution_poll exists to serve: an owner of a set of workers - a thread pool - waits for
+ * its own and not for whatever else the process happens to be running. Two polls are constructed
+ * here and only one is given the running execution.
  *
  * @remark The second poll never has anything added to it, so its is_running() also covers a poll
- * that was never connected to anything - which before this was a state no caller could reach.
+ * that was never connected to anything.
  */
 TEST(execution_poll, an_instance_answers_only_for_what_was_added_to_it) {
   std::atomic_bool action_started = {false};
@@ -589,12 +595,11 @@ TEST(execution_poll, an_instance_answers_only_for_what_was_added_to_it) {
 }
 
 /**
- * @brief An execution takes itself out of every poll holding it, not just the process-wide one.
+ * @brief An execution takes itself out of every poll holding it, not just one of them.
  *
  * add() stores the address of the execution's action_is_running, so a poll still holding one after
- * the execution has died calls into freed memory - the defect step 4 closed for the singleton. An
- * instantiable poll means an execution can be in several at once, and withdrawing from get() alone
- * would leave the others dangling.
+ * the execution has died calls into freed memory. An execution can be in several polls at once,
+ * and withdrawing from one alone would leave the others dangling.
  *
  * @attention The failure here is a crash or a wrong answer rather than a failed expectation, and
  * -fsanitize=address is what names it. The expectations below are what a poll with nothing left in
@@ -608,13 +613,10 @@ TEST(execution_poll, an_execution_withdraws_from_every_poll_holding_it) {
     auto exec = void_execution::create_instance("in_two_polls");
     first.add(*exec);
     second.add(*exec);
-    untangle::async::execution_poll::get().add(*exec);
   }
 
   EXPECT_FALSE(first.is_running()) << "the first poll still holds a destroyed execution";
   EXPECT_FALSE(second.is_running()) << "the second poll still holds a destroyed execution";
-  EXPECT_FALSE(untangle::async::execution_poll::get().is_running())
-      << "the process-wide poll still holds a destroyed execution";
 }
 
 /**
@@ -664,17 +666,18 @@ TEST(execution_poll, remove_withdraws_from_only_the_poll_it_was_called_on) {
  * The failure here is a crash, not a wrong answer.
  */
 TEST(execution_poll, survives_executions_registering_while_another_thread_waits) {
+  untangle::async::execution_poll poll;
   std::atomic_bool done = {false};
 
-  std::thread waiter([&done] {
+  std::thread waiter([&poll, &done] {
     while (!done) {
-      untangle::async::execution_poll::get().is_running();
+      poll.is_running();
     }
   });
 
   for (int i = 0; i < 200; ++i) {
     auto exec = void_execution::create_instance("churn");
-    untangle::async::execution_poll::get().add(*exec);
+    poll.add(*exec);
   }
 
   done = true;

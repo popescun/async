@@ -72,10 +72,9 @@ struct attachment {
  * @remark An execution runs in a detached thread and cannot be joined, so checking the "running"
  * state is the only way to wait for one. This checks any number of them at once.
  *
- * @remark **Instantiable, and \ref get() is one instance rather than the only one.** A caller that
- * owns a set of workers - a thread pool is the case this was written for - wants to wait for its
- * own and not for whatever else the process is running, and that is a poll of its own. The
- * singleton stays for callers with nothing to separate themselves from.
+ * @remark A poll is constructed and owned by the caller, and answers for the executions added to
+ * that one. An owner of a set of workers - a thread pool is the case this was written for - waits
+ * for its own and not for whatever else the process is running.
  */
 class execution_poll {
  public:
@@ -90,7 +89,7 @@ class execution_poll {
    * @remark The record runs both ways, and it has to: each side holds a pointer into the other, so
    * whichever dies first takes itself out of the other. ~execution() withdraws from every poll
    * holding it; this tells every execution it holds that this poll is gone. Neither order leaves a
-   * dangling pointer, which is what lets a poll be a local rather than only a singleton.
+   * dangling pointer, which is what lets a poll be a local.
    */
   ~execution_poll() {
     std::vector<registration> held;
@@ -106,6 +105,7 @@ class execution_poll {
       one.forget();
     }
   }
+
   /**
    * @brief Adds an \ref execution object to the poll
    *
@@ -176,20 +176,6 @@ class execution_poll {
       result = result || ret;
     }
     return result;
-  }
-
-  /**
-   * @brief Gets the process-wide instance.
-   *
-   * @remark One poll among however many are constructed, not the only one there can be. It answers
-   * for every execution added to *it*; an owner that wants an answer about its own workers alone
-   * constructs a poll and adds them to that.
-   *
-   * @return execution_poll The process-wide \ref execution_poll instance.
-   */
-  static execution_poll& get() {
-    static execution_poll instance;
-    return instance;
   }
 
  private:
@@ -300,11 +286,10 @@ class execution {
     // time of use: this object is freed once the destructor returns, so the check above is only
     // safe because running_ is the last thing the worker touches.
     //
-    // Out of every poll that holds a pointer into this object. Withdrawing from the singleton
-    // alone was enough while it was the only poll there could be; now that a caller may own one,
-    // an execution can be in several, and an address left in any of them outlives the object.
-    // Taken by swap so nothing else can be added to the record while this walks it, and withdrawn
-    // rather than removed because remove() would call back into an object that is going away.
+    // Out of every poll that holds a pointer into this object: an execution can be in several,
+    // and an address left in any of them outlives the object. Taken by swap so nothing else can be
+    // added to the record while this walks it, and withdrawn rather than removed because remove()
+    // would call back into an object that is going away.
     std::vector<execution_poll*> holding_polls;
 
     {

@@ -46,11 +46,12 @@ int main()
   // run the execution
   execution->run();
 
-  // add the execution object to the running poll
-  untangle::async::execution_poll::get().add(*execution);
+  // add the execution object to a poll of one's own; the poll answers for what was added to it
+  untangle::async::execution_poll poll;
+  poll.add(*execution);
 
   // wait the polled executions to finish
-  while(untangle::async::execution_poll::get().is_running())
+  while(poll.is_running())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -89,11 +90,12 @@ int main()
   // run the execution
   execution->run();
 
-  // add the execution object to the running poll
-  untangle::async::execution_poll::get().add(*execution);
+  // add the execution object to a poll of one's own; the poll answers for what was added to it
+  untangle::async::execution_poll poll;
+  poll.add(*execution);
 
   // wait the polled executions to finish
-  while(untangle::async::execution_poll::get().is_running())
+  while(poll.is_running())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -132,11 +134,12 @@ int main()
   // stop the execution
   execution->stop();
 
-  // add the execution object to the running poll
-  untangle::async::execution_poll::get().add(*execution);
+  // add the execution object to a poll of one's own; the poll answers for what was added to it
+  untangle::async::execution_poll poll;
+  poll.add(*execution);
 
   // wait the polled executions to finish
-  while(untangle::async::execution_poll::get().is_running())
+  while(poll.is_running())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -171,8 +174,9 @@ destructor waits on the same state, so an execution that goes out of scope while
 running blocks until the worker is finished rather than leaving it reading freed memory.
 
 **The poll holds a pointer to each execution added to it**, so an execution withdraws itself in its
-destructor. `execution_poll::remove()` is available for withdrawing one earlier; calling it is not
-required.
+destructor - from every poll it was added to, since it may be in more than one. A poll destroyed
+first likewise releases what it still holds, so a poll may be a local. `execution_poll::remove()` is
+available for withdrawing one earlier; calling it is not required.
 
 ## building the tests
 

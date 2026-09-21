@@ -45,6 +45,10 @@ void f() { std::println("f thread {}", std::this_thread::get_id()); }
 int main() {
   std::println("main thread {}", std::this_thread::get_id());
 
+  // Declared before the executions so it outlives them: the poll and the executions take each
+  // other out on destruction either way, and this keeps the order the readable one.
+  untangle::async::execution_poll poll;
+
   auto a = std::make_shared<A>();
   auto asyncexec = void_exec::create_instance("asyncexec");
   void_exec::bind_action_and_method(a->async_f, a, &A::f, asyncexec);
@@ -105,18 +109,18 @@ int main() {
   asyncexec3->attach(asyncexec5);
   action_on_finished();
 
-  untangle::async::execution_poll::get().add(*asyncexec);
-  untangle::async::execution_poll::get().add(*asyncexec3);
+  poll.add(*asyncexec);
+  poll.add(*asyncexec3);
 
   asyncexec->run();
   // asyncexec->stop();
   asyncexec3->run();
 
   auto otherasync = std::make_shared<other_async<std::string>>();
-  otherasync->run();
+  otherasync->run(poll);
 
   // wait the polled executions to finish
-  while (untangle::async::execution_poll::get().is_running()) {  // time of check
+  while (poll.is_running()) {  // time of check
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 

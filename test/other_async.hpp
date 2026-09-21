@@ -15,11 +15,11 @@ class other_async : public std::enable_shared_from_this<other_async<T>> {
 
   using exec_t = untangle::async::execution<std::function<void(const std::string&)>>;
 
-  void run() {
+  void run(untangle::async::execution_poll& poll) {
     sharedThis = this->shared_from_this();
     exec_t::bind_action_and_method(async_action, sharedThis, &other_async<std::string>::set,
                                    asyncexec);
-    untangle::async::execution_poll::get().add(*asyncexec);
+    poll.add(*asyncexec);
     async_action("test");
     asyncexec->run();
   }
