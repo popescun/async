@@ -1,13 +1,14 @@
 # async.hpp — fix plan
 
-**Status (2026-09-19) — concluded for now.** 36 of 37 steps done, and the last one part-done:
-1 to 34 landed or declined with the reasoning recorded, 35 part-done (A landed; B and C measured and
-deferred), 36 and 37 landed. **Everything is committed**, HEAD `a5f2579`, working tree clean. The
+**Status (2026-09-22) — reopened and closed again by step 38.** 37 of 38 steps done, and one
+part-done: 1 to 34 landed or declined with the reasoning recorded, 35 part-done (A landed; B and C
+measured and deferred), 36 and 37 landed, and **38 answers the question steps 21 and 28 left open**
+— what the caller is told when an action fails. It came back from the executor repo, which needed
+it to close its own step 5. The
 per-step commits are in the table under **Progress**; this line no longer restates them, because
 that is how it kept drifting.
-**Tests:** 42 of 42 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
-step 35 on 2026-09-19; 30x repeat with no failures; `async_smoke_test` exit 0 on all three, 0 TSan
-warnings; clang-format clean.
+**Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
+step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
 `tools/make_doc.sh`. **The PDF embeds the header's own source listing** - there is no separate file
 page - so the page count tracks `async.hpp`'s length, and a few lines either way can move it by a
@@ -75,17 +76,22 @@ remains of the group**, and step 33 joins group 7.
 | `305b672` | 26 — `\|=` on a bool becomes `\|\|`, and the poll's fold gains a test |
 | `26f91ed` | 36 — `run()` and `start()` wait for a resident worker to leave |
 | *(uncommitted)* | 32 — `finishing_` is gone; `is_running()` is `running_` |
+| *(uncommitted)* | 38 — `on_error` carries what an action threw to the caller |
 
-**NEXT: nothing is outstanding.** Step 35's B and C are recorded and deliberately not taken: B is
+**NEXT: nothing is outstanding.** Step 38 closed the last question that was anybody's. What is
+left of the "what happened to the action I gave you" ground is refusal reaching a bound caller,
+recorded under step 21 and not worth its own step until something asks for it.
+Step 35's B and C are recorded and deliberately not taken: B is
 40 lines of new apparatus for the last allocation per action and for move-only work, C only pays off
 once B exists. Take them when move-only work is wanted.
 
-**Still open after steps 21 and 28**, and now nobody's step: a caller who reaches `add_action()`
-through `bind()` learns nothing — not that an action was refused, not that one threw. Those lambdas
-return `actionT::result_type`, which has no room for an answer. Both steps closed with the direct
-caller served and that one not, so "settle them together" was only half met. It is the same ground
-as item 8's carried-forward half; land it with steps 21 and 25 or state that the bound caller is
-never told.
+**Answered by step 38, half of it.** This paragraph read: a caller who reaches `add_action()`
+through `bind()` learns nothing — not that an action was refused, not that one threw — because those
+lambdas return `actionT::result_type`, which has no room for an answer. That framing is what kept it
+open: it looked for the answer in the return type, and there is no room there for anyone. \ref
+execution::on_error puts it somewhere else entirely, so **"not that one threw" is now answered for
+every caller**, bound or direct. What is still unanswered is refusal — `add_action()` returns
+`bool`, and a bound caller cannot see it. Take that with step 21's lines if it is ever wanted.
 
 **Read the couplings before picking an order.** Step 21 touches the same two `bind()` lambdas as
 step 25 and as the half of item 8 carried forward below — land the three together or accept three
@@ -1101,12 +1107,12 @@ identical in the suite — both were caught, both warned, and the worker carried
 The action is still counted as having come off the queue, so its batch reports finished like any
 other; the comment saying so listed two outcomes and now lists three.
 
-**The other half is still open, and deliberately.** What the submitter is told has not changed. Step
-21 could answer a refused action with a `bool` because the caller was standing there; here the
-submitter is long gone by the time the action runs, so the stderr warning remains the floor. The
-plan's instruction to "settle the two together" is therefore only half met: both questions now have
-*an* answer, but neither reaches a caller who arrived through `bind()`, whose lambdas have no room
-in their return type. That gap is item 8's carried-forward half and belongs with steps 21 and 25.
+**The other half was left open, deliberately, and step 38 closed it.** What the submitter is told
+had not changed here: step 21 could answer a refused action with a `bool` because the caller was
+standing there, while the submitter of a throwing action is long gone by the time it runs, so the
+stderr warning stayed the floor. The way out was not the return type — there is no room in it for
+anyone, bound or direct — but a handler the caller assigns, which is step 38's `on_error`. The
+warning is still the floor for a caller who assigns nothing.
 
 **Test:** `execution_queue.an_action_that_throws_does_not_kill_the_worker`. It **aborted rather than
 failed** before the fix, because that is what the defect did — `gtest_discover_tests` gives every
@@ -1676,3 +1682,58 @@ green on GCC 13.
 
 **Left open:** the same guard question returns if the planned logger replaces `std::println`, and
 step 18 still wants the two remaining `std::cout` calls routed through it.
+
+### Step 38 · item L — what an action throws reaches a log and no code — DONE
+`async.hpp:655` (the member), `:762-777` (the arms), `:814` (`report_error()`) · CONFIRMED by test:
+`what_an_action_throws_reaches_the_caller`
+
+Raised by the executor repo, whose own step 5 could not be written without it. Step 28 made a
+throwing action survivable and said so plainly: *"what the submitter is told has not changed... the
+stderr warning remains the floor"*. That floor is a line naming this execution — the header's own
+name for its worker, nothing the caller chose — and it reaches a log and no code. An action that
+failed and one that succeeded are the same from outside.
+
+**The seam is a member beside `on_finished`**, assigned the same way and called on the same thread:
+
+```c++
+std::function<void(std::exception_ptr)> on_error;
+```
+
+All three catch arms consult it through `report_error()`, which returns whether a handler ran:
+
+```c++
+} catch (const std::exception& e) {
+  if (!report_error()) {
+    std::println(stderr, "warning: execution '{}' dropped an action that threw: {}", name, e.what());
+  }
+}
+```
+
+**A handler replaces the warning rather than adding to it.** A caller that has taken responsibility
+for reporting should not be reported over, and one that has not keeps exactly the behaviour it had —
+which is why the other 45 cases needed no change.
+
+**`invalid_action` is reported too**, not only the caller's own exceptions. A dead binding is one of
+the reasons an action did not run, and a caller asking why wants both answers rather than the one
+the header happens to raise itself.
+
+**`std::exception_ptr`, not a caught reference.** It is the only thing that carries what is *not* a
+`std::exception` — the arm step 28 added specifically because a bare `catch (...)` throws away the
+detail. Two handlers, or a string, would each lose something.
+
+**`report_error()` catches around the handler.** It is caller code, on a detached thread, inside the
+try that caught the action — precisely the shape step 28 existed to fix. An exception escaping it
+would call `std::terminate`, so a broken handler costs its own warning and not the process.
+
+**Test:** `execution_queue.what_an_action_throws_reaches_the_caller`, beside step 28's case so the
+two read as a pair — that one says the worker survives, this one says the caller finds out. It reads
+both arms (a `std::runtime_error` through `what()`, and `throw 42` through the catch-all) and asserts
+**stderr is empty**, which is what proves the handler replaced the warning instead of doubling it.
+
+Verified: 46/46 in Debug, under ThreadSanitizer and under AddressSanitizer; `async_smoke_test`
+exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings, 43 pages.
+
+**One repair on the way in.** `\ref invalid_action` does not resolve — it lives in `actuator.hpp`,
+outside this Doxyfile's input — and `make_doc.sh` treats doxygen warnings as errors, so it would have
+failed the build. Written as `untangle::invalid_action`, which is what the header's other mentions
+of it already do.

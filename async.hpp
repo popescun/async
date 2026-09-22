@@ -632,6 +632,28 @@ class execution {
    * \ref results() is complete by the time it runs, and \ref is_running() reads true there.
    */
   std::function<void(void)> on_finished;
+
+  /**
+   * @brief Called on the worker's thread with whatever an action threw. Assigned by the caller.
+   *
+   * The action is dropped either way; this is what it is dropped *to*. Without it the only record
+   * is a warning on stderr naming this execution, which reaches a log and no code — an action that
+   * failed and one that succeeded are the same from outside. A handler assigned here **replaces**
+   * that warning, so a caller that takes responsibility for reporting is not reported twice.
+   *
+   * @remark It receives a std::exception_ptr because the worker catches everything, including what
+   * is not a std::exception. Rethrow it to read it.
+   *
+   * @remark It is told about a dead binding too, which arrives as untangle::invalid_action. A
+   * caller asking why an action did not run wants both answers, not the one the header happens to
+   * raise itself.
+   *
+   * @attention It runs on the worker's thread, inside the drain, like \ref on_finished. Nothing may
+   * escape it: it is called from the same try the action was called from, and an exception leaving
+   * a detached thread function calls std::terminate.
+   */
+  std::function<void(std::exception_ptr)> on_error;
+
   std::string name = default_name;
 
  private:
@@ -738,14 +760,20 @@ class execution {
       try {
         execute_action(action);
       } catch (const invalid_action& ia) {
-        std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
-                     ia.what());
+        if (!report_error()) {
+          std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
+                       ia.what());
+        }
       } catch (const std::exception& e) {
-        std::println(stderr, "warning: execution '{}' dropped an action that threw: {}", name,
-                     e.what());
+        if (!report_error()) {
+          std::println(stderr, "warning: execution '{}' dropped an action that threw: {}", name,
+                       e.what());
+        }
       } catch (...) {
-        std::println(stderr, "warning: execution '{}' dropped an action that threw an unknown type",
-                     name);
+        if (!report_error()) {
+          std::println(
+              stderr, "warning: execution '{}' dropped an action that threw an unknown type", name);
+        }
       }
 
       executing_action_ = false;
@@ -772,6 +800,33 @@ class execution {
     if (actuator_execute_.is_connected()) {
       actuator_execute_();
     }
+  }
+
+  /**
+   * @brief Hands what is being caught to \ref on_error, if the caller assigned one.
+   *
+   * @attention Call only from inside a catch block: it reads std::current_exception(), which is
+   * null anywhere else and would report a handler a null exception it cannot rethrow.
+   *
+   * @return true - a handler ran, and the arm that called this has nothing more to say. false - no
+   * handler is assigned, so the arm prints its warning as it always did.
+   */
+  bool report_error() {
+    if (!on_error) {
+      return false;
+    }
+
+    // The handler is the caller's code, running on a detached thread inside the try that caught the
+    // action. Anything escaping it would leave the thread function and call std::terminate, so it
+    // is caught here - a caller's broken handler costs its own warning, not the process.
+    try {
+      on_error(std::current_exception());
+    } catch (...) {
+      std::println(stderr, "warning: execution '{}' had on_error throw, and dropped what it threw",
+                   name);
+    }
+
+    return true;
   }
 
   /**

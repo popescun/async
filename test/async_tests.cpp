@@ -347,6 +347,56 @@ TEST(execution_queue, an_action_that_throws_does_not_kill_the_worker) {
 }
 
 /**
+ * @brief What an action throws reaches the caller, and not only stderr.
+ *
+ * The warning names the execution, which is the header's own name for its worker and nothing the
+ * caller chose. It reaches a log and no code: an action that failed and one that succeeded are the
+ * same from outside. on_error carries what was thrown to whoever assigned it, the way on_finished
+ * carries the end of a batch.
+ *
+ * @remark Both arms are read. The header catches a std::exception separately so its warning can
+ * carry what(), and everything else in a catch-all; a handler told about only the first would leave
+ * the second as silent as it is now.
+ */
+TEST(execution_queue, what_an_action_throws_reaches_the_caller) {
+  auto exec = void_execution::create_instance("throwing_action_reported");
+
+  std::atomic_int reported = {0};
+  std::atomic_int reported_unknown = {0};
+  std::string reported_what;
+
+  exec->on_error = [&](std::exception_ptr thrown) {
+    try {
+      std::rethrow_exception(thrown);
+    } catch (const std::exception& e) {
+      reported_what = e.what();
+    } catch (...) {
+      reported_unknown.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    reported.fetch_add(1, std::memory_order_relaxed);
+  };
+
+  exec->add_action([] { throw std::runtime_error("the caller's own code threw"); });
+  exec->add_action([] { throw 42; });  // not a std::exception; the catch-all arm
+
+  testing::internal::CaptureStderr();
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 5000ms))
+      << "the worker did not finish";
+
+  const std::string warned = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(reported.load(), 2) << "what the actions threw reached nobody";
+  EXPECT_EQ(reported_what, "the caller's own code threw");
+  EXPECT_EQ(reported_unknown.load(), 1) << "the catch-all arm reported nothing";
+  EXPECT_EQ(warned, "") << "a handler was assigned, so the warning is its job now; stderr held: "
+                        << warned;
+}
+
+/**
  * @brief stop() ends a worker that has only just been started.
  *
  * The worker sets `started_` from its own thread and stop() clears it from the caller's, so a
