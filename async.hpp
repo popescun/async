@@ -680,9 +680,7 @@ class execution {
   /**
    * @brief Are there actions waiting to run?
    *
-   * @attention Reads action_actuator_, so the caller holds action_mutex_ - every caller here is
-   * inside a lock_guard or is the condition variable's predicate, which is called with the lock
-   * held.
+   * @attention Reads \ref action_actuator_, so the caller holds action_mutex_.
    */
   bool has_pending_actions() const { return action_actuator_.is_connected(); }
 
@@ -745,12 +743,7 @@ class execution {
     actions_run_ = 0;
 
     for (;;) {
-      // The whole batch is taken out under the lock and run with the lock released: an action is
-      // caller code that may run for a while, and may itself call add_action(), which takes the
-      // same mutex. Moving it out is also what keeps action_actuator_ to one thread - it is not
-      // synchronised, so a producer adding to it must never be writing a list the worker is
-      // walking. A moved-from actuator is empty and its handles stay valid, which is what
-      // actuator_test's test_move_carries_the_owned_actions_and_empties_the_source states.
+      // Takes over action_actuator_ under the lock; its actions then run without it.
       actuator<queued_action_t> batch;
 
       {
@@ -761,14 +754,13 @@ class execution {
 
         batch = std::move(action_actuator_);
 
-        // Under the lock that emptied the pending actions, so is_busy() sees the two together or
-        // neither.
+        // Under the same lock, so is_busy() sees both or neither.
         executing_action_ = true;
       }
 
       for (auto* action : batch.actions) {
-        // Nothing may leave this loop: an exception escaping a detached thread function calls
-        // std::terminate, and one escaping mid-batch would take the actions behind it with it.
+        // Nothing may leave this loop: the actions behind this one still have to run, and an
+        // exception escaping a detached thread function calls std::terminate.
         try {
           execute_action(*action);
         } catch (const invalid_action& ia) {
@@ -935,12 +927,9 @@ class execution {
   std::condition_variable action_cv_;
 
   /**
-   * @brief The actions waiting to run, and the only thing that owns them.
+   * @brief The actions waiting to run, and what owns them.
    *
-   * An actuator rather than a container of callables: it is what the rest of this header already
-   * uses to hold actions, and \ref add(action_t&&) moves one in, so a lambda needs no named
-   * variable behind it. It is not synchronised - every access is under action_mutex_, and
-   * \ref execute_actions() moves the whole of it out before running anything.
+   * @attention Not synchronised: every access is under action_mutex_.
    */
   actuator<queued_action_t> action_actuator_;
 
@@ -1006,11 +995,9 @@ class execution {
   std::atomic_bool collecting_results_ = {false};
 
   /**
-   * @brief Whether a batch that has already been taken out of \ref action_actuator_ is running.
+   * @brief Whether a batch taken out of \ref action_actuator_ is still running.
    *
-   * The worker takes the batch under action_mutex_ and runs it with the lock released, leaving a
-   * window in which nothing is pending and the execution is anything but idle. This is what closes
-   * it for \ref is_busy().
+   * Nothing is pending while it runs, so \ref is_busy() reads this as well.
    */
   std::atomic_bool executing_action_ = {false};
 
