@@ -11,6 +11,7 @@
  */
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <async.hpp>
 #include <atomic>
 #include <chrono>
@@ -299,35 +300,53 @@ TEST(execution_queue, queueing_during_a_batch_runs_every_action_exactly_once) {
 /**
  * @brief A continuous worker picks an action up when it is queued, not when its wait times out.
  *
- * loop() waits on a condition variable with a bounded timeout, so a worker that is never notified
- * still runs everything - late. Two hundred rounds of "queue one, wait for it" is where the
- * difference shows: woken, each round costs the call itself; polled, each costs the timeout.
+ * loop() waits on a condition variable with a bounded timeout of 10ms, so a worker that is never
+ * notified still runs everything - late, by half that on average. Each action reports how long it
+ * waited, and the median over the rounds is what separates the two: microseconds when the add
+ * notifies, milliseconds when only the timeout ends the wait.
+ *
+ * @remark Timing-sensitive, and deliberately measured on the worker's side: the time this case
+ * spends noticing that an action ran is the test's own and says nothing about the header.
  */
 TEST(execution_queue, a_continuous_worker_is_woken_by_an_add_rather_than_by_its_timeout) {
-  constexpr int rounds = 200;
+  constexpr int rounds = 100;
 
   untangle::async::execution_poll poll;
   const auto exec = void_execution::create_instance("woken_by_add");
   poll.add(*exec);
 
-  std::atomic_int ran = {0};
+  std::vector<std::chrono::microseconds> waited;
+  waited.reserve(rounds);
+
   exec->start();
 
-  const auto started = std::chrono::steady_clock::now();
-
   for (int round = 0; round < rounds; ++round) {
-    ASSERT_TRUE(exec->add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }))
-        << "the action was refused at round " << round;
+    // Shared with the action rather than captured by reference: a round that times out below
+    // leaves the action to run after this case has returned.
+    const auto reported = std::make_shared<std::atomic_llong>(-1);
+    const auto queued_at = std::chrono::steady_clock::now();
+
+    ASSERT_TRUE(exec->add_action([reported, queued_at] {
+      reported->store(std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - queued_at)
+                          .count(),
+                      std::memory_order_relaxed);
+    })) << "the action was refused at round "
+        << round;
+
     ASSERT_TRUE(
-        wait_for([&ran, round] { return ran.load(std::memory_order_relaxed) > round; }, 2000ms))
+        wait_for([reported] { return reported->load(std::memory_order_relaxed) >= 0; }, 2000ms))
         << "round " << round << " never ran";
+
+    waited.emplace_back(reported->load(std::memory_order_relaxed));
   }
 
-  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - started);
+  std::ranges::sort(waited);
+  const auto median = waited[waited.size() / 2];
 
-  EXPECT_LT(elapsed, 1000ms) << rounds << " rounds took " << elapsed.count()
-                             << "ms; the worker is waiting out its timeout rather than being woken";
+  EXPECT_LT(median, 2ms)
+      << "the median action waited " << median.count() << "us over " << rounds
+      << " rounds; loop() is waiting out its 10ms timeout rather than being woken";
 
   exec->stop();
   ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms))
