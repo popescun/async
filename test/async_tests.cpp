@@ -16,6 +16,7 @@
 #include <chrono>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -296,6 +297,44 @@ TEST(execution_queue, queueing_during_a_batch_runs_every_action_exactly_once) {
 }
 
 /**
+ * @brief A continuous worker picks an action up when it is queued, not when its wait times out.
+ *
+ * loop() waits on a condition variable with a bounded timeout, so a worker that is never notified
+ * still runs everything - late. Two hundred rounds of "queue one, wait for it" is where the
+ * difference shows: woken, each round costs the call itself; polled, each costs the timeout.
+ */
+TEST(execution_queue, a_continuous_worker_is_woken_by_an_add_rather_than_by_its_timeout) {
+  constexpr int rounds = 200;
+
+  untangle::async::execution_poll poll;
+  const auto exec = void_execution::create_instance("woken_by_add");
+  poll.add(*exec);
+
+  std::atomic_int ran = {0};
+  exec->start();
+
+  const auto started = std::chrono::steady_clock::now();
+
+  for (int round = 0; round < rounds; ++round) {
+    ASSERT_TRUE(exec->add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }))
+        << "the action was refused at round " << round;
+    ASSERT_TRUE(
+        wait_for([&ran, round] { return ran.load(std::memory_order_relaxed) > round; }, 2000ms))
+        << "round " << round << " never ran";
+  }
+
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+
+  EXPECT_LT(elapsed, 1000ms) << rounds << " rounds took " << elapsed.count()
+                             << "ms; the worker is waiting out its timeout rather than being woken";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms))
+      << "the worker was still running 5s after stop(); the object cannot be destroyed safely";
+}
+
+/**
  * @brief An action queued after stop() never runs.
  *
  * stop() ends the execution's working life: the worker drains what was queued before it and leaves,
@@ -397,6 +436,34 @@ TEST(execution_queue, an_action_that_throws_does_not_kill_the_worker) {
 
   EXPECT_EQ(before.load(), 1) << "the action before the throwing one did not run";
   EXPECT_EQ(behind.load(), 1) << "an action queued behind a throwing one never ran";
+  EXPECT_EQ(finished.load(), 1) << "the batch drained without reporting that it had finished";
+}
+
+/**
+ * @brief An action that throws is dropped, not retried: it runs once and once only.
+ *
+ * The action is counted before it throws, so the count is of attempts rather than of completions.
+ * A drain that cannot tell a batch it has already run from one it has not would run it again on
+ * the next pass, and go on doing so.
+ */
+TEST(execution_queue, a_throwing_action_runs_once) {
+  auto exec = void_execution::create_instance("throwing_action_once");
+
+  std::atomic_int attempts = {0};
+  std::atomic_int finished = {0};
+  exec->on_finished = [&finished] { finished.fetch_add(1, std::memory_order_relaxed); };
+
+  exec->add_action([&attempts] {
+    attempts.fetch_add(1, std::memory_order_relaxed);
+    throw std::runtime_error("the caller's own code threw");
+  });
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 5000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(attempts.load(), 1) << "the throwing action was attempted more than once";
   EXPECT_EQ(finished.load(), 1) << "the batch drained without reporting that it had finished";
 }
 
@@ -837,6 +904,52 @@ TEST(execution_binding, a_function_action_does_not_reach_a_destroyed_execution) 
 }
 
 /**
+ * @brief A binding whose object is gone reports through on_error, like anything else that throws.
+ *
+ * The action was queued while the object was alive, so the dead binding is discovered by the
+ * worker rather than by the caller. A caller asking why an action did not run wants that answer
+ * too, not only the ones the action raised itself - and it must arrive through on_error rather
+ * than as a line printed by whatever the queue is made of.
+ */
+TEST(execution_binding, a_dead_binding_reaches_on_error) {
+  auto s = std::make_shared<sink>();
+  const auto exec = int_execution::create_instance("dead_binding_reported");
+  int_execution::bind_action_and_method(s->action, s, &sink::count, exec);
+
+  s->action(1);  // queued while the object is alive
+  s.reset();     // and dead by the time the worker reaches it
+
+  std::atomic_int reported = {0};
+  exec->on_error = [&reported](std::exception_ptr thrown) {
+    try {
+      std::rethrow_exception(thrown);
+    } catch (const untangle::invalid_action&) {
+      reported.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+    }
+  };
+
+  testing::internal::CaptureStdout();
+  testing::internal::CaptureStderr();
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 5000ms))
+      << "the worker did not finish";
+
+  const std::string printed = testing::internal::GetCapturedStdout();
+  const std::string warned = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(reported.load(), 1) << "the dead binding reached nobody";
+  // Not "stdout is empty": the worker announces its own exit there. What may not appear is the
+  // binding's own complaint, printed by whatever holds the actions instead of being reported.
+  EXPECT_EQ(printed.find("bind: invalid object"), std::string::npos)
+      << "the dead binding was printed instead of reported; stdout held: " << printed;
+  EXPECT_EQ(warned, "") << "a handler was assigned, so the warning is its job now; stderr held: "
+                        << warned;
+}
+
+/**
  * @brief Building a binding copies the callable only if the caller keeps it.
  *
  * The callable is taken by value and moved into the action, which is moved again into the lambda
@@ -1148,6 +1261,35 @@ TEST(execution_results, keep_every_action_result) {
 
   EXPECT_EQ(exec->results(), (std::vector<int>{1, 2, 3}))
       << "the results of a run must be every action's, in the order they ran";
+}
+
+/**
+ * @brief A run that drains twice keeps both batches' results.
+ *
+ * on_finished runs inside the drain, so an action queued from it is picked up by the same pass as
+ * a second batch. The results belong to the run, not to the batch: clearing them per batch would
+ * hand the caller only what the last one returned.
+ */
+TEST(execution_results, keep_the_results_of_every_batch_in_a_run) {
+  const auto exec = int_ret_execution::create_instance("two_batches");
+
+  std::atomic_bool queued_the_second = {false};
+  exec->on_finished = [&exec, &queued_the_second] {
+    if (queued_the_second.exchange(true)) {
+      return;  // the second batch's own notification; a third would never end
+    }
+    exec->add_action([](int value) { return value; }, 2);
+  };
+
+  exec->add_action([](int value) { return value; }, 1);
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 5000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(exec->results(), (std::vector<int>{1, 2}))
+      << "a run's results must be every batch's, not only the last one's";
 }
 
 /**

@@ -10,7 +10,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -402,7 +401,7 @@ class execution {
    */
   bool is_busy() const {
     std::lock_guard<std::mutex> lock(action_mutex_);
-    return !action_queue_.empty() || executing_action_.load();
+    return has_pending_actions() || executing_action_.load();
   }
 
   /**
@@ -679,6 +678,15 @@ class execution {
   }
 
   /**
+   * @brief Are there actions waiting to run?
+   *
+   * @attention Reads action_actuator_, so the caller holds action_mutex_ - every caller here is
+   * inside a lock_guard or is the condition variable's predicate, which is called with the lock
+   * held.
+   */
+  bool has_pending_actions() const { return action_actuator_.is_connected(); }
+
+  /**
    * @brief Queues a callable already bound to its arguments, and says whether it was taken.
    *
    * What \ref add_action() does once it has bound one, and what a binding queues directly: a
@@ -698,7 +706,7 @@ class execution {
         return false;
       }
 
-      action_queue_.push_back(std::move(action));
+      action_actuator_.add(std::move(action));
     }
 
     action_cv_.notify_one();
@@ -728,66 +736,72 @@ class execution {
    * @brief Runs everything queued, then drives the attached executions.
    *
    * Counts what it ran in \ref actions_run_, which is how \ref notify_finished() tells a batch
-   * that drained from a worker that woke with nothing to do. Every action that came off the queue
-   * counts, including one that reported a dead binding.
+   * that drained from a worker that woke with nothing to do. Every action in the batch counts,
+   * including one that reported a dead binding.
    *
    * @remark The count is of this execution's own actions; an attached execution records its own.
    */
   void execute_actions() {
     actions_run_ = 0;
 
-    // The action is taken off the queue under the lock and invoked with the lock released: an
-    // action is caller code that may run for a while, and may itself call add_action().
     for (;;) {
-      queued_action_t action;
+      // The whole batch is taken out under the lock and run with the lock released: an action is
+      // caller code that may run for a while, and may itself call add_action(), which takes the
+      // same mutex. Moving it out is also what keeps action_actuator_ to one thread - it is not
+      // synchronised, so a producer adding to it must never be writing a list the worker is
+      // walking. A moved-from actuator is empty and its handles stay valid, which is what
+      // actuator_test's test_move_carries_the_owned_actions_and_empties_the_source states.
+      actuator<queued_action_t> batch;
 
       {
         std::lock_guard<std::mutex> lock(action_mutex_);
-        if (action_queue_.empty()) {
+        if (!has_pending_actions()) {
           break;
         }
 
-        action = std::move(action_queue_.front());
-        action_queue_.pop_front();
+        batch = std::move(action_actuator_);
 
-        // Under the lock that emptied the queue, so is_busy() sees the pop and this together or
+        // Under the lock that emptied the pending actions, so is_busy() sees the two together or
         // neither.
         executing_action_ = true;
       }
 
-      // Nothing may leave this loop: an exception escaping a detached thread function calls
-      // std::terminate.
-      try {
-        execute_action(action);
-      } catch (const invalid_action& ia) {
-        if (!report_error()) {
-          std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
-                       ia.what());
+      for (auto* action : batch.actions) {
+        // Nothing may leave this loop: an exception escaping a detached thread function calls
+        // std::terminate, and one escaping mid-batch would take the actions behind it with it.
+        try {
+          execute_action(*action);
+        } catch (const invalid_action& ia) {
+          if (!report_error()) {
+            std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
+                         ia.what());
+          }
+        } catch (const std::exception& e) {
+          if (!report_error()) {
+            std::println(stderr, "warning: execution '{}' dropped an action that threw: {}", name,
+                         e.what());
+          }
+        } catch (...) {
+          if (!report_error()) {
+            std::println(stderr,
+                         "warning: execution '{}' dropped an action that threw an unknown type",
+                         name);
+          }
         }
-      } catch (const std::exception& e) {
-        if (!report_error()) {
-          std::println(stderr, "warning: execution '{}' dropped an action that threw: {}", name,
-                       e.what());
-        }
-      } catch (...) {
-        if (!report_error()) {
-          std::println(
-              stderr, "warning: execution '{}' dropped an action that threw an unknown type", name);
-        }
+
+        // Counted whether it ran cleanly, reported a dead binding, or threw: it was in the batch,
+        // and the batch is what the notification is about.
+        ++actions_run_;
       }
 
       executing_action_ = false;
-
-      // Counted whether it ran cleanly, reported a dead binding, or threw: it came off the queue,
-      // and the queue is what the notification is about.
-      ++actions_run_;
 
       // The notification is raised without the lock: on_finished may call add_action(), which
       // takes it.
       bool drained = false;
       {
         std::lock_guard<std::mutex> lock(action_mutex_);
-        drained = action_queue_.empty();
+        drained = !has_pending_actions();
       }
 
       if (drained) {
@@ -842,7 +856,7 @@ class execution {
       // An action may queue another, so a pass that drained can leave more behind it. That is the
       // next batch, not the end of this one.
       std::lock_guard<std::mutex> lock(action_mutex_);
-      if (!action_queue_.empty()) {
+      if (has_pending_actions()) {
         return;
       }
     }
@@ -888,9 +902,9 @@ class execution {
         // Bounded: an attached execution has its own list and cannot notify this condition
         // variable.
         action_cv_.wait_for(lock, std::chrono::milliseconds(10),
-                            [this] { return !action_queue_.empty() || !started_; });
+                            [this] { return has_pending_actions() || !started_; });
 
-        if (!started_ && action_queue_.empty()) {
+        if (!started_ && !has_pending_actions()) {
           break;
         }
       }
@@ -915,12 +929,20 @@ class execution {
   // may be queued before run()/start(), but not after stop().
   std::atomic_bool stopped_ = {false};
 
-  // action_queue_, started_ and stopped_ are written by every thread that calls add_action() or
+  // action_actuator_, started_ and stopped_ are written by every thread that calls add_action() or
   // stop() and read by the worker; nothing touches them outside this mutex.
   mutable std::mutex action_mutex_;
   std::condition_variable action_cv_;
 
-  std::deque<queued_action_t> action_queue_;
+  /**
+   * @brief The actions waiting to run, and the only thing that owns them.
+   *
+   * An actuator rather than a container of callables: it is what the rest of this header already
+   * uses to hold actions, and \ref add(action_t&&) moves one in, so a lambda needs no named
+   * variable behind it. It is not synchronised - every access is under action_mutex_, and
+   * \ref execute_actions() moves the whole of it out before running anything.
+   */
+  actuator<queued_action_t> action_actuator_;
 
   /**
    * @brief The actuator type used for attachments: the one type here that does not depend on
@@ -984,11 +1006,11 @@ class execution {
   std::atomic_bool collecting_results_ = {false};
 
   /**
-   * @brief Whether an action that has already left the queue is still running.
+   * @brief Whether a batch that has already been taken out of \ref action_actuator_ is running.
    *
-   * The worker pops under action_mutex_ and runs with the lock released, leaving a window in which
-   * the queue is empty and the execution is anything but idle. This is what closes it for
-   * \ref is_busy().
+   * The worker takes the batch under action_mutex_ and runs it with the lock released, leaving a
+   * window in which nothing is pending and the execution is anything but idle. This is what closes
+   * it for \ref is_busy().
    */
   std::atomic_bool executing_action_ = {false};
 

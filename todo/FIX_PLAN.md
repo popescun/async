@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-23) — reopened by steps 39-47**, of which 39 has landed; group 9
+**Status (2026-09-23) — reopened by steps 39-47**, of which 39 to 45 have landed; group 9
 holds it. Before it: **closed again by step 38.** 37 of 38 steps done, and one
 part-done: 1 to 34 landed or declined with the reasoning recorded, 35 part-done (A landed; B and C
 measured and deferred), 36 and 37 landed, and **38 answers the question steps 21 and 28 left open**
@@ -80,7 +80,7 @@ remains of the group**, and step 33 joins group 7.
 | *(uncommitted)* | 38 — `on_error` carries what an action threw to the caller |
 | *(planned)* | 39-47 — the action queue becomes an actuator |
 
-**NEXT: steps 40-47** — the action queue becomes an actuator; **39 is done**, raised by the user on 2026-09-23 on
+**NEXT: step 46's allocation count** — the action queue is an actuator; **39 to 45 and 47 have landed**, raised by the user on 2026-09-23 on
 the strength of the actuator's `43fefca`. A POC is in `git stash@{0}` and measures 42 of 46;
 group 9 has the analysis and the steps.
 
@@ -210,14 +210,14 @@ of atomic.
 | 38 ✅ | L | what an action throws reaches a log and no code | `:655`, `:762-777`, `:814` | CONFIRMED (test) |
 | **Group 9 — the queue becomes an actuator (open)** |
 | 39 ✅ | api | a moved actuator keeps its action pointers valid | `actuator_test.cpp:1212-1259` | CONFIRMED (58/58; 2 breaks caught) |
-| 40 | api | the drain takes the batch out under the lock | `:736`, `:690` | test in place; red vs the POC (5 races) |
-| 41 | api | a throwing action neither re-runs nor stops its batch | `:736`, `:757-775` | CONFIRMED (2 timeouts) |
-| 42 | api | a dead binding still reaches `on_error` | `actuator.hpp:359` | read-only |
-| 43 | api | one predicate for "is there work" | `:403`, `:836`, `:890` | CONFIRMED (2 failures) |
-| 44 | api | `loop()` wakes on an add again | `:890-893` | read-only |
-| 45 | api | results survive a second batch, written under their mutex | `:726-739`, `:868` | read-only |
-| 46 | api | what the change leaves behind: `<deque>`, docs, allocations | `:13`, `:690`, `:714`, `:1006` | to measure |
-| 47 | api | the gate: Debug, ASan, TSan, clang-format, make_doc.sh | whole repo | — |
+| 40 ✅ | api | the drain takes the batch out under the lock | `:736`, `:690` | CONFIRMED (5 races on the POC) |
+| 41 ✅ | api | a throwing action neither re-runs nor stops its batch | `:736`, `:757-775` | CONFIRMED (1.37M retries on the POC) |
+| 42 ✅ | api | a dead binding still reaches `on_error` | `actuator.hpp:359` | CONFIRMED (stdout on the POC) |
+| 43 ✅ | api | one predicate for "is there work" | `:403`, `:836`, `:890` | CONFIRMED (2 failures on the POC) |
+| 44 ✅ | api | `loop()` wakes on an add again | `:890-893` | CONFIRMED (2263 ms on the POC) |
+| 45 ✅ | api | results survive a second batch, written under their mutex | `:726-739`, `:868` | CONFIRMED (`{2}` on the POC) |
+| 46 | api | what the change leaves behind: `<deque>`, docs, allocations | `:13`, `:739`, `:1009` | sweep done; allocations to measure |
+| 47 ✅ | api | the gate: Debug, ASan, TSan, clang-format, make_doc.sh | whole repo | 51/51 on four presets; 0 doc warnings |
 
 ---
 
@@ -1856,88 +1856,104 @@ build directory of its own — configured out of tree, reusing the async build's
 
 **Left for the async side:** nothing. Step 40 may be written.
 
-### Step 40 · the drain takes the batch out under the lock — TEST IN PLACE, change pending
-`test/async_tests.cpp:254-306` (the case) · `async.hpp:736` (the drain), `:690` (the add)
+### Steps 40 to 45 · the conversion — DONE, as one commit
+`async.hpp:736-800` (the drain), `:690` (the add), `:403` (`is_busy()`), `:880-895` (`loop()`),
+`:923` (the member) · guards written first, then the change
 
-`execute_actions()` moves `actuator_` into a local under `action_mutex_`, leaving the member empty,
-and invokes the local with the lock released. The worker cannot hold the lock across a call - an
-action may queue another, and `on_finished` is documented as doing exactly that - so whatever holds
-the pending actions is being written to while the worker walks it. Taking the batch out is what ends
-that, and it removes the drop window with it: an action added during the batch lands in the
-now-empty member and becomes the next batch.
+**Why one commit.** Steps 41 to 45 are not defects in the header as it was: a throwing action was
+already isolated, `is_busy()` already answered, `loop()` already woke on an add, and a run already
+kept every batch's results. They are the four ways the POC **regressed** it. So each was written as
+a guard - green on the deque, red against the POC - and the conversion then had to keep all of them
+green. Landing 40 on its own would have left the suite red until 45, which the plan's own rule
+forbids.
 
-**The test came first: `execution_queue.queueing_during_a_batch_runs_every_action_exactly_once`.**
-200 actions of 200 µs, queued 100 µs apart, so the worker is inside a batch while the rest arrive;
-every action counts its own runs, and every count has to be exactly 1.
+**The guards, each red against the POC (`git stash@{0}`, built out of tree):**
 
-**It is green on the deque and red against the POC**, which is what makes it a test of this step
-rather than a restatement of the current behaviour:
-
-| Header | Debug | ThreadSanitizer |
+| Step | Case | Against the POC |
 |---|---|---|
-| the deque, as it is today | passes | **clean** |
-| the POC (`git stash@{0}`), built out of tree | passes | **5 data races**, `actuator.hpp:347` against `add()` and a vptr race in `function.h:274` — the worker calling a `std::function` that `reset()` is destroying. Exit **134** under `TSAN_OPTIONS=halt_on_error=1` |
+| 40 | `execution_queue.queueing_during_a_batch_runs_every_action_exactly_once` | **5 data races** under TSan, `actuator.hpp:347` against `add()` and a vptr race in `function.h:274`; exit 134 with `halt_on_error=1` |
+| 41 | `execution_queue.a_throwing_action_runs_once` | never returns - **1,370,266** retry warnings in 8 s |
+| 42 | `execution_binding.a_dead_binding_reaches_on_error` | `on_error` told nothing, and `bind: invalid object` on **stdout**, printed by the actuator |
+| 43 | `execution_busy.a_queued_action_makes_an_execution_busy`, `…is_not_busy_once_its_actions_have_run` | both fail; the second shows `ran` = 0, the wait returned before the action ran |
+| 44 | `execution_queue.a_continuous_worker_is_woken_by_an_add_rather_than_by_its_timeout` | 200 rounds in **2263 ms** against a 1000 ms limit |
+| 45 | `execution_results.keep_the_results_of_every_batch_in_a_run` | `{2}` instead of `{1, 2}` |
 
-The counts alone do not catch it: the POC runs all 200 exactly once here, because the window is
-narrow. **The sanitizer is the assertion** — which is why the case says so in its own doc comment,
-and why `-DASYNC_SANITIZE=thread` is the configuration this step is verified in.
+43's two cases already existed; the other four are new.
 
-**Suite:** 47 of 47 in Debug, 46 of 46 under ThreadSanitizer; clang-format clean.
+**What landed.**
 
-**Left to do:** the change itself, once this case is reviewed.
+`action_queue_` is `actuator<queued_action_t> action_actuator_`, named after what it is as the deque
+was before it. `add_queued_action()` moves the action in with `add(action_t&&)`, so the actuator
+owns it and no named variable stands behind it.
 
-### Step 41 · a throwing action neither re-runs nor stops its batch — TODO
+`execute_actions()` **takes the batch out and runs it outside the lock**:
 
-With step 40 in place, drive the local
-batch action by action through the existing arms. **Red already:** tests 8 and 9, both timing out.
-Add one more: three actions, the middle one throwing, all three run exactly **once** and the batch
-still reports finished.
+```c++
+actuator<queued_action_t> batch;
+{
+  std::lock_guard<std::mutex> lock(action_mutex_);
+  if (!has_pending_actions()) {
+    break;
+  }
+  batch = std::move(action_actuator_);
+  executing_action_ = true;
+}
 
-### Step 42 · a dead binding still reaches `on_error` — TODO
+for (auto* action : batch.actions) {
+  try {
+    execute_action(*action);
+  } catch (...) { ... }
+  ++actions_run_;
+}
+```
 
-Only bites if the fork went the other way, and it
-is why it should not: `actuator::operator()` catches `invalid_action` itself, so `on_error` is never
-told and the text goes to `std::cout`. **Test first:** a binding whose object has been destroyed;
-assert `on_error` receives an `invalid_action` and that **stdout stays empty** — the shape step 38's
-case already uses for stderr.
+Three things follow from it, and they are steps 40, 41 and 45 respectively. The worker never walks a
+list a producer can write to, and never holds `action_mutex_` across caller code that may call
+`add_action()`. The batch is driven **action by action**, through the three catch arms already
+there, so one that throws is dropped where it stands and the rest of the batch still runs - and it
+cannot run twice, because it is not in the member any more. And nothing clears `results_` per batch;
+`execute()` clears it per run, as it always did.
 
-### Step 43 · one predicate for "is there work" — TODO
+`actuator::operator()` is **never called on this path**, which is what settles step 42: the actuator
+catches `invalid_action` itself, prints it to `std::cout` and drops it, so a dead binding driven
+through it would reach neither `on_error` nor stderr. Driving the batch action by action leaves that
+answer where step 38 put it.
 
-`is_busy()` (`:403`), `notify_finished()` (`:836`) and
-`loop()` (`:890`) each ask the deque directly. Replace the three with one private
-`has_pending_actions()`, taken under `action_mutex_`; with step 40 in place "pending" means the member
-actuator, and `executing_action_` covers the batch in flight, as it does today. **Red already:**
-tests 42 and 44.
+**One predicate**, `has_pending_actions()`, replaces the three direct reads of the container -
+`is_busy()`, `notify_finished()` and `loop()`'s wait and break. It reads `action_actuator_` and is
+documented as requiring `action_mutex_`; every caller is inside a `lock_guard` or is the condition
+variable's predicate, which is called with the lock held. `loop()` waking on an add is step 44, and
+it is a one-line consequence of the predicate being right.
 
-### Step 44 · `loop()` wakes on an add again — TODO
+**The invariant under it all is step 39's**: `batch = std::move(action_actuator_)` moves a
+`std::list` of owned actions, so the handles in `actions` still point at live actions afterwards,
+and the member is left empty - `test_move_carries_the_owned_actions_and_empties_the_source` is what
+says so, and the drain's comment cites it.
 
-The condition-variable predicate at `:890` reads the deque,
-so under the POC a continuous worker only wakes on the 10 ms timeout, and the break at `:893` fires
-with actions still pending — saved only by the drain after the loop. No case sees either, because
-they all wait up to 2 s. **Test first:** `stop()` called with an action still queued runs it before
-the worker leaves. Assert that; the wake-up latency is the reason, not the assertion.
+**Verified:** 51 of 51 on all four presets - debug, release, asan, tsan - with
+`ASAN_OPTIONS`/`TSAN_OPTIONS=halt_on_error=1`; clang-format clean. `<deque>` came off the includes
+with the member.
 
-### Step 45 · results survive a second batch, and are written under their mutex — TODO
+**Left of the group:** step 46's re-measurement and step 47's doc gate.
 
-The POC clears `results_`
-per batch, outside `results_mutex_`: a run with two batches loses the first's results, and the clear
-races `results()`. The clear belongs in `execute()` (`:868`), where it already is. **Test first:**
-`on_finished` queues one more action — it runs inside the drain, so the same `execute_actions()`
-loop picks the new action up as a second batch — then assert `results()` holds **both** batches.
+### Step 46 · what the change leaves behind — the sweep DONE, the measurement open
+`async.hpp:13` (the include), `:739`, `:1009` (the comments)
 
-### Step 46 · what the change leaves behind — TODO
+`<deque>` came off with the member. `execute_actions()` no longer says an action "came off the
+queue" - it says the batch - and `executing_action_` is documented as the batch being out of
+`action_actuator_` rather than as a pop. `add_queued_action()` and `actions_run_` read correctly as
+they stand: both are about queueing and about what a pass ran, neither about a container.
+`tools/make_doc.sh`: **0 warnings, 43 pages**.
 
-`<deque>` (`:13`) comes off with the member.
-`execute_action()` (`:714`) stays under "hold only" and goes otherwise. The doc comments on
-`add_queued_action()` (`:690`) and `actions_run_` (`:1006`) both describe a queue and a pop. And
-**re-measure the allocation count** with step 35's harness — 1000 calls through a binding, counting
-`operator new` — and record it here beside step 35 A's 1.01, whatever it says.
+**Still open: the allocation count.** Step 35 A measured **1.01 allocations per queued action** on
+the deque. The actuator allocates an `owned` node and an `actions` node per action, and one
+`std::list` pair per batch besides. Re-measure with step 35's harness - 1000 calls through a binding,
+counting `operator new` - and record the number here beside 1.01, whatever it says.
 
-### Step 47 · the gate — TODO
-
-46 cases plus the new ones, green in Debug, under AddressSanitizer and under
-ThreadSanitizer; `async_smoke_test` exit 0 on all three; clang-format clean; `tools/make_doc.sh` 0
-warnings — a `\ref action_queue_` left anywhere fails the PDF build outright.
+### Step 47 · the gate — DONE for the conversion
+51 of 51 on all four presets: `debug`, `release`, `asan` and `tsan`, the sanitizer ones with
+`ASAN_OPTIONS`/`TSAN_OPTIONS=halt_on_error=1` through `test/CMakePresets.json`. clang-format clean.
+`tools/make_doc.sh` 0 warnings, 43 pages. The gate is re-run when step 46's measurement lands.
 
 **Order:** 39, 40, 41, 43, then 42, 44, 45, and 46 with 47. 40 before 41, because a batch that is not taken out
 of the member cannot be drained twice safely whatever the error handling does.
