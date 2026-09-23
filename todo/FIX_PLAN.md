@@ -1,6 +1,7 @@
 # async.hpp — fix plan
 
-**Status (2026-09-22) — reopened and closed again by step 38.** 37 of 38 steps done, and one
+**Status (2026-09-23) — reopened by steps 39-47**, planned and not started; group 9
+holds it. Before it: **closed again by step 38.** 37 of 38 steps done, and one
 part-done: 1 to 34 landed or declined with the reasoning recorded, 35 part-done (A landed; B and C
 measured and deferred), 36 and 37 landed, and **38 answers the question steps 21 and 28 left open**
 — what the caller is told when an action fails. It came back from the executor repo, which needed
@@ -77,8 +78,13 @@ remains of the group**, and step 33 joins group 7.
 | `26f91ed` | 36 — `run()` and `start()` wait for a resident worker to leave |
 | *(uncommitted)* | 32 — `finishing_` is gone; `is_running()` is `running_` |
 | *(uncommitted)* | 38 — `on_error` carries what an action threw to the caller |
+| *(planned)* | 39-47 — the action queue becomes an actuator |
 
-**NEXT: nothing is outstanding.** Step 38 closed the last question that was anybody's. What is
+**NEXT: steps 39-47** — the action queue becomes an actuator, raised by the user on 2026-09-23 on
+the strength of the actuator's `43fefca`. A POC is in `git stash@{0}` and measures 42 of 46;
+group 9 has the analysis and the steps.
+
+**Before that, nothing was outstanding.** Step 38 closed the last question that was anybody's. What is
 left of the "what happened to the action I gave you" ground is refusal reaching a bound caller,
 recorded under step 21 and not worth its own step until something asks for it.
 Step 35's B and C are recorded and deliberately not taken: B is
@@ -201,6 +207,17 @@ of atomic.
 | 37 ✅ | hyg | test comments carry plan-sized narrative | `test/async_tests.cpp` | read-only |
 | **Group 8 — build (closed)** |
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
+| 38 ✅ | L | what an action throws reaches a log and no code | `:655`, `:762-777`, `:814` | CONFIRMED (test) |
+| **Group 9 — the queue becomes an actuator (open)** |
+| 39 | api | a moved actuator keeps its action pointers valid | `actuator_test.cpp` | to prove |
+| 40 | api | the drain takes the batch out under the lock | `:736`, `:690` | CONFIRMED (13 races) |
+| 41 | api | a throwing action neither re-runs nor stops its batch | `:736`, `:757-775` | CONFIRMED (2 timeouts) |
+| 42 | api | a dead binding still reaches `on_error` | `actuator.hpp:359` | read-only |
+| 43 | api | one predicate for "is there work" | `:403`, `:836`, `:890` | CONFIRMED (2 failures) |
+| 44 | api | `loop()` wakes on an add again | `:890-893` | read-only |
+| 45 | api | results survive a second batch, written under their mutex | `:726-739`, `:868` | read-only |
+| 46 | api | what the change leaves behind: `<deque>`, docs, allocations | `:13`, `:690`, `:714`, `:1006` | to measure |
+| 47 | api | the gate: Debug, ASan, TSan, clang-format, make_doc.sh | whole repo | — |
 
 ---
 
@@ -1737,3 +1754,147 @@ exit 0; clang-format clean; `tools/make_doc.sh` 0 warnings, 43 pages.
 outside this Doxyfile's input — and `make_doc.sh` treats doxygen warnings as errors, so it would have
 failed the build. Written as `untangle::invalid_action`, which is what the header's other mentions
 of it already do.
+
+## Group 9 — the queue becomes an actuator (open)
+
+### Background · `action_queue_` becomes an `actuator` — the POC, measured
+`async.hpp:923` (the deque), `:690` (`add_queued_action()`), `:736` (`execute_actions()`), `:403`
+(`is_busy()`), `:836` (`notify_finished()`), `:883-893` (`loop()`), `:714` (`execute_action()`) ·
+POC measured 2026-09-23 against actuator `43fefca`
+
+Raised by the user on 2026-09-23, out of the actuator's own `43fefca`: `add()` and `connect()` now
+take an action **by value** and move it into `actuator::owned`, so an actuator can hold an anonymous
+lambda with no named variable behind it. That is the one thing that had kept the queue from being an
+actuator, and the header already uses actuators for the other two lists it keeps
+(`actuator_execute_`, `actuator_stop_`).
+
+**The POC is `git stash@{0}`, "POC using actuator instead action queue".** It adds
+`actuator<queued_action_t> actuator_`, queues into it with `add(std::move(action))`, and drains by
+invoking it whole and moving `actuator_.results` into `results_`. Measured, not argued: **42 of 46
+green**, and the four failures are the shape of the work left.
+
+| Failure | What it is |
+|---|---|
+| `execution_queue.an_action_that_throws_does_not_kill_the_worker` — **timeout 120 s** | the throwing action is retried for ever: **129,346 warnings in 2 s** |
+| `execution_queue.what_an_action_throws_reaches_the_caller` — **timeout 120 s** | the same loop |
+| `execution_busy.a_queued_action_makes_an_execution_busy` | `is_busy()` still reads the deque, which is now always empty |
+| `execution_busy.an_execution_is_not_busy_once_its_actions_have_run` | the same, and it shows the cost: `ran` is **0**, the case ran straight past its wait |
+
+**Why the retry loop.** An exception that is not `invalid_action` escapes `actuator::operator()`
+(`actuator.hpp:336-368` has no catch-all), so `actuator_.reset()` is never reached. The list still
+holds **every** action of the batch, the ones that already ran included, and the next pass runs them
+all again — for ever.
+
+**And a data race the suite does not exercise.** The existing suite is TSan-clean under the POC, but
+only because nothing in it adds an action while a batch is in flight. A probe that does — 200
+actions of 200 µs, a producer adding every 100 µs — reports **13 data races**, among them
+`actuator.hpp:347` (the invocation loop) against `add()`, and a **vptr race in `function.h:274`**,
+which is the worker calling a `std::function` that `reset()` is destroying. An actuator is not
+thread-safe and was never meant to be; the header's own attachment actuators are only ever touched
+by one thread. There is a drop window with it: an action added between the end of the invocation and
+`reset()` is destroyed without running. Not observed in 3 × 20,000 — the window is narrow — but it
+is there by construction.
+
+**What it buys, plainly.** Step 35 A measured the deque at **1.01 allocations per queued action**.
+The actuator route allocates an `owned` node and an `actions` node per action on top of the
+callable's own, so this trades allocations for uniformity with the two attachment actuators. That
+is a real trade and worth naming; it is not a defect, and the steps below assume it is wanted.
+
+#### The fork: does the actuator **drive** the batch, or only **hold** it?
+
+Everything below depends on this, so take it first.
+
+- **Hold only** — the drain moves the pending actuator out under the lock, then walks
+  `batch.actions` and calls each action through `execute_action()` inside the three catch arms
+  already at `:757-775`. Per-action isolation, `on_error`, the results push and `actions_run_` all
+  keep exactly the meaning they have. `actuator::operator()` is never called on this path.
+- **Drive** — the drain calls `batch()`. Then three contracts have to be rebuilt **in the actuator
+  repo**, for every one of its users: an action that throws must not abort the rest of the batch
+  (and must not leave the batch un-reset); `invalid_action` must stop being swallowed at
+  `actuator.hpp:359`, where it is written to `std::cout` and dropped, so that step 38's `on_error`
+  can still be told about a dead binding; and that `std::cout` has to go, which steps 18 and 19
+  removed from this repo entirely.
+
+**Recommended: hold only.** It is the whole of the user's stated goal — one owning action list,
+lambdas included — without reopening a contract in another repo that this header's tests pin down.
+
+**The steps.** Each one starts with a test that is red before the change, and is its own commit.
+
+### Step 39 · the invariant the design rests on — TODO
+
+Moving an actuator must keep its `action_t*` pointing at
+live actions: `actions` holds addresses into `owned`, and a `std::list` move transfers nodes rather
+than elements, so the addresses survive. Test it rather than trust it — a case in the actuator
+repo's `actuator_test.cpp` that builds an actuator of owned lambdas, move-constructs and
+move-assigns it, invokes the destination and asserts the results, and asserts the source reports
+`is_connected() == false`. Nothing in async can be written until this is green.
+
+### Step 40 · the drain takes the batch out under the lock — TODO
+
+`execute_actions()` moves `actuator_` into a
+local under `action_mutex_`, leaving the member empty, and invokes the local with the lock
+released. That closes all 13 races and the vptr use-after-destroy, and it removes the drop window:
+an action added during the batch lands in the *member*, which is the next batch. **Test first:** a
+producer thread adding while long-running actions drain, asserting every action ran exactly once —
+it is the probe above, as a case, and it is red under TSan today.
+
+### Step 41 · a throwing action neither re-runs nor stops its batch — TODO
+
+With step 40 in place, drive the local
+batch action by action through the existing arms. **Red already:** tests 8 and 9, both timing out.
+Add one more: three actions, the middle one throwing, all three run exactly **once** and the batch
+still reports finished.
+
+### Step 42 · a dead binding still reaches `on_error` — TODO
+
+Only bites if the fork went the other way, and it
+is why it should not: `actuator::operator()` catches `invalid_action` itself, so `on_error` is never
+told and the text goes to `std::cout`. **Test first:** a binding whose object has been destroyed;
+assert `on_error` receives an `invalid_action` and that **stdout stays empty** — the shape step 38's
+case already uses for stderr.
+
+### Step 43 · one predicate for "is there work" — TODO
+
+`is_busy()` (`:403`), `notify_finished()` (`:836`) and
+`loop()` (`:890`) each ask the deque directly. Replace the three with one private
+`has_pending_actions()`, taken under `action_mutex_`; with step 40 in place "pending" means the member
+actuator, and `executing_action_` covers the batch in flight, as it does today. **Red already:**
+tests 42 and 44.
+
+### Step 44 · `loop()` wakes on an add again — TODO
+
+The condition-variable predicate at `:890` reads the deque,
+so under the POC a continuous worker only wakes on the 10 ms timeout, and the break at `:893` fires
+with actions still pending — saved only by the drain after the loop. No case sees either, because
+they all wait up to 2 s. **Test first:** `stop()` called with an action still queued runs it before
+the worker leaves. Assert that; the wake-up latency is the reason, not the assertion.
+
+### Step 45 · results survive a second batch, and are written under their mutex — TODO
+
+The POC clears `results_`
+per batch, outside `results_mutex_`: a run with two batches loses the first's results, and the clear
+races `results()`. The clear belongs in `execute()` (`:868`), where it already is. **Test first:**
+`on_finished` queues one more action — it runs inside the drain, so the same `execute_actions()`
+loop picks the new action up as a second batch — then assert `results()` holds **both** batches.
+
+### Step 46 · what the change leaves behind — TODO
+
+`<deque>` (`:13`) comes off with the member.
+`execute_action()` (`:714`) stays under "hold only" and goes otherwise. The doc comments on
+`add_queued_action()` (`:690`) and `actions_run_` (`:1006`) both describe a queue and a pop. And
+**re-measure the allocation count** with step 35's harness — 1000 calls through a binding, counting
+`operator new` — and record it here beside step 35 A's 1.01, whatever it says.
+
+### Step 47 · the gate — TODO
+
+46 cases plus the new ones, green in Debug, under AddressSanitizer and under
+ThreadSanitizer; `async_smoke_test` exit 0 on all three; clang-format clean; `tools/make_doc.sh` 0
+warnings — a `\ref action_queue_` left anywhere fails the PDF build outright.
+
+**Order:** 39, 40, 41, 43, then 42, 44, 45, and 46 with 47. 40 before 41, because a batch that is not taken out
+of the member cannot be drained twice safely whatever the error handling does.
+
+**Unchanged, and worth knowing before touching the notification contract:** an action that queues
+another still runs it in the same pass. Probed on both headers — `ran=2 batches=1` either way, so
+the POC does not move that line, it only moves the mechanism from "pop the next" to "the list grew
+while it was being walked".
