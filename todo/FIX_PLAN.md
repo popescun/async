@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-23) — reopened by steps 39-47**, planned and not started; group 9
+**Status (2026-09-23) — reopened by steps 39-47**, of which 39 has landed; group 9
 holds it. Before it: **closed again by step 38.** 37 of 38 steps done, and one
 part-done: 1 to 34 landed or declined with the reasoning recorded, 35 part-done (A landed; B and C
 measured and deferred), 36 and 37 landed, and **38 answers the question steps 21 and 28 left open**
@@ -80,7 +80,7 @@ remains of the group**, and step 33 joins group 7.
 | *(uncommitted)* | 38 — `on_error` carries what an action threw to the caller |
 | *(planned)* | 39-47 — the action queue becomes an actuator |
 
-**NEXT: steps 39-47** — the action queue becomes an actuator, raised by the user on 2026-09-23 on
+**NEXT: steps 40-47** — the action queue becomes an actuator; **39 is done**, raised by the user on 2026-09-23 on
 the strength of the actuator's `43fefca`. A POC is in `git stash@{0}` and measures 42 of 46;
 group 9 has the analysis and the steps.
 
@@ -209,7 +209,7 @@ of atomic.
 | 27 ✅ | F | C++23 raises the toolchain floor; CI may not clear it | `test/CMakeLists.txt:7` | CONFIRMED (CI) |
 | 38 ✅ | L | what an action throws reaches a log and no code | `:655`, `:762-777`, `:814` | CONFIRMED (test) |
 | **Group 9 — the queue becomes an actuator (open)** |
-| 39 | api | a moved actuator keeps its action pointers valid | `actuator_test.cpp` | to prove |
+| 39 ✅ | api | a moved actuator keeps its action pointers valid | `actuator_test.cpp:1212-1259` | CONFIRMED (58/58; 2 breaks caught) |
 | 40 | api | the drain takes the batch out under the lock | `:736`, `:690` | CONFIRMED (13 races) |
 | 41 | api | a throwing action neither re-runs nor stops its batch | `:736`, `:757-775` | CONFIRMED (2 timeouts) |
 | 42 | api | a dead binding still reaches `on_error` | `actuator.hpp:359` | read-only |
@@ -1820,14 +1820,41 @@ lambdas included — without reopening a contract in another repo that this head
 
 **The steps.** Each one starts with a test that is red before the change, and is its own commit.
 
-### Step 39 · the invariant the design rests on — TODO
+### Step 39 · the invariant the design rests on — DONE
+`actuator/test/actuator_test.cpp:1212-1259` · three cases, green on arrival
 
-Moving an actuator must keep its `action_t*` pointing at
-live actions: `actions` holds addresses into `owned`, and a `std::list` move transfers nodes rather
-than elements, so the addresses survive. Test it rather than trust it — a case in the actuator
-repo's `actuator_test.cpp` that builds an actuator of owned lambdas, move-constructs and
-move-assigns it, invokes the destination and asserts the results, and asserts the source reports
-`is_connected() == false`. Nothing in async can be written until this is green.
+Moving an actuator must keep its `action_t*` pointing at live actions: `actions` holds addresses
+into `owned`, and a `std::list` move transfers nodes rather than elements, so the addresses survive.
+Step 40 takes the pending batch out of the shared member with exactly that move, so this is tested
+rather than trusted.
+
+**Three cases, in the actuator repo:**
+
+- `test_move_keeps_the_handles_of_the_source` — the handle `add()` returned, and the one the named
+  overload returned, still equal what the moved-to actuator points at, and the handle is the
+  address of the stored action.
+- `test_move_carries_the_owned_actions_and_empties_the_source` — the destination invokes through
+  both the list and the map, and the source reports `is_connected() == false` with `owned` empty.
+- `test_move_assignment_carries_the_owned_actions` — the same for move assignment, over an actuator
+  that already held an action of its own.
+
+**Green on arrival, 58 of 58**, so they are characterisation rather than repair — which is why they
+were then checked for being vacuous, two ways, both against a patched copy of the header in a
+scratch tree:
+
+| Deliberate break | Result |
+|---|---|
+| `owned` as a `std::vector` | `test_move_keeps_the_handles_of_the_source` and `test_move_carries_the_owned_actions_and_empties_the_source` **fail** — the second `add()` reallocates and the first handle dangles before any move happens |
+| a move constructor that **copies** `owned` and keeps `actions` as it was | `test_move_keeps_the_handles_of_the_source` **fails** |
+
+The first break is the one the actuator's own ownership note already warns about; the second is the
+failure this step exists for, and the case catches it.
+
+**Verified:** 58 of 58 in the actuator repo, Debug; clang-format clean. The actuator repo has no
+build directory of its own — configured out of tree, reusing the async build's googletest:
+`cmake -S actuator/test -B <dir> -G Ninja -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=test/build/_deps/googletest-src`.
+
+**Left for the async side:** nothing. Step 40 may be written.
 
 ### Step 40 · the drain takes the batch out under the lock — TODO
 
