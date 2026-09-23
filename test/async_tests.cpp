@@ -242,6 +242,60 @@ TEST(execution_queue, runs_every_action_queued_while_the_worker_drains) {
 }
 
 /**
+ * @brief Every action queued while a batch is running runs, and runs exactly once.
+ *
+ * The worker cannot hold action_mutex_ across a call - an action may queue another - so it runs
+ * with the lock released, and whatever holds the pending actions is being written to by the caller
+ * while it does. The drain has to take the batch out of that shared object before it walks it.
+ *
+ * @remark Sanitizer-sensitive. The counts below hold even for a drain that walks the shared list,
+ * because the window is narrow; -DASYNC_SANITIZE=thread is what names the race instead.
+ */
+TEST(execution_queue, queueing_during_a_batch_runs_every_action_exactly_once) {
+  constexpr int queued = 200;
+
+  // Value-initialised in place: an atomic is neither copyable nor movable, so the count is the only
+  // thing the vector is ever asked to do.
+  std::vector<std::atomic_int> runs(queued);
+
+  untangle::async::execution_poll poll;
+  const auto exec = void_execution::create_instance("queued_during_a_batch");
+  poll.add(*exec);
+
+  exec->start();
+
+  // Each action outlasts the gap before the next one is queued, so the worker is inside a batch
+  // while the rest arrive - which is the window the drain has to be safe in.
+  for (int i = 0; i < queued; ++i) {
+    ASSERT_TRUE(exec->add_action([&runs, i] {
+      runs[i].fetch_add(1, std::memory_order_relaxed);
+      std::this_thread::sleep_for(200us);
+    })) << "the action was refused at "
+        << i;
+    std::this_thread::sleep_for(100us);
+  }
+
+  const auto all_ran = [&runs] {
+    for (const auto& count : runs) {
+      if (count.load(std::memory_order_relaxed) == 0) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  EXPECT_TRUE(wait_for(all_ran, 5000ms)) << "an action queued while a batch was running never ran";
+
+  for (int i = 0; i < queued; ++i) {
+    EXPECT_EQ(runs[i].load(std::memory_order_relaxed), 1) << "action " << i << " did not run once";
+  }
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms))
+      << "the worker was still running 5s after stop(); the object cannot be destroyed safely";
+}
+
+/**
  * @brief An action queued after stop() never runs.
  *
  * stop() ends the execution's working life: the worker drains what was queued before it and leaves,

@@ -210,7 +210,7 @@ of atomic.
 | 38 ✅ | L | what an action throws reaches a log and no code | `:655`, `:762-777`, `:814` | CONFIRMED (test) |
 | **Group 9 — the queue becomes an actuator (open)** |
 | 39 ✅ | api | a moved actuator keeps its action pointers valid | `actuator_test.cpp:1212-1259` | CONFIRMED (58/58; 2 breaks caught) |
-| 40 | api | the drain takes the batch out under the lock | `:736`, `:690` | CONFIRMED (13 races) |
+| 40 | api | the drain takes the batch out under the lock | `:736`, `:690` | test in place; red vs the POC (5 races) |
 | 41 | api | a throwing action neither re-runs nor stops its batch | `:736`, `:757-775` | CONFIRMED (2 timeouts) |
 | 42 | api | a dead binding still reaches `on_error` | `actuator.hpp:359` | read-only |
 | 43 | api | one predicate for "is there work" | `:403`, `:836`, `:890` | CONFIRMED (2 failures) |
@@ -1856,14 +1856,35 @@ build directory of its own — configured out of tree, reusing the async build's
 
 **Left for the async side:** nothing. Step 40 may be written.
 
-### Step 40 · the drain takes the batch out under the lock — TODO
+### Step 40 · the drain takes the batch out under the lock — TEST IN PLACE, change pending
+`test/async_tests.cpp:254-306` (the case) · `async.hpp:736` (the drain), `:690` (the add)
 
-`execute_actions()` moves `actuator_` into a
-local under `action_mutex_`, leaving the member empty, and invokes the local with the lock
-released. That closes all 13 races and the vptr use-after-destroy, and it removes the drop window:
-an action added during the batch lands in the *member*, which is the next batch. **Test first:** a
-producer thread adding while long-running actions drain, asserting every action ran exactly once —
-it is the probe above, as a case, and it is red under TSan today.
+`execute_actions()` moves `actuator_` into a local under `action_mutex_`, leaving the member empty,
+and invokes the local with the lock released. The worker cannot hold the lock across a call - an
+action may queue another, and `on_finished` is documented as doing exactly that - so whatever holds
+the pending actions is being written to while the worker walks it. Taking the batch out is what ends
+that, and it removes the drop window with it: an action added during the batch lands in the
+now-empty member and becomes the next batch.
+
+**The test came first: `execution_queue.queueing_during_a_batch_runs_every_action_exactly_once`.**
+200 actions of 200 µs, queued 100 µs apart, so the worker is inside a batch while the rest arrive;
+every action counts its own runs, and every count has to be exactly 1.
+
+**It is green on the deque and red against the POC**, which is what makes it a test of this step
+rather than a restatement of the current behaviour:
+
+| Header | Debug | ThreadSanitizer |
+|---|---|---|
+| the deque, as it is today | passes | **clean** |
+| the POC (`git stash@{0}`), built out of tree | passes | **5 data races**, `actuator.hpp:347` against `add()` and a vptr race in `function.h:274` — the worker calling a `std::function` that `reset()` is destroying. Exit **134** under `TSAN_OPTIONS=halt_on_error=1` |
+
+The counts alone do not catch it: the POC runs all 200 exactly once here, because the window is
+narrow. **The sanitizer is the assertion** — which is why the case says so in its own doc comment,
+and why `-DASYNC_SANITIZE=thread` is the configuration this step is verified in.
+
+**Suite:** 47 of 47 in Debug, 46 of 46 under ThreadSanitizer; clang-format clean.
+
+**Left to do:** the change itself, once this case is reviewed.
 
 ### Step 41 · a throwing action neither re-runs nor stops its batch — TODO
 
