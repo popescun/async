@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <print>
@@ -712,25 +713,6 @@ class execution {
   }
 
   /**
-   * @brief Runs one action, keeping its return value when the action type has one and run() asked.
-   *
-   * results_mutex_ is taken only here, after the action has returned, so an action that calls
-   * add_action() never meets it held.
-   */
-  void execute_action(queued_action_t& action) {
-    if constexpr (std::is_void_v<typename actionT::result_type>) {
-      action();
-    } else {
-      auto value = action();
-
-      if (collecting_results_) {
-        std::lock_guard<std::mutex> lock(results_mutex_);
-        results_.push_back(std::move(value));
-      }
-    }
-  }
-
-  /**
    * @brief Runs everything queued, then drives the attached executions.
    *
    * Counts what it ran in \ref actions_run_, which is how \ref notify_finished() tells a batch
@@ -758,33 +740,29 @@ class execution {
         executing_action_ = true;
       }
 
-      for (auto* action : batch.actions) {
-        // Nothing may leave this loop: the actions behind this one still have to run, and an
-        // exception escaping a detached thread function calls std::terminate.
-        try {
-          execute_action(*action);
-        } catch (const invalid_action& ia) {
-          if (!report_error()) {
-            std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
-                         ia.what());
-          }
-        } catch (const std::exception& e) {
-          if (!report_error()) {
-            std::println(stderr, "warning: execution '{}' dropped an action that threw: {}", name,
-                         e.what());
-          }
-        } catch (...) {
-          if (!report_error()) {
-            std::println(stderr,
-                         "warning: execution '{}' dropped an action that threw an unknown type",
-                         name);
-          }
-        }
+      // Counted before the call: a dead binding leaves the list during it.
+      const auto in_the_batch = batch.actions.size();
 
-        // Counted whether it ran cleanly, reported a dead binding, or threw: it was in the batch,
-        // and the batch is what the notification is about.
-        ++actions_run_;
+      // The actions have their own arms inside the actuator; this one is for the work around
+      // them, and for the rule that nothing may leave this loop: an exception escaping a detached
+      // thread function calls std::terminate.
+      try {
+        batch();
+
+        // Empty for a void action type, which is what makes this one line rather than two arms.
+        if (collecting_results_) {
+          std::lock_guard<std::mutex> lock(results_mutex_);
+          std::ranges::move(batch.results, std::back_inserter(results_));
+        }
+      } catch (...) {
+        report_error(std::current_exception());
       }
+
+      for (const auto& thrown : batch.errors) {
+        report_error(thrown);
+      }
+
+      actions_run_ += in_the_batch;
 
       executing_action_ = false;
 
@@ -809,30 +787,36 @@ class execution {
   }
 
   /**
-   * @brief Hands what is being caught to \ref on_error, if the caller assigned one.
+   * @brief Hands what an action threw to \ref on_error, or warns about it when nobody is assigned.
    *
-   * @attention Call only from inside a catch block: it reads std::current_exception(), which is
-   * null anywhere else and would report a handler a null exception it cannot rethrow.
-   *
-   * @return true - a handler ran, and the arm that called this has nothing more to say. false - no
-   * handler is assigned, so the arm prints its warning as it always did.
+   * @param thrown - What the action threw, as the actuator recorded it.
    */
-  bool report_error() {
-    if (!on_error) {
-      return false;
+  void report_error(std::exception_ptr thrown) {
+    if (on_error) {
+      // The handler is the caller's code, on a detached thread; anything escaping it would leave
+      // the thread function and call std::terminate.
+      try {
+        on_error(thrown);
+      } catch (...) {
+        std::println(stderr,
+                     "warning: execution '{}' had on_error throw, and dropped what it threw", name);
+      }
+
+      return;
     }
 
-    // The handler is the caller's code, running on a detached thread inside the try that caught the
-    // action. Anything escaping it would leave the thread function and call std::terminate, so it
-    // is caught here - a caller's broken handler costs its own warning, not the process.
     try {
-      on_error(std::current_exception());
+      std::rethrow_exception(thrown);
+    } catch (const invalid_action& ia) {
+      std::println(stderr, "warning: execution '{}' dropped an invalid action: {}", name,
+                   ia.what());
+    } catch (const std::exception& e) {
+      std::println(stderr, "warning: execution '{}' dropped an action that threw: {}", name,
+                   e.what());
     } catch (...) {
-      std::println(stderr, "warning: execution '{}' had on_error throw, and dropped what it threw",
+      std::println(stderr, "warning: execution '{}' dropped an action that threw an unknown type",
                    name);
     }
-
-    return true;
   }
 
   /**

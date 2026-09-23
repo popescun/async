@@ -1899,25 +1899,33 @@ actuator<queued_action_t> batch;
   executing_action_ = true;
 }
 
-for (auto* action : batch.actions) {
-  try {
-    execute_action(*action);
-  } catch (...) { ... }
-  ++actions_run_;
+batch();  // the actuator invokes its own actions
+
+for (const auto& thrown : batch.errors) {
+  report_error(thrown);
 }
 ```
 
 Three things follow from it, and they are steps 40, 41 and 45 respectively. The worker never walks a
 list a producer can write to, and never holds `action_mutex_` across caller code that may call
-`add_action()`. The batch is driven **action by action**, through the three catch arms already
-there, so one that throws is dropped where it stands and the rest of the batch still runs - and it
-cannot run twice, because it is not in the member any more. And nothing clears `results_` per batch;
-`execute()` clears it per run, as it always did.
+`add_action()`. The batch is driven by **`actuator::operator()`** - the actuator invokes its own
+actions, which is the point of it being one - and an action that throws cannot run twice, because
+the batch it is in is not the member any more. And nothing clears `results_` per batch; `execute()`
+clears it per run, as it always did. What the actions threw comes back in `batch.errors`, and what
+they returned in `batch.results`.
 
-`actuator::operator()` is **never called on this path**, which is what settles step 42: the actuator
-catches `invalid_action` itself, prints it to `std::cout` and drops it, so a dead binding driven
-through it would reach neither `on_error` nor stderr. Driving the batch action by action leaves that
-answer where step 38 put it.
+**Driving it took two changes in the actuator**, made on 2026-09-23 and tested there. Every action
+is isolated now: an exception that is not `invalid_action` used to escape `operator()` mid-batch,
+skipping the actions behind it and leaving the batch un-reset. And what an action threw is recorded
+in the new `actuator::errors`, a `std::exception_ptr` per failure, instead of being written to
+`std::cout` - which is what settles step 42, because a dead binding that is printed reaches neither
+`on_error` nor stderr. `<iostream>` came off the actuator's includes with it.
+
+On this side, `execute_action()` is gone and `report_error()` takes what was thrown rather than
+reading `std::current_exception()`: it hands it to `on_error`, or rethrows it to pick the same three
+warning texts the catch arms used to print. The drain keeps one `catch (...)` of its own - around
+the call and the results move, not around the actions - because nothing may leave a detached thread
+function, and `batch.results` is moved into `results_` there.
 
 **One predicate**, `has_pending_actions()`, replaces the three direct reads of the container -
 `is_busy()`, `notify_finished()` and `loop()`'s wait and break. It reads `action_actuator_` and is
