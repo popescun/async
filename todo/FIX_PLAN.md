@@ -1878,7 +1878,7 @@ forbids.
 | 41 | `execution_queue.a_throwing_action_runs_once` | never returns - **1,370,266** retry warnings in 8 s |
 | 42 | `execution_binding.a_dead_binding_reaches_on_error` | `on_error` told nothing, and `bind: invalid object` on **stdout**, printed by the actuator |
 | 43 | `execution_busy.a_queued_action_makes_an_execution_busy`, `…is_not_busy_once_its_actions_have_run` | both fail; the second shows `ran` = 0, the wait returned before the action ran |
-| 44 | `execution_queue.a_continuous_worker_is_woken_by_an_add_rather_than_by_its_timeout` | 200 rounds in **2263 ms** against a 1000 ms limit |
+| 44 | `execution_queue.a_continuous_worker_is_woken_by_an_add_rather_than_by_its_timeout` | a **10,132 µs** median wake-up against a 2 ms limit |
 | 45 | `execution_results.keep_the_results_of_every_batch_in_a_run` | `{2}` instead of `{1, 2}` |
 
 43's two cases already existed; the other four are new.
@@ -1944,6 +1944,26 @@ says so, and the drain's comment cites it.
 **Verified:** 51 of 51 on all four presets - debug, release, asan, tsan - with
 `ASAN_OPTIONS`/`TSAN_OPTIONS=halt_on_error=1`; clang-format clean. `<deque>` came off the includes
 with the member.
+
+**Step 44's guard was rewritten after CI failed it**, on the macOS runner, at 1019 ms against its
+1000 ms limit. The first version timed 200 rounds of "queue one, wait for it" from the outside, so
+most of what it measured was its own `wait_for()` polling at 1 ms a turn - about 5 ms a round on a
+loaded runner, which is exactly what a worker waiting out a 10 ms timeout looks like. The case could
+not tell them apart.
+
+It measures the **worker's side** now: each action reports how long it waited between being queued
+and running, and the assertion is on the **median over 100 rounds**. That number is the header's
+alone, and the two behaviours are three orders of magnitude apart:
+
+| build | median wake-up |
+|---|---|
+| debug | **4 µs** |
+| ThreadSanitizer | **12 µs** |
+| AddressSanitizer | **16 µs** |
+| the POC, whose predicate reads the empty deque | **10,132 µs** |
+
+The limit is 2 ms: 125x above the slowest sanitizer build, and a fifth of the timeout a polled
+worker waits out.
 
 **Then `77ba66a`**, which is the same drain calling `batch()`. See the fork above: the conversion
 landed twice, and only the second one uses the actuator for what it is.
