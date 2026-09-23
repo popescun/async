@@ -78,11 +78,17 @@ remains of the group**, and step 33 joins group 7.
 | `26f91ed` | 36 — `run()` and `start()` wait for a resident worker to leave |
 | *(uncommitted)* | 32 — `finishing_` is gone; `is_running()` is `running_` |
 | *(uncommitted)* | 38 — `on_error` carries what an action threw to the caller |
-| *(planned)* | 39-47 — the action queue becomes an actuator |
+| `ebb1f1c` (actuator) | 39 — a moved actuator keeps the actions it moved along with |
+| `3761f0e`, `8e1c561` | 40-45 — the presets, and the five guards written before the change |
+| `7e07a51` | 40-45 — the action queue becomes an actuator |
+| `a8b8b47` (actuator) | 42 — an actuator records what its actions throw, and stops printing it |
+| `77ba66a` | 40-45 — the drain lets the actuator invoke its own actions |
+| `050901f`, `3f6c198`, *(uncommitted)* | 46, 47 — the sweep, the measurement and the gate |
 
-**NEXT: nothing in group 9** — the action queue is an actuator; **39 to 47 have landed**, raised by the user on 2026-09-23 on
-the strength of the actuator's `43fefca`. A POC is in `git stash@{0}` and measures 42 of 46;
-group 9 has the analysis and the steps.
+**NEXT: nothing in group 9.** The action queue is an actuator and the actuator drives it; **39 to 47
+have landed**. The group was raised by the user on 2026-09-23 on the strength of the actuator's
+`43fefca`, and the POC it started from is still in `git stash@{0}`, measuring 42 of 46 - it is what
+every guard in the group was written against.
 
 **Before that, nothing was outstanding.** Step 38 closed the last question that was anybody's. What is
 left of the "what happened to the action I gave you" ground is refusal reaching a bound caller,
@@ -1800,23 +1806,20 @@ is there by construction.
 through queue and drain against the deque's 88**, because the drain takes the mutex once per batch
 rather than once per action. More allocations, less lock traffic, and the lock traffic wins.
 
-#### The fork: does the actuator **drive** the batch, or only **hold** it?
+#### The fork: does the actuator **drive** the batch, or only **hold** it? — **decided: drive**
 
-Everything below depends on this, so take it first.
+- **Hold only** — the drain moves the pending actuator out under the lock and walks `batch.actions`
+  itself. Nothing changes outside this repo, and `actuator::operator()` is never called.
+- **Drive** — the drain calls `batch()`. Three contracts then have to hold in the **actuator repo**,
+  for every one of its users: an action that throws must not abort the rest of the batch or leave it
+  un-reset; `invalid_action` must stop being swallowed at `actuator.hpp:359`, where it was written
+  to `std::cout` and dropped, so step 38's `on_error` can still be told about a dead binding; and
+  that `std::cout` has to go, which steps 18 and 19 removed from this repo entirely.
 
-- **Hold only** — the drain moves the pending actuator out under the lock, then walks
-  `batch.actions` and calls each action through `execute_action()` inside the three catch arms
-  already at `:757-775`. Per-action isolation, `on_error`, the results push and `actions_run_` all
-  keep exactly the meaning they have. `actuator::operator()` is never called on this path.
-- **Drive** — the drain calls `batch()`. Then three contracts have to be rebuilt **in the actuator
-  repo**, for every one of its users: an action that throws must not abort the rest of the batch
-  (and must not leave the batch un-reset); `invalid_action` must stop being swallowed at
-  `actuator.hpp:359`, where it is written to `std::cout` and dropped, so that step 38's `on_error`
-  can still be told about a dead binding; and that `std::cout` has to go, which steps 18 and 19
-  removed from this repo entirely.
-
-**Recommended: hold only.** It is the whole of the user's stated goal — one owning action list,
-lambdas included — without reopening a contract in another repo that this header's tests pin down.
+**Landed as "hold only" first, and corrected to "drive" the same day, at the user's call:** an
+actuator that is only storage is not one, and firing the actions it holds is the whole of what it is
+for. The three contracts were rebuilt in the actuator (`a8b8b47`) rather than worked around here -
+see the note under steps 40 to 45. The two commits are `7e07a51` and `77ba66a`.
 
 **The steps.** Each one starts with a test that is red before the change, and is its own commit.
 
@@ -1942,7 +1945,8 @@ says so, and the drain's comment cites it.
 `ASAN_OPTIONS`/`TSAN_OPTIONS=halt_on_error=1`; clang-format clean. `<deque>` came off the includes
 with the member.
 
-**Left of the group:** step 46's re-measurement and step 47's doc gate.
+**Then `77ba66a`**, which is the same drain calling `batch()`. See the fork above: the conversion
+landed twice, and only the second one uses the actuator for what it is.
 
 ### Step 46 · what the change leaves behind — DONE
 `async.hpp:13` (the include), `:739`, `:1009` (the comments)
@@ -1975,10 +1979,15 @@ Step 35 A's own number was 56 ns on a probe that is not this one; the comparison
 two rows above, measured the same way. **If the allocation count is ever the thing that matters more
 than the lock traffic, step 35 B is still recorded and still the answer.**
 
+**Re-measured after `77ba66a`**, which moved the drain from walking `batch.actions` to calling
+`batch()`: 3.00 allocations and a 62 ns median against 61 - the same numbers. Who invokes the
+actions does not move either figure; taking the mutex once per batch is what did.
+
 ### Step 47 · the gate — DONE for the conversion
 51 of 51 on all four presets: `debug`, `release`, `asan` and `tsan`, the sanitizer ones with
 `ASAN_OPTIONS`/`TSAN_OPTIONS=halt_on_error=1` through `test/CMakePresets.json`. clang-format clean.
-`tools/make_doc.sh` 0 warnings, 43 pages. The gate is re-run when step 46's measurement lands.
+`tools/make_doc.sh` 0 warnings, 43 pages. Re-run whole after `77ba66a`, with the actuator's own
+suite beside it: **63 of 63** there, **51 of 51** here.
 
 **Order:** 39, 40, 41, 43, then 42, 44, 45, and 46 with 47. 40 before 41, because a batch that is not taken out
 of the member cannot be drained twice safely whatever the error handling does.
