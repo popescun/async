@@ -1,6 +1,6 @@
 # async.hpp — fix plan
 
-**Status (2026-09-23) — reopened by steps 39-47**, of which 39 to 45 have landed; group 9
+**Status (2026-09-23) — reopened by steps 39-47**, all of which have landed; group 9
 holds it. Before it: **closed again by step 38.** 37 of 38 steps done, and one
 part-done: 1 to 34 landed or declined with the reasoning recorded, 35 part-done (A landed; B and C
 measured and deferred), 36 and 37 landed, and **38 answers the question steps 21 and 28 left open**
@@ -80,7 +80,7 @@ remains of the group**, and step 33 joins group 7.
 | *(uncommitted)* | 38 — `on_error` carries what an action threw to the caller |
 | *(planned)* | 39-47 — the action queue becomes an actuator |
 
-**NEXT: step 46's allocation count** — the action queue is an actuator; **39 to 45 and 47 have landed**, raised by the user on 2026-09-23 on
+**NEXT: nothing in group 9** — the action queue is an actuator; **39 to 47 have landed**, raised by the user on 2026-09-23 on
 the strength of the actuator's `43fefca`. A POC is in `git stash@{0}` and measures 42 of 46;
 group 9 has the analysis and the steps.
 
@@ -216,7 +216,7 @@ of atomic.
 | 43 ✅ | api | one predicate for "is there work" | `:403`, `:836`, `:890` | CONFIRMED (2 failures on the POC) |
 | 44 ✅ | api | `loop()` wakes on an add again | `:890-893` | CONFIRMED (2263 ms on the POC) |
 | 45 ✅ | api | results survive a second batch, written under their mutex | `:726-739`, `:868` | CONFIRMED (`{2}` on the POC) |
-| 46 | api | what the change leaves behind: `<deque>`, docs, allocations | `:13`, `:739`, `:1009` | sweep done; allocations to measure |
+| 46 ✅ | api | what the change leaves behind: `<deque>`, docs, allocations | `:13`, `:739`, `:1009` | measured (3.00/action, 61 ns) |
 | 47 ✅ | api | the gate: Debug, ASan, TSan, clang-format, make_doc.sh | whole repo | 51/51 on four presets; 0 doc warnings |
 
 ---
@@ -1795,10 +1795,10 @@ by one thread. There is a drop window with it: an action added between the end o
 `reset()` is destroyed without running. Not observed in 3 × 20,000 — the window is narrow — but it
 is there by construction.
 
-**What it buys, plainly.** Step 35 A measured the deque at **1.01 allocations per queued action**.
-The actuator route allocates an `owned` node and an `actions` node per action on top of the
-callable's own, so this trades allocations for uniformity with the two attachment actuators. That
-is a real trade and worth naming; it is not a defect, and the steps below assume it is wanted.
+**What it costs, measured at step 46.** Three allocations per queued action against the deque's
+1.01 - the callable's target, the `owned` node and the `actions` node - and **61 ns per action
+through queue and drain against the deque's 88**, because the drain takes the mutex once per batch
+rather than once per action. More allocations, less lock traffic, and the lock traffic wins.
 
 #### The fork: does the actuator **drive** the batch, or only **hold** it?
 
@@ -1936,7 +1936,7 @@ with the member.
 
 **Left of the group:** step 46's re-measurement and step 47's doc gate.
 
-### Step 46 · what the change leaves behind — the sweep DONE, the measurement open
+### Step 46 · what the change leaves behind — DONE
 `async.hpp:13` (the include), `:739`, `:1009` (the comments)
 
 `<deque>` came off with the member. `execute_actions()` no longer says an action "came off the
@@ -1945,10 +1945,27 @@ queue" - it says the batch - and `executing_action_` is documented as the batch 
 they stand: both are about queueing and about what a pass ran, neither about a container.
 `tools/make_doc.sh`: **0 warnings, 43 pages**.
 
-**Still open: the allocation count.** Step 35 A measured **1.01 allocations per queued action** on
-the deque. The actuator allocates an `owned` node and an `actions` node per action, and one
-`std::list` pair per batch besides. Re-measure with step 35's harness - 1000 calls through a binding,
-counting `operator new` - and record the number here beside 1.01, whatever it says.
+**The allocation count, measured 2026-09-23.** Step 35 A had the deque at 1.01 allocations per
+queued action. Both headers measured here with one probe - a counting `operator new`, 1000 calls
+through a binding for the count, 200k queue-and-drain for the time, medians of nine runs at `-O2`:
+
+| header | allocations per queued action | queue + drain |
+|---|---|---|
+| the deque, `7e07a51^` | **1.01** | 88 ns (min 82, max 99) |
+| the actuator, as it is now | **3.00** | **61 ns** (min 49, max 67) |
+
+**Three allocations, and they are all accounted for**: the queued lambda's own target, as before;
+the node `owned` stores the action in; and the node `actions` stores the pointer in. The deque's
+1.01 was one target plus a block amortised across many actions.
+
+**And it is faster anyway, by about 30%.** The drain takes `action_mutex_` once per batch instead of
+once per action, and under load a batch is large - which is worth more here than the two extra
+allocations cost. The figure is the whole path, queue through drain, so it includes the lock traffic
+the deque paid per action.
+
+Step 35 A's own number was 56 ns on a probe that is not this one; the comparison that counts is the
+two rows above, measured the same way. **If the allocation count is ever the thing that matters more
+than the lock traffic, step 35 B is still recorded and still the answer.**
 
 ### Step 47 · the gate — DONE for the conversion
 51 of 51 on all four presets: `debug`, `release`, `asan` and `tsan`, the sanitizer ones with
