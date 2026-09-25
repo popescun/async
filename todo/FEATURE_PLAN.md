@@ -5,8 +5,8 @@ the drain fire it in one call; this is the step after both. `action_actuator_` k
 exactly as they are and gains a **tasks** list beside them — an action bound to its arguments *and*
 to the callback it must notify — reached through a new `add_task()`.
 
-**Status (2026-09-25) — steps 1, 4, 5 and 6 are done, 62 of 62 green; steps 2 and 3 were merged
-into step 1, and step 5 landed with it. Only step 7's commits are left.** The
+**Status (2026-09-25) — CLOSED. Committed as `3bfead5`: steps 1, 4, 5, 6 and 7 done, 62 of 62
+green; steps 2 and 3 were merged into step 1, and step 5 landed with it.** The
 actuator is closed and bumped, so nothing blocks this repo. This is a feature plan, not a fix plan.
 Claims marked **PROBED** were compiled and run on 2026-09-24/25; the rest are read-only and say so.
 
@@ -67,13 +67,13 @@ while entries run, not about ownership, and tasks need it for the same reason.
 
 | # | Step | Sites | Evidence |
 |---|---|---|---|
-| 1 ✅ | `add_task()`, `add_queued_task()`, the drain firing tasks, and `has_pending_actions_or_tasks()` | `:499-534`, `:719-729`, `:758-786`, `:836` | CONFIRMED (8 cases) — **DONE**, hash pending |
+| 1 ✅ | `add_task()`, `add_queued_task()`, the drain firing tasks, and `has_pending_actions_or_tasks()` | `:499-534`, `:719-729`, `:758-786`, `:836` | CONFIRMED (8 cases) — **DONE** (`3bfead5`) |
 | 2 | — merged into step 1, see below | — | — |
 | 3 | — merged into step 1, see below | — | — |
-| 4 ✅ | `is_busy()` and `on_finished` across two kinds | `:816-818`, `:846`, `:903-926`, `:1076-1087` | CONFIRMED (4 cases) — **DONE**, hash pending |
+| 4 ✅ | `is_busy()` and `on_finished` across two kinds | `:816-818`, `:846`, `:903-926`, `:1076-1087` | CONFIRMED (4 cases) — **DONE** (`3bfead5`) |
 | 5 | the suite gains the queued-callback cases — landed with step 1 | `test/async_tests.cpp` | ✅ 8 cases |
-| 6 ✅ | what a queued task promises — the reference and `README.md` | `:203-207`, `:493-497`, `:683-689`, `:706-710` | transcription, nothing open — **DONE**, hash pending |
-| 7 | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **part done** — only the commits are left |
+| 6 ✅ | what a queued task promises — the reference and `README.md` | `:203-207`, `:493-497`, `:683-689`, `:706-710` | transcription, nothing open — **DONE** (`3bfead5`) |
+| 7 ✅ | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **DONE** (`3bfead5`, `a6ef912`) |
 
 ### Step 1 ✅ · the door, the drain and the predicate — DONE
 
@@ -226,16 +226,16 @@ question waiting on the caller, and cost a round trip asking whether one was.
 now carries `task not added` after `stop()` and `refused a task that cannot report`, the second with
 the note that it is caught while the caller is still on the stack.
 
-### Step 7 · the reference and the commits — PART DONE
+### Step 7 ✅ · the reference and the commits — DONE
 
 **Done: `README.md` and `doc/refman.pdf`.** The reference was rebuilt at every step rather than once
 at the end, so it never drifted — 45 pages when step 1 started, 47 now. `README.md` gained a tasks
 section and the two new warnings, in step 6.
 
-**Left: the commits.** Steps 1, 4, 5 and 6 are one tree across four files. A message covering them
-is written and handed over; the shape is the same question the actuator answered by doing it —
-one commit for the feature rather than one per step, because every step was reviewed at its **red
-test** rather than at its commit.
+**Done: the commits.** Steps 1, 4, 5 and 6 landed together as `3bfead5`, with the header, the 12
+cases, `README.md` and the reference — one commit for the feature rather than one per step, the
+same shape the actuator took and for the same reason: every step was reviewed at its **red test**
+rather than at its commit. The actuator's own bump, `ef93437`, is `a6ef912`.
 
 **The bump `executor` takes was never this repo's, and listing it here was the same error the
 actuator's step 7 made.** `executor` records async's commit in `executor`'s own tree, so moving that
@@ -284,11 +284,14 @@ with its own fix. The plan's own updates are their own commit, and always a late
 
 | Commit | Step |
 |---|---|
-| hash pending | 1 — `add_task()`, the drain, the predicate, and 8 cases (steps 2 and 3 merged in) |
-| hash pending | 4 — both kinds counted, `actions_and_tasks_run_`, and 4 cases |
-| hash pending | 6 — the reference and `README.md` |
+| `3bfead5` | 1, 4, 5 and 6 — the queue on two kinds, 12 cases, `README.md` and the reference |
+| `a6ef912` | 7 — the actuator bumped to `ef93437`, the tip whose plan is closed |
 
-**NEXT: `executor`, once these are committed.** Everything here but the commits is done. Its plan
+**CLOSED.** Every step is done or merged, and all of it is in `3bfead5`. 62 of 62 green,
+clang-format clean, doxygen clean, `README.md` and `doc/refman.pdf` current. Nothing here is
+outstanding and nothing here blocks anything.
+
+**NEXT is `executor`.** Its plan
 opens on a naming decision — whether the pool's existing `add_task()` becomes `add_action()` so the
 two repos read alike — and on a question this repo's step 1 raised: the pool's own queue is
 documented as first in, first out across both kinds, while a pass here runs every action before any
