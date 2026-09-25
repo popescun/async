@@ -55,7 +55,7 @@ deletions it advertised do not happen:
 | `queued_action_t` (`:660`) | the nullary carrier for a queued action | **kept, unchanged** |
 | `action_actuator_` (`:918`) | `actuator<queued_action_t>` | same type, now also holding tasks — `task<R>` where `R` is `queued_action_t::result_type` |
 | `add_action()` (`:495`) | `std::bind` into the actions list | **unchanged** |
-| `add_task()` | — | new: `bind_task(action, callback, args...)` into the tasks list |
+| `add_task()` | — | new: `bind_task(action, args..., callback)` into the tasks list |
 | the drain (`:750`) | `batch()` | `batch()`, then `batch.call_tasks()` |
 | `in_the_batch` (`:744`) | `batch.actions.size()` | plus `batch.tasks.size()` |
 
@@ -66,23 +66,30 @@ while entries run, not about ownership, and tasks need it for the same reason.
 
 | # | Step | Sites | Evidence |
 |---|---|---|---|
-| 1 | `add_task(action, callback, args...)`, onto `actuator::add_task()` | beside `:495`, `:697` | read-only |
+| 1 | `add_task(action, args..., callback)`, onto `actuator::add_task()` | beside `:495`, `:697` | read-only |
 | 2 | the drain fires tasks after actions, and counts both | `:744`, `:750`, `:765` | read-only |
 | 3 | `has_pending_actions()` accounts for tasks | `:686`, `:735` | blocked on the actuator's step 6 |
 | 4 | `is_busy()` and `on_finished` across two kinds | `:403`, `:823-840` | **read-only, and the one to think about** |
 | 5 | the suite gains the queued-callback cases | `test/async_tests.cpp` | — |
-| 6 | what a queued task promises — the reference | `:474-492`, `:634`, `:651-655` | decision |
+| 6 | what a queued task promises, and that the last argument is the callback — the reference | `:474-492`, `:634`, `:651-655` | decision |
 | 7 | `tools/make_doc.sh`, the actuator bump, and the bump `executor` takes | `doc/` | — |
 
 ### Step 1 · the new door
 
 ```c++
-template <typename callback_t, typename... Args>
-bool add_task(actionT action, callback_t callback, Args&&... args) {
+template <typename... Args>
+bool add_task(actionT action, Args&&... args) {
   return add_queued_task(
-      untangle::bind_task(std::move(action), std::move(callback), std::forward<Args>(args)...));
+      untangle::bind_task(std::move(action), std::forward<Args>(args)...));
 }
 ```
+
+**The callback is the last of `args`, and this signature never says so.** It cannot: a pack cannot
+be followed by a deducible parameter, which is why `untangle::bind_task()` splits the last element
+off itself. The split is paid once, there, and this door is a pure forward — the same shape
+`add_action()` (`:495-497`) already has, one word apart. What the reference here owes is the rule the
+signature cannot state: **the last argument is the callback**, and a missing or unusable one is a
+`static_assert` inside `bind_task`, not a silent no-op.
 
 `add_queued_task()` mirrors `add_queued_action()` (`:697`) exactly — the same `stopped_` check, the
 same warning, the same `false`, the same `notify_one()`. Both answers mean what they meant before:
@@ -124,6 +131,10 @@ with no pool in sight.
 
 - **`add_action()` does not notify.** One line at `:474-492`, pointing at `add_task()`. It is the
   question every reader of the actuator's callback convention will arrive with.
+- **`add_task()`'s last argument is the callback**, and the signature cannot say so because the pack
+  runs to the end. It has to be said in prose, with the `void()` form for a void action named
+  explicitly — a reader who has only seen the actions convention will expect a callback to be
+  optional and to be recognised by its type, and here it is neither.
 - **The callback runs on the worker's thread**, inside the drain, before `on_finished` (`:634`).
   The same warning `on_error` (`:651-655`) already carries, for the same reason.
 - **A throwing callback reaches `on_error`**, because it runs inside the actuator's `try` and its
@@ -137,10 +148,10 @@ with no pool in sight.
 
 An earlier draft carried a step marked *the one that can send the chain back*:
 `bind_action_and_method()` (`:325`) and `bind_action_and_function()` (`:361`) hold their action in a
-`std::shared_ptr<const actionT>`, while `bind_task()` takes the action by value — so routing
-`add_action()` through `bind_task()` would have needed a wrapper type naming `result_type`, and the
-shape of that wrapper could have forced the actuator's `bind_task` signature to change after it had
-landed.
+`std::shared_ptr<const actionT>`, while `bind_task()` takes the action by value and reads
+`result_type` off it — so routing `add_action()` through `bind_task()` would have needed a wrapper
+type naming `result_type`, and the shape of that wrapper could have forced the actuator's
+`bind_task` signature to change after it had landed.
 
 **It is gone.** `add_action()` no longer routes through `bind_task()` — it keeps `std::bind` and
 `add_queued_action()` untouched — so the two bindings are not touched at all. Nothing in this repo
