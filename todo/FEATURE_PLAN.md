@@ -5,9 +5,10 @@ the drain fire it in one call; this is the step after both. `action_actuator_` k
 exactly as they are and gains a **tasks** list beside them — an action bound to its arguments *and*
 to the callback it must notify — reached through a new `add_task()`.
 
-**Status (2026-09-25) — nothing written, and blocked on the actuator.** This is a feature plan, not
-a fix plan. Claims marked **PROBED** were compiled and run on 2026-09-24/25; the rest are read-only
-and say so.
+**Status (2026-09-25) — steps 1, 4, 5 and 6 are done, 62 of 62 green; steps 2 and 3 were merged
+into step 1, and step 5 landed with it. Only step 7's commits are left.** The
+actuator is closed and bumped, so nothing blocks this repo. This is a feature plan, not a fix plan.
+Claims marked **PROBED** were compiled and run on 2026-09-24/25; the rest are read-only and say so.
 
 **This is the second of three.** `actuator/todo/FEATURE_PLAN.md` holds the mechanism and must land
 and be bumped first; `todo/FEATURE_PLAN.md` in `executor` holds the pool and the two cases that
@@ -66,57 +67,111 @@ while entries run, not about ownership, and tasks need it for the same reason.
 
 | # | Step | Sites | Evidence |
 |---|---|---|---|
-| 1 | `add_task(action, args..., callback)`, onto `actuator::add_task()` | beside `:495`, `:697` | read-only |
-| 2 | the drain fires tasks after actions, and counts both | `:744`, `:750`, `:765` | read-only |
-| 3 | `has_pending_actions()` accounts for tasks | `:686`, `:735` | blocked on the actuator's step 6 |
-| 4 | `is_busy()` and `on_finished` across two kinds | `:403`, `:823-840` | **read-only, and the one to think about** |
-| 5 | the suite gains the queued-callback cases | `test/async_tests.cpp` | — |
-| 6 | what a queued task promises, and that the last argument is the callback — the reference | `:474-492`, `:634`, `:651-655` | decision |
-| 7 | `tools/make_doc.sh`, the actuator bump, and the bump `executor` takes | `doc/` | — |
+| 1 ✅ | `add_task()`, `add_queued_task()`, the drain firing tasks, and `has_pending_actions_or_tasks()` | `:499-534`, `:719-729`, `:758-786`, `:836` | CONFIRMED (8 cases) — **DONE**, hash pending |
+| 2 | — merged into step 1, see below | — | — |
+| 3 | — merged into step 1, see below | — | — |
+| 4 ✅ | `is_busy()` and `on_finished` across two kinds | `:816-818`, `:846`, `:903-926`, `:1076-1087` | CONFIRMED (4 cases) — **DONE**, hash pending |
+| 5 | the suite gains the queued-callback cases — landed with step 1 | `test/async_tests.cpp` | ✅ 8 cases |
+| 6 ✅ | what a queued task promises — the reference and `README.md` | `:203-207`, `:493-497`, `:683-689`, `:706-710` | transcription, nothing open — **DONE**, hash pending |
+| 7 | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **part done** — only the commits are left |
 
-### Step 1 · the new door
+### Step 1 ✅ · the door, the drain and the predicate — DONE
+
+`async.hpp:499-534` (`add_task()`), `:719-729` (`has_pending_actions_or_tasks()`), `:758-786`
+(`add_queued_task()`), `:836` (the drain). Eight cases at `test/async_tests.cpp:440-657`. 58 of
+58 green, clang-format clean, doxygen clean, `doc/refman.pdf` at 45 pages.
+
+**Steps 1, 2 and 3 were merged, because they are one behaviour and not three.** The plan had them
+separate and its own Order section half-knew better — "each is small and the file does not build
+between them". Reading the drain first, as this plan instructed, showed the reason is worse than
+compilation:
 
 ```c++
-template <typename... Args>
-bool add_task(actionT action, Args&&... args) {
-  return add_queued_task(
-      untangle::bind_task(std::move(action), std::forward<Args>(args)...));
+if (!has_pending_actions()) {   // step 3: actions only, so a queued task means "nothing here"
+  break;
 }
+batch = std::move(action_actuator_);
+...
+batch();                        // step 2: fires actions, never tasks
 ```
 
-**The callback is the last of `args`, and this signature never says so.** It cannot: a pack cannot
-be followed by a deducible parameter, which is why `untangle::bind_task()` splits the last element
-off itself. The split is paid once, there, and this door is a pure forward — the same shape
-`add_action()` (`:495-497`) already has, one word apart. What the reference here owes is the rule the
-signature cannot state: **the last argument is the callback**, and a missing or unusable one is a
-`static_assert` inside `bind_task`, not a silent no-op.
+After step 1 alone a queued task is invisible to the predicate, the loop breaks at once, the task
+never runs, and `is_busy()` reports the execution idle. **Its only observable surface would have
+been `add_task()`'s own `bool`** — and cases asserting that could not tell a working implementation
+from one that drops the task on the floor, because both answer `true`. Three small pieces, one
+review, because there is one claim: a task queued here runs and notifies.
 
-`add_queued_task()` mirrors `add_queued_action()` (`:697`) exactly — the same `stopped_` check, the
-same warning, the same `false`, the same `notify_one()`. Both answers mean what they meant before:
-**a stopped execution refuses and drops**, and a dropped task never notifies, which is a thing the
-reference has to say plainly now that a caller is relying on being told.
+**What landed:**
 
-### Step 3 · blocked on the actuator's step 6
+- `add_task(action, args..., callback)` — a pure forward to `untangle::bind_task()`, the same shape
+  `add_action()` (`:495-497`) has, one word apart. The callback is the last of `args` and the
+  signature cannot say so, so the documentation does.
+- `add_queued_task()` — mirrors `add_queued_action()` (`:797`) with **one refusal more**: the
+  actuator turns away a task with nothing to run or no callback to notify, and that answer is
+  passed straight back rather than swallowed, under its own warning.
+- `has_pending_actions_or_tasks()` — **renamed**, not merely extended. It answers two questions
+  now, and a name saying only the first would have been the kind of thing a reader trusts and is
+  wrong about. Seven call sites.
+- The drain — `batch.call_tasks()` after `batch()`, inside the same `try`.
 
-`has_pending_actions()` (`:686`) answers from `action_actuator_.is_connected()`, which reads
-`actions` and `actions_map`. Once tasks are queued, a batch of tasks with no actions reports itself
-empty and the drain `break`s at `:735` **with work still queued** — the worker then parks on
-`action_cv_` and the tasks sit there until something else wakes it.
+**Actions run before tasks within a batch. Decided 2026-09-25.** One pass fires every action the
+actuator holds and then every task, so the two kinds do not interleave in the order they were
+queued; across batches the queue is still first in, first out. `a_batch_runs_its_actions_before
+_its_tasks` states it, with a message pointing at the drain as the place it would change.
 
-One line here, but which line depends on the actuator: `is_connected()` extended to include tasks,
-or a new `has_tasks()` read alongside. **Do not write this step until that is settled.**
+> **It differs from what `executor`'s plan says of its own queue**, where first in, first out across
+> both kinds is called "the behaviour, not an implementation detail". The two are different queues
+> and may legitimately differ — the pool's `pending_` is one container it controls, while this is an
+> actuator fired in two calls — but if they should agree, the change is here and in the actuator,
+> and the actuator is closed. Worth settling before `executor`'s own steps are written.
 
-### Step 4 · what "busy" and "finished" mean with two kinds
+**`actions_run_` is deliberately untouched**, which leaves step 4 a real defect rather than a
+read-only note: it counts `batch.actions.size()`, so a pass that ran only tasks counts zero and
+`notify_finished()` suppresses `on_finished` entirely.
 
-The one place where two kinds is more than bookkeeping, and it is read-only so far:
+### Steps 2 and 3 — merged into step 1
 
-- `is_busy()` (`:403`) answers from `executing_action_` and `has_pending_actions()`. It must be
-  true while a task is in flight, or the pool above reads an idle worker and hands it more.
-- `notify_finished()` (`:823-827`) suppresses `on_finished` when `actions_run_ == 0`. A pass that
-  ran only tasks must not count as having run nothing.
-- **A task's callback fires before `on_finished`**, inside `call_tasks()`, which is inside the
-  drain. Two notifications with different meanings now exist on the same thread — one per task,
-  one per drained queue — and the reference has to keep them apart.
+Kept as numbers so the Order section and the async entries in the other two plans still resolve.
+What they were is in step 1: the drain firing tasks after actions, and the predicate it reads
+seeing them. The actuator's step 6 unblocked the second, and `has_tasks()` is what it now calls.
+
+### Step 4 ✅ · what "busy" and "finished" mean with two kinds — DONE
+
+`async.hpp:816-818` (the count), `:846` (the add), `:903-926` (`notify_finished()`), `:1076-1087`
+(the member). Four cases at `test/async_tests.cpp:660-746`. 62 of 62 green, clang-format clean,
+doxygen clean, `doc/refman.pdf` at 45 pages.
+
+**Three of the four cases passed before the fix**, which is what made them worth writing: they are
+the constraints the fix had to respect, not the thing being fixed.
+
+| Case | Before | What it holds the fix to |
+|---|---|---|
+| `reports_finishing_a_pass_that_ran_only_tasks` | **failed** | the defect itself |
+| `reports_finishing_a_pass_of_both_kinds_once` | passed | not once per *kind* — the obvious wrong fix |
+| `an_idle_continuous_worker_still_reports_nothing` | passed | zero still means zero — the rule the count exists for, which dropping it would break |
+| `a_queued_task_makes_the_execution_busy` | passed | what step 1's rename gave, asserted nowhere until now |
+
+So the shape was constrained from three sides at once: count both kinds, keep the total per *pass*,
+and keep an idle worker silent.
+
+**The fix is one line of arithmetic.** `const auto in_the_batch = batch.actions.size() +
+batch.tasks.size();` — and both sizes have to be read at that point for different reasons: the
+actions list shrinks *during* `operator()` when a dead binding is dropped, and the tasks list is
+emptied outright by `call_tasks()`.
+
+**`actions_run_` is renamed `actions_and_tasks_run_`**, on the precedent set by
+`has_pending_actions_or_tasks()`: it decides `on_finished` for both kinds now, and a name saying
+only the first is the kind a reader trusts and is wrong about. Private, five call sites.
+
+**`is_busy()` needed nothing**, as the note above had already concluded — step 1's rename is what
+made it see a queued task. `a_queued_task_makes_the_execution_busy` is there because that was true
+by inheritance and asserted nowhere, and a later change to the predicate would otherwise break the
+pool above in silence.
+
+> **What the reference still owes, and it is step 6's**: a task's callback fires **before**
+> `on_finished`, inside `call_tasks()`, inside the drain. Two notifications with different meanings
+> now run on the same thread — one per task, one per drained queue — and nothing yet tells a caller
+> which is which.
 
 ### Step 5 · the cases
 
@@ -127,22 +182,71 @@ void-returning task notifying with `void()`, which is the half no pool case cove
 They belong here and not only in `executor`, because a caller using `execution` directly meets this
 with no pool in sight.
 
-### Step 6 · what the reference has to say
+### Step 6 ✅ · what the reference has to say — DONE
 
-- **`add_action()` does not notify.** One line at `:474-492`, pointing at `add_task()`. It is the
-  question every reader of the actuator's callback convention will arrive with.
-- **`add_task()`'s last argument is the callback**, and the signature cannot say so because the pack
-  runs to the end. It has to be said in prose, with the `void()` form for a void action named
-  explicitly — a reader who has only seen the actions convention will expect a callback to be
-  optional and to be recognised by its type, and here it is neither.
-- **The callback runs on the worker's thread**, inside the drain, before `on_finished` (`:634`).
-  The same warning `on_error` (`:651-655`) already carries, for the same reason.
-- **A throwing callback reaches `on_error`**, because it runs inside the actuator's `try` and its
-  exception lands in `batch.errors`, which `:769` walks into `report_error()`. So `on_error` can
-  fire for a task whose body succeeded.
-- **A task that throws does not notify. Finished does not mean failed**, decided 2026-09-25, and
-  documented as a choice rather than an omission.
-- **A refused task does not notify**, because it never ran.
+`async.hpp:203-207` (the class doc), `:493-497` (`add_action()`), `:683-689` (`on_finished`),
+`:706-710` (`on_error`), and `README.md` — a `## tasks: work that reports back` section plus the two
+new warnings in *queueing and lifetime*. 62 of 62 green, clang-format clean, doxygen clean,
+`doc/refman.pdf` at 47 pages.
+
+**The Evidence column said "decision", and by the time this step was reached there was nothing left
+to decide.** That label was accurate when the step was written — every rule below was open — and
+stale by the time it was read. All of them had been settled in an earlier step, which is what a
+documentation step should be: transcription, not choice.
+
+| Rule | Settled in |
+|---|---|
+| `add_action()` does not notify | decided 2026-09-25 — `add_action()` stays callback-free |
+| the last argument is the callback | decided 2026-09-25 — callback-last |
+| finished does not mean failed | the actuator's step 4 |
+| a throwing callback reaches `on_error` | the actuator's step 4 |
+| a task's result goes only to its callback; errors are appended | the actuator's step 4 |
+| `on_finished` fires for a task-only pass | this repo's step 4 |
+| a refused task never notifies | this repo's step 1 |
+
+**Worth keeping as method:** an Evidence column entry is a claim about the state of a step *when it
+is read*, not when it is written. "decision" left standing after the decision was made reads as a
+question waiting on the caller, and cost a round trip asking whether one was.
+
+**What the header now says**, beyond the rules listed above:
+
+- The class doc names the two kinds and why a task carries its own callback — a queued call has no
+  invocation left for the actuator's convention to read one from.
+- `add_action()` says it notifies nobody, **and** that a trailing callable passed to it is an
+  ordinary argument of the action. That is the mistake a reader of the actuator's convention will
+  arrive ready to make.
+- `on_finished` says it is raised **once per pass, not once per piece of work**, that a task-only
+  pass raises it like any other, and that it must not be read as "my task finished" — the task's own
+  callback has already run by then, inside the same drain and on the same thread. That was the
+  blockquote step 4 handed forward, and it is discharged.
+- `on_error` says a task's failure arrives there, and so does its callback's — so it can fire for a
+  task whose action **succeeded**: the work was done and only the telling failed.
+
+**The README's *queueing and lifetime* section listed the stderr warnings for actions only**, so it
+now carries `task not added` after `stop()` and `refused a task that cannot report`, the second with
+the note that it is caught while the caller is still on the stack.
+
+### Step 7 · the reference and the commits — PART DONE
+
+**Done: `README.md` and `doc/refman.pdf`.** The reference was rebuilt at every step rather than once
+at the end, so it never drifted — 45 pages when step 1 started, 47 now. `README.md` gained a tasks
+section and the two new warnings, in step 6.
+
+**Left: the commits.** Steps 1, 4, 5 and 6 are one tree across four files. A message covering them
+is written and handed over; the shape is the same question the actuator answered by doing it —
+one commit for the feature rather than one per step, because every step was reviewed at its **red
+test** rather than at its commit.
+
+**The bump `executor` takes was never this repo's, and listing it here was the same error the
+actuator's step 7 made.** `executor` records async's commit in `executor`'s own tree, so moving that
+pointer is a change to `executor`, made in `executor`, and its plan owns it. Struck from here rather
+than tracked in two places — a step that waits on another repo's commit can never close on its own
+terms.
+
+> **Record the hash once, and only once the commit is final.** The actuator's plan had to write its
+> hash three times: two amends rewrote the commit the plan was citing, and each rewrite left a dozen
+> citations pointing at a commit no branch reached. A plan's own update belongs in a **later**
+> commit, and the number belongs in that one.
 
 ## What is no longer a risk
 
@@ -180,6 +284,13 @@ with its own fix. The plan's own updates are their own commit, and always a late
 
 | Commit | Step |
 |---|---|
-| — | nothing landed, and nothing can until the actuator is green and bumped |
+| hash pending | 1 — `add_task()`, the drain, the predicate, and 8 cases (steps 2 and 3 merged in) |
+| hash pending | 4 — both kinds counted, `actions_and_tasks_run_`, and 4 cases |
+| hash pending | 6 — the reference and `README.md` |
 
-**NEXT: not here.** The actuator's step 1. Read step 4 before this repo's step 1 is written.
+**NEXT: `executor`, once these are committed.** Everything here but the commits is done. Its plan
+opens on a naming decision — whether the pool's existing `add_task()` becomes `add_action()` so the
+two repos read alike — and on a question this repo's step 1 raised: the pool's own queue is
+documented as first in, first out across both kinds, while a pass here runs every action before any
+task. The two are different queues and may differ, but it should be a decision rather than a
+discovery.

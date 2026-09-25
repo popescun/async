@@ -161,6 +161,20 @@ never run, and the refusal is reported:
 warning: execution 'continuous' is stopped, action not added
 ```
 
+A task is refused after `stop()` for the same reason, and says so in its own words:
+
+```
+warning: execution 'continuous' is stopped, task not added
+```
+
+A task is also refused before it is ever queued if it could not do its job — no callback to notify,
+or nothing to run. That one is the caller's own mistake and is caught while they are still on the
+stack, rather than surfacing later as a failure of a task whose action had in fact succeeded:
+
+```
+warning: execution 'continuous' refused a task that cannot report
+```
+
 An action bound to an object that has since been destroyed is dropped the same way, rather than
 ending the process:
 
@@ -177,6 +191,36 @@ running blocks until the worker is finished rather than leaving it reading freed
 destructor - from every poll it was added to, since it may be in more than one. A poll destroyed
 first likewise releases what it still holds, so a poll may be a local. `execution_poll::remove()` is
 available for withdrawing one earlier; calling it is not required.
+
+## tasks: work that reports back
+
+Everything above queues **actions**, through `add_action()`. An action is fire and forget: it runs, what it returns is dropped, and the caller hears nothing more about it. A **task**, through `add_task()`, carries the callback it must notify:
+
+```c++
+auto exec = untangle::async::execution<std::function<int(int)>>::create_instance("scale");
+exec->start();
+
+// the callback comes last, after the arguments the action is bound to
+exec->add_task([](int n) { return n * 2; }, 21, [](int result) { /* result == 42 */ });
+```
+
+A task whose action returns `void` still reports that it finished, with a callback taking nothing — *finished* is the message and the result is optional:
+
+```c++
+exec->add_task([](int by) { /* ... */ }, 5, [] { /* finished */ });
+```
+
+**The callback is the last argument, and the signature cannot say so.** A parameter pack cannot be followed by a deducible parameter, so it arrives inside the arguments and `untangle::bind_task()` splits it off. It must be callable with the action's result and return nothing — or callable with nothing at all, when the action returns void. A missing or unusable one is a compile error rather than silence.
+
+**Why a task carries its own callback rather than being handed one.** The actuator has a callback convention already: pass a trailing callable to an actuator's call operator and it is invoked with each action's result. That convention reads the trailing argument of an *invocation*, and a queued call has no invocation left to read from — so the callback has to travel with the work. That is what a task is.
+
+**`add_task()` answers `bool`, and the answer is the whole report.** It refuses a task the execution can never run — because it is stopped — or one that could never do its job: no callback to notify, or nothing to run. A refused task is dropped, so it never runs and never notifies, and a caller waiting on the callback alone would wait for ever.
+
+**Finished does not mean failed.** A task whose action throws is *not* notified: there is no result to hand over, and for a void task no completion to report either. What it threw goes to `on_error`, as a failing action's does. And because a callback runs inside the same `try` as the task that owns it, `on_error` can fire for a task whose action in fact succeeded — the work was done and only the telling failed.
+
+**`on_finished` is not a task's callback.** It is raised once per *pass*, when the queue has drained, and a pass that ran only tasks raises it like any other. A task's own callback has already run by then, inside the same drain and on the same thread. Two notifications, two meanings: one per task, one per drained queue.
+
+Both kinds share one queue and one worker. Within a single pass every action runs before any task, so the two do not interleave in the order they were queued; across passes the queue is still first in, first out.
 
 ## building the tests
 

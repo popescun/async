@@ -16,8 +16,10 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -436,6 +438,313 @@ TEST(execution_queue, tells_the_caller_when_an_action_is_refused) {
  * The throwing action is dropped with a warning naming the execution, the actions before and behind
  * it still run, and the batch still reports that it drained.
  */
+// --- tasks on the queue --------------------------------------------------------------------------
+// An execution's queue holds two kinds. An action is fire-and-forget: add_action() queues it and
+// the caller hears nothing more. A task carries the callback it must notify, built by
+// untangle::bind_task() with the callback as its last argument, and add_task() queues it. The
+// drain fires the actions with operator() and then the tasks with call_tasks().
+//
+// Queueing, draining and the predicate the drain reads are one behaviour and not three: a task the
+// drain cannot see is a task that never runs, so the cases below cover all of it at once. See
+// todo/FEATURE_PLAN.md step 1.
+
+TEST(execution_queue, runs_a_task_and_notifies_its_callback) {
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("task_notifies");
+  poll.add(*exec);
+
+  std::atomic_int reported = {-1};
+  std::atomic_bool ran = {false};
+
+  exec->start();
+  ASSERT_TRUE(exec->add_task(
+      std::function<int(int)>([&ran](int n) {
+        ran = true;
+        return n * 2;
+      }),
+      21, std::function<void(int)>([&reported](int result) { reported.store(result); })));
+
+  EXPECT_TRUE(wait_for([&reported] { return reported.load() == 42; }, 2000ms))
+      << "the task was queued and never notified";
+  EXPECT_TRUE(ran.load());
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+TEST(execution_queue, runs_a_task_queued_before_the_worker_starts) {
+  // Queueing before the worker exists is normal, and the task has to survive the wait -- the same
+  // claim runs_an_action_queued_before_the_worker_starts makes for an action.
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("task_before_start");
+  poll.add(*exec);
+
+  std::atomic_int reported = {-1};
+
+  ASSERT_TRUE(exec->add_task(std::function<int(int)>([](int n) { return n + 1; }), 41,
+                             std::function<void(int)>([&reported](int r) { reported.store(r); })));
+
+  exec->run();
+
+  EXPECT_TRUE(wait_for([&reported] { return reported.load() == 42; }, 2000ms))
+      << "a task queued before the worker started never ran";
+
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+TEST(execution_queue, notifies_a_void_task_with_nothing) {
+  // A task whose action returns nothing still reports that it finished.
+  untangle::async::execution_poll poll;
+  auto exec = int_execution::create_instance("void_task_notifies");
+  poll.add(*exec);
+
+  std::atomic_int ran = {0};
+  std::atomic_bool finished = {false};
+
+  exec->start();
+  ASSERT_TRUE(exec->add_task(std::function<void(int)>([&ran](int by) { ran.fetch_add(by); }), 5,
+                             std::function<void()>([&finished] { finished = true; })));
+
+  EXPECT_TRUE(wait_for([&finished] { return finished.load(); }, 2000ms))
+      << "a void task finished without saying so";
+  EXPECT_EQ(ran.load(), 5);
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+TEST(execution_queue, tells_the_caller_when_a_task_is_refused) {
+  // A stopped execution refuses, as it does for an action -- and a refused task never notifies, so
+  // the answer is the only report the caller gets.
+  using answer_t = decltype(std::declval<int_ret_execution&>().add_task(
+      std::declval<std::function<int(int)>>(), 0, std::declval<std::function<void(int)>>()));
+
+  EXPECT_TRUE((std::is_same_v<answer_t, bool>))
+      << "add_task() returns void, so a caller cannot learn that its task was refused";
+
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("task_after_stop");
+  poll.add(*exec);
+
+  exec->start();
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+
+  std::atomic_bool notified = {false};
+  const bool taken =
+      exec->add_task(std::function<int(int)>([](int n) { return n; }), 1,
+                     std::function<void(int)>([&notified](int) { notified = true; }));
+
+  EXPECT_FALSE(taken) << "a stopped execution took a task it can never run";
+  EXPECT_FALSE(notified.load()) << "a refused task notified anyway";
+}
+
+TEST(execution_queue, refuses_a_task_that_can_never_report) {
+  // The actuator refuses a task with no callback to notify, and that answer has to reach the caller
+  // here rather than being swallowed on the way.
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("task_without_callback");
+  poll.add(*exec);
+
+  exec->start();
+  const bool taken = exec->add_task(std::function<int(int)>([](int n) { return n; }), 1,
+                                    std::function<void(int)>{});
+
+  EXPECT_FALSE(taken) << "a task that can never notify was queued";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+TEST(execution_queue, a_task_that_throws_reaches_on_error_and_does_not_notify) {
+  // Finished does not mean failed: there is no result to report, so the callback is not invoked and
+  // what the task threw travels the on_error path an action's failure already takes.
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("throwing_task");
+  poll.add(*exec);
+
+  std::atomic_bool notified = {false};
+  std::atomic_int reported_errors = {0};
+
+  exec->on_error = [&reported_errors](std::exception_ptr) {
+    reported_errors.fetch_add(1, std::memory_order_relaxed);
+  };
+
+  exec->start();
+  ASSERT_TRUE(exec->add_task(
+      std::function<int(int)>([](int) -> int { throw std::runtime_error("task failed"); }), 1,
+      std::function<void(int)>([&notified](int) { notified = true; })));
+
+  EXPECT_TRUE(wait_for([&reported_errors] { return reported_errors.load() == 1; }, 2000ms))
+      << "what the task threw never reached on_error";
+  EXPECT_FALSE(notified.load()) << "a task that threw reported as though it had finished";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+TEST(execution_queue, runs_both_kinds_queued_together) {
+  // Actions and tasks share one queue and one drain. Both run; what is not claimed here is the
+  // order between the two kinds, which a batch does not preserve - see a_batch_runs_its_actions
+  // _before_its_tasks.
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("both_kinds");
+  poll.add(*exec);
+
+  std::atomic_int action_calls = {0};
+  std::atomic_int reported = {-1};
+
+  exec->start();
+  ASSERT_TRUE(exec->add_action(std::function<int(int)>([&action_calls](int n) {
+                                 action_calls.fetch_add(1);
+                                 return n;
+                               }),
+                               1));
+  ASSERT_TRUE(exec->add_task(std::function<int(int)>([](int n) { return n * 2; }), 21,
+                             std::function<void(int)>([&reported](int r) { reported.store(r); })));
+
+  EXPECT_TRUE(wait_for([&] { return action_calls.load() == 1 && reported.load() == 42; }, 2000ms))
+      << "one kind ran and the other did not";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+/**
+ * @brief A batch runs every action it holds before any of its tasks.
+ *
+ * Not a requirement so much as the shape of the drain, stated so that it is a decision on record
+ * rather than a surprise: one pass fires the actuator's actions with operator() and then its tasks
+ * with call_tasks(), so within a single batch the two kinds do not interleave in the order they
+ * were queued. Across batches the queue is still first in, first out.
+ */
+TEST(execution_queue, a_batch_runs_its_actions_before_its_tasks) {
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("batch_order");
+  poll.add(*exec);
+
+  std::mutex order_mutex;
+  std::vector<std::string> order;
+  const auto note = [&order_mutex, &order](std::string what) {
+    std::lock_guard<std::mutex> lock(order_mutex);
+    order.push_back(std::move(what));
+  };
+
+  // Queued before the worker starts, so both are in the first batch rather than racing it.
+  ASSERT_TRUE(exec->add_task(std::function<int(int)>([](int n) { return n; }), 1,
+                             std::function<void(int)>([&note](int) { note("task"); })));
+  ASSERT_TRUE(exec->add_action(std::function<int(int)>([&note](int n) {
+                                 note("action");
+                                 return n;
+                               }),
+                               2));
+
+  exec->run();
+
+  EXPECT_TRUE(wait_for(
+      [&] {
+        std::lock_guard<std::mutex> lock(order_mutex);
+        return order.size() == 2;
+      },
+      2000ms));
+
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+
+  std::lock_guard<std::mutex> lock(order_mutex);
+  ASSERT_EQ(order.size(), 2u);
+  EXPECT_EQ(order.front(), "action") << "the task was queued first, and a batch still runs the "
+                                        "actions first; if that is no longer wanted, the drain is "
+                                        "where it changes";
+}
+
+// --- tasks and "finished" ------------------------------------------------------------------------
+// notify_finished() suppresses on_finished when the pass ran nothing, which is how a continuous
+// worker that woke with an empty queue is told apart from one that drained a batch. The count it
+// reads is of actions, so a pass that ran only tasks looks like a pass that ran nothing. See
+// todo/FEATURE_PLAN.md step 4.
+
+TEST(execution_queue, reports_finishing_a_pass_that_ran_only_tasks) {
+  auto exec = int_ret_execution::create_instance("tasks_only_finished");
+
+  std::atomic_int finished = {0};
+  std::atomic_int reported = {-1};
+  exec->on_finished = [&finished] { finished.fetch_add(1, std::memory_order_relaxed); };
+
+  ASSERT_TRUE(exec->add_task(std::function<int(int)>([](int n) { return n * 2; }), 21,
+                             std::function<void(int)>([&reported](int r) { reported.store(r); })));
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 5000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(reported.load(), 42) << "the task never ran";
+  EXPECT_EQ(finished.load(), 1)
+      << "a pass that ran only tasks drained in silence: on_finished counts actions, and there "
+         "were none";
+}
+
+TEST(execution_queue, reports_finishing_a_pass_of_both_kinds_once) {
+  // The count has to grow by both kinds and still raise on_finished exactly once for the pass.
+  auto exec = int_ret_execution::create_instance("both_kinds_finished");
+
+  std::atomic_int finished = {0};
+  std::atomic_int action_calls = {0};
+  std::atomic_int reported = {-1};
+  exec->on_finished = [&finished] { finished.fetch_add(1, std::memory_order_relaxed); };
+
+  ASSERT_TRUE(exec->add_action(std::function<int(int)>([&action_calls](int n) {
+                                 action_calls.fetch_add(1, std::memory_order_relaxed);
+                                 return n;
+                               }),
+                               1));
+  ASSERT_TRUE(exec->add_task(std::function<int(int)>([](int n) { return n; }), 2,
+                             std::function<void(int)>([&reported](int r) { reported.store(r); })));
+
+  exec->run();
+
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 5000ms))
+      << "the worker did not finish";
+
+  EXPECT_EQ(action_calls.load(), 1);
+  EXPECT_EQ(reported.load(), 2);
+  EXPECT_EQ(finished.load(), 1) << "on_finished was raised once per kind rather than once per pass";
+}
+
+TEST(execution_queue, an_idle_continuous_worker_still_reports_nothing) {
+  // The rule the count exists for, and it must survive the fix: a worker that woke with an empty
+  // queue has finished nothing, and must not say it finished something.
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("idle_reports_nothing");
+  poll.add(*exec);
+
+  std::atomic_int finished = {0};
+  exec->on_finished = [&finished] { finished.fetch_add(1, std::memory_order_relaxed); };
+
+  exec->start();
+
+  // Long enough for a continuous worker to wake on its own timeout more than once.
+  std::this_thread::sleep_for(100ms);
+
+  EXPECT_EQ(finished.load(), 0) << "an idle worker reported that it had finished a pass";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+TEST(execution_queue, a_queued_task_makes_the_execution_busy) {
+  // is_busy() is what a pool above reads to decide whether a worker has room. A queued task that
+  // did not make it true would have the pool hand more work to a worker that is not idle.
+  auto exec = int_ret_execution::create_instance("task_is_busy");
+
+  EXPECT_FALSE(exec->is_busy()) << "an execution with an empty queue reported itself busy";
+
+  ASSERT_TRUE(exec->add_task(std::function<int(int)>([](int n) { return n; }), 1,
+                             std::function<void(int)>([](int) {})));
+
+  EXPECT_TRUE(exec->is_busy()) << "a queued task left the execution looking idle";
+}
+
 TEST(execution_queue, an_action_that_throws_does_not_kill_the_worker) {
   auto exec = void_execution::create_instance("throwing_action");
 

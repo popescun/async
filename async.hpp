@@ -196,9 +196,15 @@ class execution_poll {
 /**
  * @brief Asynchronous template execution class.
  *
- * An async execution provides a mechanism to queue actions and execute them sequentially on a
- * separate thread. It may also attach another \ref execution object and trigger its actions. This
- * way actions of different types may be executed on the same thread.
+ * An async execution provides a mechanism to queue work and execute it sequentially on a separate
+ * thread. It may also attach another \ref execution object and trigger its actions. This way
+ * actions of different types may be executed on the same thread.
+ *
+ * **Two kinds of work may be queued.** An *action*, through \ref add_action(), is fire and forget:
+ * it runs, and the caller hears nothing more about it. A *task*, through \ref add_task(), carries
+ * the callback it must notify, and reports what it produced - or, for an action returning void,
+ * merely that it finished. A queued call has no invocation left for the actuator's own callback
+ * convention to read a callback from, which is why a task carries its own.
  *
  * The mechanism relies on an "asynchronous binding" created by \ref bind_action_and_method() or
  * \ref bind_action_and_function().
@@ -402,7 +408,7 @@ class execution {
    */
   bool is_busy() const {
     std::lock_guard<std::mutex> lock(action_mutex_);
-    return has_pending_actions() || executing_action_.load();
+    return has_pending_actions_or_tasks() || executing_action_.load();
   }
 
   /**
@@ -484,6 +490,12 @@ class execution {
    * \ref bind_action_and_function() never sees the answer: those lambdas return
    * `actionT::result_type`, which has no room for it.
    *
+   * @remark **It does not notify anyone.** The answer below is the last the caller hears: what the
+   * action returns is run and dropped, and nothing reports that it finished. Use \ref add_task()
+   * for work that has to report. A trailing callable passed here is an ordinary argument of the
+   * action - the actuator's callback convention reads a trailing argument of an *invocation*, and
+   * a queued call has none.
+   *
    * @tparam Args - The argument types the action is bound to.
    * @param action - The action to queue.
    * @param args - The arguments to bind to \p action.
@@ -494,6 +506,43 @@ class execution {
   template <typename... Args>
   bool add_action(actionT action, Args&&... args) {
     return add_queued_action(std::bind(std::move(action), std::forward<Args>(args)...));
+  }
+
+  /**
+   * @brief Queues a task, and says whether it was taken.
+   *
+   * A task is an action bound to its arguments **and to the callback it must notify** - unlike
+   * \ref add_action(), which queues work the caller hears nothing more about. It runs on whichever
+   * thread drives this execution, and the callback is invoked there too, with what the action
+   * returned. Queueing before \ref run() or \ref start() is normal.
+   *
+   * @attention **The last argument is the callback**, and this signature cannot say so: a parameter
+   * pack cannot be followed by a deducible parameter, so it arrives inside \p args and
+   * untangle::bind_task() splits it off. It must be callable with the action's result and return
+   * nothing - or callable with nothing at all, when the action returns void, because *finished* is
+   * the message and the result is optional. A missing or unusable one is a static_assert rather
+   * than silence.
+   *
+   * @attention **Finished does not mean failed.** A task whose action throws is not notified -
+   * there is no result to hand over - and what it threw goes to \ref on_error, as a failing
+   * action's does. A caller waiting on the callback alone would wait for ever.
+   *
+   * @remark The actions convention on untangle::actuator does not apply here and never did: it
+   * reads a trailing argument of an *invocation*, and a queued call has no invocation left to read
+   * from. That is what a task is for.
+   *
+   * @tparam Args - The argument types to bind, of which the last is the callback.
+   * @param action - The action to run.
+   * @param args - The arguments to bind to \p action, followed by the callback to notify.
+   *
+   * @return true - queued, and this execution's worker will run it and notify the callback.
+   * @return false - refused and dropped, so it will never run and never notify. Either the
+   * execution is stopped, or the task could not do its job: no callback to notify, or nothing to
+   * run. **The answer is the whole report** - nothing is thrown and the callback is not invoked.
+   */
+  template <typename... Args>
+  bool add_task(actionT action, Args&&... args) {
+    return add_queued_task(untangle::bind_task(std::move(action), std::forward<Args>(args)...));
   }
 
   /**
@@ -627,9 +676,15 @@ class execution {
   std::function<bool(void)> action_is_running;
 
   /**
-   * @brief Called on the worker's thread once the action queue has drained. Assigned by the caller.
+   * @brief Called on the worker's thread once the queue has drained. Assigned by the caller.
    *
    * \ref results() is complete by the time it runs, and \ref is_running() reads true there.
+   *
+   * @remark **It is raised once per pass, not once per piece of work**, and a pass that ran only
+   * tasks raises it like any other. Do not read it as "my task finished": that is the task's own
+   * callback, and it has already run by this point, inside the same drain and on this thread.
+   *
+   * @remark A worker that woke with an empty queue has finished nothing and stays silent.
    */
   std::function<void(void)> on_finished;
 
@@ -647,6 +702,12 @@ class execution {
    * @remark It is told about a dead binding too, which arrives as untangle::invalid_action. A
    * caller asking why an action did not run wants both answers, not the one the header happens to
    * raise itself.
+   *
+   * @remark **A task's failure arrives here as well, and so does its callback's.** A task whose
+   * action throws is not notified - there is no result to hand over - so this is the only report
+   * it makes. And because a callback runs inside the same try as the task that owns it, this can
+   * fire for a task whose action in fact **succeeded**: the work was done, and only the telling
+   * failed.
    *
    * @attention It runs on the worker's thread, inside the drain, like \ref on_finished. Nothing may
    * escape it: it is called from the same try the action was called from, and an exception leaving
@@ -679,11 +740,17 @@ class execution {
   }
 
   /**
-   * @brief Are there actions waiting to run?
+   * @brief Is there an action or a task waiting to run?
+   *
+   * @remark It asks both questions because the drain does: a queue holding only tasks that
+   * answered "nothing here" would break out of \ref execute_actions() with the work still in it,
+   * and the worker would park on \ref action_cv_ until something else woke it.
    *
    * @attention Reads \ref action_actuator_, so the caller holds action_mutex_.
    */
-  bool has_pending_actions() const { return action_actuator_.is_connected(); }
+  bool has_pending_actions_or_tasks() const {
+    return action_actuator_.is_connected() || action_actuator_.has_tasks();
+  }
 
   /**
    * @brief Queues a callable already bound to its arguments, and says whether it was taken.
@@ -713,16 +780,46 @@ class execution {
   }
 
   /**
+   * @brief Queues a task already built by untangle::bind_task(), and says whether it was taken.
+   *
+   * What \ref add_task() does once it has built one. It mirrors \ref add_queued_action(), with one
+   * refusal more: the actuator turns away a task that has nothing to run or no callback to notify,
+   * and that answer is passed straight back rather than swallowed here.
+   *
+   * @return true - queued; false - the execution is stopped, or the task could not do its job.
+   */
+  bool add_queued_task(untangle::task<typename actionT::result_type> task) {
+    {
+      std::lock_guard<std::mutex> lock(action_mutex_);
+
+      // As for an action: a stopped worker would never reach it, and a task left in the queue
+      // would look pending while being unable to ever notify.
+      if (stopped_) {
+        std::println(stderr, "warning: execution '{}' is stopped, task not added", name);
+        return false;
+      }
+
+      if (!action_actuator_.add_task(std::move(task))) {
+        std::println(stderr, "warning: execution '{}' refused a task that cannot report", name);
+        return false;
+      }
+    }
+
+    action_cv_.notify_one();
+    return true;
+  }
+
+  /**
    * @brief Runs everything queued, then drives the attached executions.
    *
-   * Counts what it ran in \ref actions_run_, which is how \ref notify_finished() tells a batch
-   * that drained from a worker that woke with nothing to do. Every action in the batch counts,
-   * including one that reported a dead binding.
+   * Counts what it ran in \ref actions_and_tasks_run_, which is how \ref notify_finished() tells
+   * a batch that drained from a worker that woke with nothing to do. Every action **and every
+   * task** in the batch counts, including an action that reported a dead binding.
    *
-   * @remark The count is of this execution's own actions; an attached execution records its own.
+   * @remark The count is of this execution's own work; an attached execution records its own.
    */
   void execute_actions() {
-    actions_run_ = 0;
+    actions_and_tasks_run_ = 0;
 
     for (;;) {
       // Takes over action_actuator_ under the lock; its actions then run without it.
@@ -730,7 +827,7 @@ class execution {
 
       {
         std::lock_guard<std::mutex> lock(action_mutex_);
-        if (!has_pending_actions()) {
+        if (!has_pending_actions_or_tasks()) {
           break;
         }
 
@@ -740,8 +837,9 @@ class execution {
         executing_action_ = true;
       }
 
-      // Counted before the call: a dead binding leaves the list during it.
-      const auto in_the_batch = batch.actions.size();
+      // Counted before either call: a dead binding leaves the actions list during operator(),
+      // and call_tasks() consumes the tasks list outright.
+      const auto in_the_batch = batch.actions.size() + batch.tasks.size();
 
       // The actions have their own arms inside the actuator; this one is for the work around
       // them, and for the rule that nothing may leave this loop: an exception escaping a detached
@@ -754,6 +852,13 @@ class execution {
           std::lock_guard<std::mutex> lock(results_mutex_);
           std::ranges::move(batch.results, std::back_inserter(results_));
         }
+
+        // After the actions, and deliberately: one pass fires every action it holds and then every
+        // task, so within a batch the two kinds do not interleave in the order they were queued.
+        // Across batches the queue is still first in, first out. A task reports to its own
+        // callback, so nothing is collected here; what one throws lands in batch.errors below,
+        // beside what an action threw.
+        batch.call_tasks();
       } catch (...) {
         report_error(std::current_exception());
       }
@@ -762,7 +867,7 @@ class execution {
         report_error(thrown);
       }
 
-      actions_run_ += in_the_batch;
+      actions_and_tasks_run_ += in_the_batch;
 
       executing_action_ = false;
 
@@ -771,7 +876,7 @@ class execution {
       bool drained = false;
       {
         std::lock_guard<std::mutex> lock(action_mutex_);
-        drained = !has_pending_actions();
+        drained = !has_pending_actions_or_tasks();
       }
 
       if (drained) {
@@ -822,9 +927,12 @@ class execution {
   /**
    * @brief Raises \ref on_finished, unless the pass ran nothing: an idle worker has finished
    * nothing.
+   *
+   * @remark "Nothing" means neither an action nor a task. A pass that ran only tasks has
+   * finished a batch like any other, and says so.
    */
   void notify_finished() {
-    if (actions_run_ == 0 || !on_finished) {
+    if (actions_and_tasks_run_ == 0 || !on_finished) {
       return;
     }
 
@@ -832,7 +940,7 @@ class execution {
       // An action may queue another, so a pass that drained can leave more behind it. That is the
       // next batch, not the end of this one.
       std::lock_guard<std::mutex> lock(action_mutex_);
-      if (has_pending_actions()) {
+      if (has_pending_actions_or_tasks()) {
         return;
       }
     }
@@ -878,9 +986,9 @@ class execution {
         // Bounded: an attached execution has its own list and cannot notify this condition
         // variable.
         action_cv_.wait_for(lock, std::chrono::milliseconds(10),
-                            [this] { return has_pending_actions() || !started_; });
+                            [this] { return has_pending_actions_or_tasks() || !started_; });
 
-        if (!started_ && !has_pending_actions()) {
+        if (!started_ && !has_pending_actions_or_tasks()) {
           break;
         }
       }
@@ -995,8 +1103,12 @@ class execution {
    * On the object rather than returned, so \ref notify_finished() can be raised wherever the pass
    * was driven. Atomic because that need not be this execution's own worker: one driven through
    * \ref attach() runs on its attacher's.
+   *
+   * @remark It counts both kinds. Counting only the actions would leave a pass that ran nothing
+   * but tasks indistinguishable from one that ran nothing at all, and \ref on_finished would be
+   * suppressed for a batch that had in fact drained.
    */
-  std::atomic_size_t actions_run_ = {0};
+  std::atomic_size_t actions_and_tasks_run_ = {0};
 };
 }  // namespace async
 }  // namespace untangle
