@@ -1,132 +1,160 @@
-# async.hpp — the queue on tasks, feature plan
+# async.hpp — tasks on the queue, feature plan
 
-**The action queue becomes a task queue.** `7e07a51` made the queue an actuator and `77ba66a` made
-the drain fire it in one call; this is the step after both. `queued_action_t` — the nullary carrier
-this file hand-rolled because the queue needed one with a `result_type` — is replaced by the
-actuator's own `task<R>`, and `add_action()` becomes a delegation to `untangle::bind_task()`.
+**The queue gains a second kind.** `7e07a51` made the action queue an actuator and `77ba66a` made
+the drain fire it in one call; this is the step after both. `action_actuator_` keeps its actions
+exactly as they are and gains a **tasks** list beside them — an action bound to its arguments *and*
+to the callback it must notify — reached through a new `add_task()`.
 
 **Status (2026-09-25) — nothing written, and blocked on the actuator.** This is a feature plan, not
-a fix plan. It has one defect at its root: the actuator's callback convention does not survive
-being queued **here**, and the pool downstream only inherits what this file does. Claims marked
-**PROBED** were compiled and run on 2026-09-24/25; the rest are read-only and say so.
+a fix plan. Claims marked **PROBED** were compiled and run on 2026-09-24/25; the rest are read-only
+and say so.
 
 **This is the second of three.** `actuator/todo/FEATURE_PLAN.md` holds the mechanism and must land
 and be bumped first; `todo/FEATURE_PLAN.md` in `executor` holds the pool and the two cases that
 close the whole chain. Steps are numbered per repo, as in `FIX_PLAN.md`; cross-repo references are
-qualified ("the actuator's step 3").
+qualified ("the actuator's step 6").
 
 **Baseline.** `985a991`, actuator at `a8b8b47`. Sites are line numbers at those commits.
 
-## Why — this file is where the callback dies
+## Why — what a queued action cannot tell you
 
 `add_action()` (`:495-497`) binds the caller's pack into a nullary callable with `std::bind`, and
-stores it as `queued_action_t` (`:660`). The drain then invokes the batch with **no arguments**
-(`:750`). The actuator's convention reads its callback out of the invocation pack, so the pack it
-reads is empty and the callback is never fired:
+the drain invokes the batch with **no arguments** (`:750`). The actuator's action convention reads
+its callback out of the invocation pack, so the pack read there is empty:
 
 | Path | What the actuator is invoked with | Callback |
 |---|---|---|
 | `connect(action)` then `a(21, cb)` | `(21, cb)` | **fired** — 42 |
-| `execution::add_action(action, 21, cb)` | `()` — `std::bind` sealed the pack at `:496` | lost |
+| `execution::add_action(action, 21, cb)` | `()` — `std::bind` sealed the pack at `:496` | **not fired** |
 
-**PROBED.** The action runs and the callback is silently skipped. Nothing warns: under the
-convention the callback is also a legitimate argument of the action, so every overload is satisfied.
-**A caller using `add_action()` directly has this today, with no pool in sight** — which is why
-step 6 puts the cases in this suite and not only in the pool's.
+**PROBED.** That is the observation this whole chain started from, and it is worth being precise
+about what it now means. **It is not a defect to be fixed here.** The convention is about invoking
+an actuator directly with a pack; a queue has no pack to read from, and cannot acquire one — a
+batch holds many queued calls each wanting a different callback, while `operator()` broadcasts a
+single pack to all of them. **So a queued action does not notify, by nature, and `add_action()`
+keeps that behaviour unchanged.** What was missing is a second kind of queue entry that carries its
+own callback. That is a task.
 
-**Why it cannot be fixed here alone.** `std::bind` returns an opaque object; once the pack is inside
-it, nothing downstream can find the callback again — so the extraction has to happen at the moment
-of binding, which is `bind_task()`'s whole job. And the actuator cannot fire it from its own
-invocation pack, because a batch holds many queued calls each with a different callback while
-`operator()` broadcasts one pack to all of them. The callback must travel **with** its action. That
-is the actuator's steps 1 to 5.
+**Decided 2026-09-25.** `add_action()` stays callback-free and fire-and-forget. Under the actuator's
+step 2 a task's callback is a named parameter and is **not** forwarded to the action, so any
+trailing callable still passed to `add_action()` is necessarily a real parameter of the action's own
+signature — otherwise the call would not compile. **Nothing is silently swallowed any more**; the
+action receives it and does with it what it likes. The reference owes one line saying `add_action()`
+does not carry the trailing-callback convention, and pointing at `add_task()`.
 
-## What this file gives up, and what it gets
+## What this costs — and a correction to an earlier draft
 
-**This is where the simplification lands.** `queued_action_t` exists only because the queue needed a
-nullary carrier naming a `result_type` that C++20 removed from `std::function`. `task<R>` is that
-carrier:
+An earlier version of this plan had the queue holding tasks *only*, `queued_action_t` deleted and
+`action_actuator_` collapsing to `actuator<actionT>`. **That is withdrawn.** It was premised on one
+kind of queue entry, and the decision that `add_action()` stays callback-free means there are two.
+The actuator carries both lists natively, so this file changes far less than promised — and the
+deletions it advertised do not happen:
 
-| Today | After |
-|---|---|
-| `using queued_action_t = std::function<R(void)>` (`:660`) | deleted |
-| `actuator<queued_action_t> action_actuator_` (`:918`) | `actuator<actionT>` — the same template argument as everything else in the class |
-| `actuator<queued_action_t> batch` (`:729`) | `actuator<actionT> batch` |
-| `add_queued_action(std::bind(...))` (`:496`) | `add_queued_action(untangle::bind_task(...))` |
-| `batch()` (`:750`) | `batch.call_tasks()` |
-| `batch.actions.size()` (`:744`) | `batch.tasks.size()` |
+| | Today | After |
+|---|---|---|
+| `queued_action_t` (`:660`) | the nullary carrier for a queued action | **kept, unchanged** |
+| `action_actuator_` (`:918`) | `actuator<queued_action_t>` | same type, now also holding tasks — `task<R>` where `R` is `queued_action_t::result_type` |
+| `add_action()` (`:495`) | `std::bind` into the actions list | **unchanged** |
+| `add_task()` | — | new: `bind_task(action, callback, args...)` into the tasks list |
+| the drain (`:750`) | `batch()` | `batch()`, then `batch.call_tasks()` |
+| `in_the_batch` (`:744`) | `batch.actions.size()` | plus `batch.tasks.size()` |
 
 **The lock dance at `:729-740` does not change.** The swap is about not holding `action_mutex_`
-while actions run, not about ownership, and tasks need it for the same reason.
+while entries run, not about ownership, and tasks need it for the same reason.
 
 ## Step index
 
 | # | Step | Sites | Evidence |
 |---|---|---|---|
-| 1 | `queued_action_t` deleted, `action_actuator_` becomes `actuator<actionT>` | `:660`, `:918`, `:729` | read-only |
-| 2 | `add_action()` delegates to `bind_task()`; `add_queued_action()` takes a task | `:495-497`, `:697` | read-only |
-| 3 | `execute_actions()` fires `call_tasks()`, counts `tasks.size()` | `:744`, `:750`, `:765` | read-only |
-| 4 | `has_pending_actions()` reads tasks | `:686` | blocked on the actuator's step 7 |
-| 5 | `bind_action_and_method()` / `_function()` onto `bind_task()` | `:325-338`, `:361-374` | **the risk — read first** |
-| 6 | the suite gains the two callback cases | `test/async_tests.cpp` | — |
-| 7 | what a queued callback promises — the reference | `:634`, `:651-655` | decision |
-| 8 | `tools/make_doc.sh`, the actuator bump, and the bump `executor` takes | `doc/` | — |
+| 1 | `add_task(action, callback, args...)`, onto `actuator::add_task()` | beside `:495`, `:697` | read-only |
+| 2 | the drain fires tasks after actions, and counts both | `:744`, `:750`, `:765` | read-only |
+| 3 | `has_pending_actions()` accounts for tasks | `:686`, `:735` | blocked on the actuator's step 6 |
+| 4 | `is_busy()` and `on_finished` across two kinds | `:403`, `:823-840` | **read-only, and the one to think about** |
+| 5 | the suite gains the queued-callback cases | `test/async_tests.cpp` | — |
+| 6 | what a queued task promises — the reference | `:474-492`, `:634`, `:651-655` | decision |
+| 7 | `tools/make_doc.sh`, the actuator bump, and the bump `executor` takes | `doc/` | — |
 
-### Step 4 · blocked on the actuator's step 7
-
-`has_pending_actions()` (`:686`) answers from `action_actuator_.is_connected()`, which reads
-`actions` and `actions_map`. After step 1 the queue holds tasks and no actions, so left alone **a
-queue full of tasks reports itself empty and the drain breaks** — it would `break` out of the loop
-at `:735` with work still queued.
-
-The fix is one line here, but which line depends on a decision in the actuator: extend
-`is_connected()` to include tasks, or add `has_tasks()` and read that instead. **Do not write this
-step until that is settled.**
-
-### Step 5 · the one place this is not a simplification — READ BEFORE THE ACTUATOR'S STEP 3
-
-`bind_action_and_method()` (`:325`) and `bind_action_and_function()` (`:361`) hold the action in a
-`std::shared_ptr<const actionT>` so that a queued call costs a pointer rather than a copy of the
-action, and hand `add_queued_action()` a lambda that captures it:
+### Step 1 · the new door
 
 ```c++
-exec->add_queued_action([async_action, ... args = std::forward<decltype(args)>(args)] {
-  return (*async_action)(args...);
-});
+template <typename callback_t, typename... Args>
+bool add_task(actionT action, callback_t callback, Args&&... args) {
+  return add_queued_task(
+      untangle::bind_task(std::move(action), std::move(callback), std::forward<Args>(args)...));
+}
 ```
 
-`bind_task()` takes the action **by value** and reads `action_t::result_type` off it. These two
-therefore need a small wrapper that owns the `shared_ptr` and names `result_type` — the only step in
-this plan that adds a type rather than removing one.
+`add_queued_task()` mirrors `add_queued_action()` (`:697`) exactly — the same `stopped_` check, the
+same warning, the same `false`, the same `notify_one()`. Both answers mean what they meant before:
+**a stopped execution refuses and drops**, and a dropped task never notifies, which is a thing the
+reference has to say plainly now that a caller is relying on being told.
 
-**This is what can send the whole chain back.** If the wrapper turns out to constrain `bind_task`'s
-signature, the actuator's step 3 is rewritten after it has landed. Settle the shape of the wrapper
-here *before* the actuator writes `bind_task`, not after.
+### Step 3 · blocked on the actuator's step 6
 
-A second question rides along: these two bindings queue directly through `add_queued_action()` and
-never see a trailing callback, because the action they queue is `(*async_action)(args...)` with the
-caller's own pack. Whether a bound action should carry the convention at all is open — **it is not
-a regression either way**, since it does not work today, but it should be answered rather than
-inherited.
+`has_pending_actions()` (`:686`) answers from `action_actuator_.is_connected()`, which reads
+`actions` and `actions_map`. Once tasks are queued, a batch of tasks with no actions reports itself
+empty and the drain `break`s at `:735` **with work still queued** — the worker then parks on
+`action_cv_` and the tasks sit there until something else wakes it.
 
-### Step 7 · what the reference has to say
+One line here, but which line depends on the actuator: `is_connected()` extended to include tasks,
+or a new `has_tasks()` read alongside. **Do not write this step until that is settled.**
 
-Three rules, all decided in the actuator's step 5, all needing a sentence here because this is
-where a caller meets them:
+### Step 4 · what "busy" and "finished" mean with two kinds
 
-- **The callback runs on the worker's thread**, inside the drain, before `on_finished` (`:634`) and
-  before the batch's results reach `results_`. The same warning `on_error` (`:651-655`) already
-  carries.
+The one place where two kinds is more than bookkeeping, and it is read-only so far:
+
+- `is_busy()` (`:403`) answers from `executing_action_` and `has_pending_actions()`. It must be
+  true while a task is in flight, or the pool above reads an idle worker and hands it more.
+- `notify_finished()` (`:823-827`) suppresses `on_finished` when `actions_run_ == 0`. A pass that
+  ran only tasks must not count as having run nothing.
+- **A task's callback fires before `on_finished`**, inside `call_tasks()`, which is inside the
+  drain. Two notifications with different meanings now exist on the same thread — one per task,
+  one per drained queue — and the reference has to keep them apart.
+
+### Step 5 · the cases
+
+Two, mirroring the pool's: a task queued to a **running** execution notifies with its result, and a
+task queued to a **stopped** one does not — `add_task()` answers `false` and nothing fires. Plus a
+void-returning task notifying with `void()`, which is the half no pool case covers.
+
+They belong here and not only in `executor`, because a caller using `execution` directly meets this
+with no pool in sight.
+
+### Step 6 · what the reference has to say
+
+- **`add_action()` does not notify.** One line at `:474-492`, pointing at `add_task()`. It is the
+  question every reader of the actuator's callback convention will arrive with.
+- **The callback runs on the worker's thread**, inside the drain, before `on_finished` (`:634`).
+  The same warning `on_error` (`:651-655`) already carries, for the same reason.
 - **A throwing callback reaches `on_error`**, because it runs inside the actuator's `try` and its
   exception lands in `batch.errors`, which `:769` walks into `report_error()`. So `on_error` can
-  fire for an action whose body succeeded.
-- **An action that throws gets no callback**, because no result exists to report.
+  fire for a task whose body succeeded.
+- **A task that throws does not notify. Finished does not mean failed**, decided 2026-09-25, and
+  documented as a choice rather than an omission.
+- **A refused task does not notify**, because it never ran.
+
+## What is no longer a risk
+
+An earlier draft carried a step marked *the one that can send the chain back*:
+`bind_action_and_method()` (`:325`) and `bind_action_and_function()` (`:361`) hold their action in a
+`std::shared_ptr<const actionT>`, while `bind_task()` takes the action by value — so routing
+`add_action()` through `bind_task()` would have needed a wrapper type naming `result_type`, and the
+shape of that wrapper could have forced the actuator's `bind_task` signature to change after it had
+landed.
+
+**It is gone.** `add_action()` no longer routes through `bind_task()` — it keeps `std::bind` and
+`add_queued_action()` untouched — so the two bindings are not touched at all. Nothing in this repo
+now constrains the actuator's steps 1 or 2.
+
+**What it leaves behind is a question, not a risk:** there is no `bind_task_and_method()`. A caller
+who wants a *bound* action to notify on completion has no door, and would need one built the way
+these two are. Out of scope here; worth recording so it is a decision later rather than a surprise.
 
 ## Order
 
-1 to 3 in sequence — each is small and the file does not build between them. 4 waits on the
-actuator's step 7. **5 is read first and settled first**, though it is written last. 6 is the
-acceptance criterion for this repo; the pool's two cases in `executor` are the one for the chain.
+1 and 2 in sequence. 3 waits on the actuator's step 6. 4 is read first — it decides whether 1 and 2
+are complete or merely compiling. 5 is the acceptance criterion for this repo; the pool's two cases
+in `executor` are the one for the chain.
 
 ## Working method
 
@@ -143,5 +171,4 @@ with its own fix. The plan's own updates are their own commit, and always a late
 |---|---|
 | — | nothing landed, and nothing can until the actuator is green and bumped |
 
-**NEXT: read step 5 and settle the wrapper**, because the actuator cannot write `bind_task` without
-it.
+**NEXT: not here.** The actuator's step 1. Read step 4 before this repo's step 1 is written.
