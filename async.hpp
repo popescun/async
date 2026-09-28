@@ -783,12 +783,17 @@ class execution {
    * @brief Queues a task already built by untangle::bind_task(), and says whether it was taken.
    *
    * What \ref add_task() does once it has built one. It mirrors \ref add_queued_action(), with one
-   * refusal more: the actuator turns away a task that has nothing to run or no callback to notify,
-   * and that answer is passed straight back rather than swallowed here.
+   * refusal more: the actuator turns away an empty task - one untangle::bind_task() built from an
+   * action or a callback that was itself empty - and that answer is passed straight back rather
+   * than swallowed here.
+   *
+   * @remark The type no longer names the result. A untangle::task_t notifies the callback
+   * untangle::bind_task() sealed inside it, so one nullary signature carries the tasks of every
+   * execution whatever their action returns.
    *
    * @return true - queued; false - the execution is stopped, or the task could not do its job.
    */
-  bool add_queued_task(untangle::task<typename actionT::result_type> task) {
+  bool add_queued_task(untangle::task_t task) {
     {
       std::lock_guard<std::mutex> lock(action_mutex_);
 
