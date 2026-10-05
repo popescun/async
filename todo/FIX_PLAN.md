@@ -2055,3 +2055,12 @@ synchronised with a running worker either.
 > `~execution()` wait until the attacher's worker is out of it. Then attach and detach become safe
 > while running, and the `execution_idle` note can go. Test: the probe above as a case, under ASan
 > and TSan.
+>
+> Since actuator step 27 (2026-10-05) `remove()` is refused while the actuator is dispatching. It
+> changes how this fails, not whether: rerun on the new actuator, the probe still fails in the
+> current pass - `heap-use-after-free` in `execute_actions()` (`:869`) on the attacher's worker,
+> which is still inside the destroyed execution. Had it survived, the refused removal would have
+> left `action_execute` in the attacher's actuator, to be called on the next pass. And the
+> `dispatching` count the refusal reads belongs to the attacher's worker, read from the destroying
+> thread - a race of its own. The actuator is single-threaded by contract, so the fix stays here:
+> the lock proposed above covers all three.
