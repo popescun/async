@@ -600,6 +600,13 @@ class execution {
     other->attachment_lifetime_->attacher = attachment_lifetime_;
     other->attacher_execute_ = &actuator_execute_;
     other->attacher_stop_ = &actuator_stop_;
+
+    // An idle worker blocks until it is told otherwise; from now on it has to poll.
+    {
+      std::lock_guard<std::mutex> lock(action_mutex_);
+      attached_ = true;
+    }
+    action_cv_.notify_all();
   }
 
   /**
@@ -628,6 +635,11 @@ class execution {
     other.attachment_lifetime_->attacher.reset();
     other.attacher_execute_ = nullptr;
     other.attacher_stop_ = nullptr;
+
+    {
+      std::lock_guard<std::mutex> lock(action_mutex_);
+      attached_ = actuator_execute_.is_connected();
+    }
 
     return true;
   }
@@ -989,10 +1001,16 @@ class execution {
       {
         std::unique_lock<std::mutex> lock(action_mutex_);
 
-        // Bounded: an attached execution has its own list and cannot notify this condition
-        // variable.
-        action_cv_.wait_for(lock, std::chrono::milliseconds(10),
-                            [this] { return has_pending_actions_or_tasks() || !started_; });
+        const auto has_work = [this] { return has_pending_actions_or_tasks() || !started_; };
+
+        // Polls only while something is attached: an attached execution has its own list and
+        // cannot notify this condition variable. With nothing attached the worker blocks until it
+        // has work, is stopped, or attach() wakes it.
+        if (attached_) {
+          action_cv_.wait_for(lock, std::chrono::milliseconds(10), has_work);
+        } else {
+          action_cv_.wait(lock, [this, &has_work] { return has_work() || attached_; });
+        }
 
         if (!started_ && !has_pending_actions_or_tasks()) {
           break;
@@ -1023,6 +1041,16 @@ class execution {
   // stop() and read by the worker; nothing touches them outside this mutex.
   mutable std::mutex action_mutex_;
   std::condition_variable action_cv_;
+
+  /**
+   * @brief Whether anything is attached, so the worker has to poll rather than block while idle.
+   *
+   * Set by \ref attach(), cleared by \ref detach() once nothing is left. An attached execution
+   * destroyed while attached leaves it set, so the worker goes on polling: needless, not wrong.
+   *
+   * @attention Not synchronised: every access is under action_mutex_.
+   */
+  bool attached_ = false;
 
   /**
    * @brief The actions waiting to run, and what owns them.

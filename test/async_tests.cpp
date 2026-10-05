@@ -23,6 +23,12 @@
 #include <type_traits>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#elif defined(__linux__)
+#include <sys/resource.h>
+#endif
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -75,6 +81,57 @@ bool wait_until_poll_idle(untangle::async::execution_poll& poll, std::chrono::mi
   // time of check; the time of use is the caller's next statement, and for every caller here that
   // is letting the execution go out of scope
   return wait_for([&poll] { return !poll.is_running(); }, limit);
+}
+
+/**
+ * @brief How many times this process's threads gave up the processor so far, or -1 where it is not
+ * known.
+ *
+ * A worker blocked on a condition variable switches out once and stays out; one waiting with a
+ * timeout switches every time the timeout fires. Mach counts per task on macOS - getrusage()
+ * leaves ru_nvcsw at zero there - and getrusage() counts on Linux.
+ */
+long context_switches() {
+#if defined(__APPLE__)
+  task_events_info_data_t events{};
+  mach_msg_type_number_t count = TASK_EVENTS_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_EVENTS_INFO, reinterpret_cast<task_info_t>(&events),
+                &count) != KERN_SUCCESS) {
+    return -1;
+  }
+  return events.csw;
+#elif defined(__linux__)
+  rusage usage{};
+  getrusage(RUSAGE_SELF, &usage);
+  return usage.ru_nvcsw;
+#else
+  return -1;
+#endif
+}
+
+/**
+ * @brief How many context switches \p executions started and idle cost over half a second.
+ *
+ * Polling every 10 ms, eight workers switch some 400 times in that window; blocked, about none.
+ */
+long idle_switches(std::vector<std::shared_ptr<void_execution>>& executions) {
+  for (auto& exec : executions) {
+    exec->start();
+  }
+  std::this_thread::sleep_for(50ms);  // let every worker reach its wait
+
+  const auto before = context_switches();
+  std::this_thread::sleep_for(500ms);
+  const auto after = context_switches();
+
+  for (auto& exec : executions) {
+    exec->stop();
+  }
+  for (auto& exec : executions) {
+    EXPECT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
+        << "a worker did not stop";
+  }
+  return after - before;
 }
 
 /**
@@ -302,10 +359,10 @@ TEST(execution_queue, queueing_during_a_batch_runs_every_action_exactly_once) {
 /**
  * @brief A continuous worker picks an action up when it is queued, not when its wait times out.
  *
- * loop() waits on a condition variable with a bounded timeout of 10ms, so a worker that is never
- * notified still runs everything - late, by half that on average. Each action reports how long it
+ * loop() waits on a condition variable, with a 10ms timeout only while something is attached, so a
+ * worker that is never notified runs an action late or not at all. Each action reports how long it
  * waited, and the median over the rounds is what separates the two: microseconds when the add
- * notifies, milliseconds when only the timeout ends the wait.
+ * notifies, milliseconds or worse when it does not.
  *
  * @remark Timing-sensitive, and deliberately measured on the worker's side: the time this case
  * spends noticing that an action ran is the test's own and says nothing about the header.
@@ -940,6 +997,47 @@ TEST(execution_lifecycle, a_second_run_does_not_leave_two_workers_in_one_executi
   }  // let go at once, so the destructor's handshake meets both workers
 
   SUCCEED() << "twenty double runs, and the object outlived both workers each time";
+}
+
+/**
+ * @brief A worker with nothing attached blocks while idle, rather than waking every 10 ms.
+ *
+ * Fix plan step 6 (fluxcpp): every store and aggregator is a worker, so a timed wait is ~100
+ * wake-ups a second each for nothing.
+ */
+TEST(execution_idle, a_worker_with_nothing_attached_does_not_wake_while_idle) {
+  if (context_switches() < 0) {
+    GTEST_SKIP() << "no context switch count on this platform";
+  }
+
+  std::vector<std::shared_ptr<void_execution>> executions;
+  for (auto i = 0; i < 8; ++i) {
+    executions.push_back(void_execution::create_instance("idle"));
+  }
+
+  EXPECT_LT(idle_switches(executions), 40) << "idle workers kept waking up";
+}
+
+/**
+ * @brief Detaching the last attachment lets the worker block again.
+ *
+ * Attached and detached before start(): attach() and detach() are not synchronised with a running
+ * worker.
+ */
+TEST(execution_idle, a_worker_whose_attachment_was_detached_does_not_wake_while_idle) {
+  if (context_switches() < 0) {
+    GTEST_SKIP() << "no context switch count on this platform";
+  }
+
+  std::vector<std::shared_ptr<void_execution>> executions;
+  auto attached = void_execution::create_instance("attached");
+  for (auto i = 0; i < 8; ++i) {
+    executions.push_back(void_execution::create_instance("detached"));
+    executions.back()->attach(attached);
+    executions.back()->detach(*attached);
+  }
+
+  EXPECT_LT(idle_switches(executions), 40) << "idle workers kept waking up after a detach";
 }
 
 /**
@@ -1725,8 +1823,8 @@ TEST(execution_notification, on_finished_fires_each_time_a_batch_drains) {
 /**
  * @brief An idle worker reports nothing.
  *
- * loop() wakes every 10ms to look in on its attachments and calls execute_actions() each time.
- * 200ms is twenty such passes, none of which finished anything.
+ * With nothing attached loop() blocks; with attachments it wakes every 10ms and calls
+ * execute_actions() each time. Either way, nothing runs in these 200ms, so nothing is finished.
  */
 TEST(execution_notification, an_idle_worker_reports_nothing) {
   const auto exec = void_execution::create_instance("idle");
