@@ -903,6 +903,10 @@ rename pass catching a string literal, not something anyone wrote.
 path at all. These are locked now, so they are no longer a race; they are still debug leftovers, and
 the suggestion above to let a logger own them stands.
 
+**Settled 2026-10-05:** it should not. Both prints are deleted, so a worker's thread ends silently;
+the warnings about dropped or refused work stay on stderr. Asked for by fluxcpp's plan (step 7) and
+executor's (step 11), where every store, aggregator and pool worker printed on shutdown.
+
 **Flow-on:** `async.hpp` no longer uses `<iostream>`, which shortens step 22's list.
 
 ### Step 19 · item E — the smoke test races on `std::cout` between two workers — DONE
