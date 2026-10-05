@@ -8,6 +8,8 @@ measured and deferred), 36 and 37 landed, and **38 answers the question steps 21
 it to close its own step 5. The
 per-step commits are in the table under **Progress**; this line no longer restates them, because
 that is how it kept drifting.
+**2026-10-05 review:** step 48 (group 10) is open, read at `01a4958` from fluxcpp's module
+review.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
@@ -224,6 +226,8 @@ of atomic.
 | 45 ✅ | api | results survive a second batch, written under their mutex | `:726-739`, `:868` | CONFIRMED (`{2}` on the POC) |
 | 46 ✅ | api | what the change leaves behind: `<deque>`, docs, allocations | `:13`, `:739`, `:1009` | measured (3.00/action, 61 ns) |
 | 47 ✅ | api | the gate: Debug, ASan, TSan, clang-format, make_doc.sh | whole repo | 51/51 on four presets; 0 doc warnings |
+| **Group 10 — from the 2026-10-05 review (open)** |
+| 48 | bug | an attached execution destroyed while its attacher runs it is a use-after-free | `:273-279` (`~execution`), `:907` | CONFIRMED (ASan, TSan) |
 
 ---
 
@@ -2020,3 +2024,34 @@ of the member cannot be drained twice safely whatever the error handling does.
 another still runs it in the same pass. Probed on both headers — `ran=2 batches=1` either way, so
 the POC does not move that line, it only moves the mechanism from "pop the next" to "the list grew
 while it was being walked".
+
+## Group 10 — from the 2026-10-05 review (open)
+
+A read of `async.hpp` at `01a4958`, after fluxcpp's plan made an idle worker block (`502650b`) and
+dropped the per-thread prints (`2a06497`).
+
+### Step 48 · an attached execution destroyed while its attacher runs it
+`async.hpp:273-279` (`~execution`), `:907` (the attachment pass in `execute_actions`) · CONFIRMED
+by probe (ASan, TSan)
+
+`~execution()` takes itself out of its attacher's `actuator_execute_` and `actuator_stop_` with no
+lock, then waits for `running_` - its own worker's flag. An attached execution has no worker of its
+own: the attacher's worker drives it, through `actuator_execute_()`, which may be walking that same
+actuator, or inside this execution's `execute_actions()`, at that moment. Probe: attach before
+`start()`, queue an action on the attached execution that sleeps 100 ms, start the attacher, and
+destroy the attached execution while the attacher's worker is in that action:
+
+```
+address: ERROR: AddressSanitizer: heap-use-after-free
+thread:  WARNING: ThreadSanitizer: data race
+```
+
+Step 13 made the attacher's own lifetime safe (the `weak_ptr` link); this is the other side. It
+shares a root with the limit `execution_idle` states: `attach()` and `detach()` are not
+synchronised with a running worker either.
+
+> Proposed: synchronise the attachment actuators with the attacher's worker - the attacher holds a
+> lock around its attachment pass, and `attach()`, `detach()` and `~execution()` take it - and have
+> `~execution()` wait until the attacher's worker is out of it. Then attach and detach become safe
+> while running, and the `execution_idle` note can go. Test: the probe above as a case, under ASan
+> and TSan.
