@@ -3,7 +3,8 @@
 /**
  * @brief Interface to \ref untangle::async::execution class.
  */
-#pragma once
+#ifndef UNTANGLE_ASYNC_ASYNC_HPP
+#define UNTANGLE_ASYNC_ASYNC_HPP
 
 #include <actuator/actuator.hpp>
 #include <algorithm>
@@ -1117,3 +1118,5 @@ class execution {
 };
 }  // namespace async
 }  // namespace untangle
+
+#endif  // UNTANGLE_ASYNC_ASYNC_HPP
