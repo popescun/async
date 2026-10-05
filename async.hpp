@@ -617,11 +617,19 @@ class execution {
    * @param other - The execution to stop triggering. Detaching one that was never attached is not
    * an error: the caller asked for a state that already holds.
    *
+   * @remark Refused, and nothing changed, from inside this execution's own attachment pass - from
+   * an action of \p other, say: its actuators are dispatching, and refuse removals then. Detach
+   * once the pass is over.
+   *
    * @return true - \p other was attached and is no longer.
-   * @return false - \p other was not attached to this execution.
+   * @return false - \p other was not attached to this execution, or the detach was refused.
    */
   template <typename otherT>
   bool detach(otherT& other) {
+    if (actuator_execute_.is_dispatching() || actuator_stop_.is_dispatching()) {
+      return false;
+    }
+
     // The actuator's own action list is the record of what is attached; nothing else has to keep
     // one. An action is stored as a pointer, so the attachment is found by identity.
     const auto& actions = actuator_execute_.actions;

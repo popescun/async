@@ -1520,6 +1520,40 @@ TEST(execution_attach, detach_stops_an_attached_execution_from_being_triggered) 
 }
 
 /**
+ * @brief A detach from inside the attacher's own pass is refused, and leaves the attachment whole.
+ *
+ * The attached execution's action runs inside the attacher's attachment pass, while the attacher's
+ * actuators are dispatching - and the actuator refuses removals then. detach() must say so rather
+ * than clear its own record of an attachment that is still wired in.
+ */
+TEST(execution_attach, detach_from_inside_the_attachers_pass_is_refused) {
+  auto attacher = void_execution::create_instance("attacher");
+  auto attached = void_execution::create_instance("attached");
+  attacher->attach(attached);
+
+  bool detached = true;
+  int ran = 0;
+  attached->add_action([&attacher, &attached, &detached, &ran] {
+    detached = attacher->detach(*attached);
+    ++ran;
+  });
+
+  attacher->action_execute();  // the attacher's pass, on this thread
+
+  EXPECT_FALSE(detached) << "detach() reported success from inside the attacher's pass";
+
+  auto other = void_execution::create_instance("other");
+  EXPECT_THROW(other->attach(attached), untangle::async::invalid_attachment)
+      << "the attached execution no longer counts itself as attached";
+
+  attached->add_action([&ran] { ++ran; });
+  attacher->action_execute();
+  EXPECT_EQ(ran, 2) << "the attachment did not survive the refused detach";
+
+  EXPECT_TRUE(attacher->detach(*attached)) << "detach() refused once the pass was over";
+}
+
+/**
  * @brief detach() unwires the stop path too, not only the execute path.
  *
  * stop() is final for an execution, so one that still accepts and runs an action after its former

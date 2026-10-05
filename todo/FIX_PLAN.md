@@ -8,7 +8,7 @@ measured and deferred), 36 and 37 landed, and **38 answers the question steps 21
 it to close its own step 5. The
 per-step commits are in the table under **Progress**; this line no longer restates them, because
 that is how it kept drifting.
-**2026-10-05 review:** step 48 (group 10) is open, read at `01a4958` from fluxcpp's module
+**2026-10-05 review:** steps 48 and 49 (group 10) are open, read at `01a4958` from fluxcpp's module
 review.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
@@ -228,6 +228,7 @@ of atomic.
 | 47 ✅ | api | the gate: Debug, ASan, TSan, clang-format, make_doc.sh | whole repo | 51/51 on four presets; 0 doc warnings |
 | **Group 10 — from the 2026-10-05 review (open)** |
 | 48 | bug | an attached execution destroyed while its attacher runs it is a use-after-free | `:273-279` (`~execution`), `:907` | CONFIRMED (ASan, TSan) |
+| 49 | bug | `detach()` from inside the attacher's pass reports success while the attachment stays wired | `:624` (`detach`) | CONFIRMED (test) |
 
 ---
 
@@ -2064,3 +2065,21 @@ synchronised with a running worker either.
 > `dispatching` count the refusal reads belongs to the attacher's worker, read from the destroying
 > thread - a race of its own. The actuator is single-threaded by contract, so the fix stays here:
 > the lock proposed above covers all three.
+
+### Step 49 · `detach()` from inside the attacher's pass
+`async.hpp:624` (`detach`) · CONFIRMED by test
+
+Since actuator step 27 an actuator refuses removals while it is dispatching. An attached
+execution's action runs inside the attacher's attachment pass, so a `detach()` it makes there has
+both of its removals refused - and `detach()` ignored their answer: it cleared `other`'s link and
+its `attacher_execute_` and `attacher_stop_`, and returned true, while the attachment stayed wired
+in. The attached execution no longer counted itself as attached, a second attacher could take it,
+and its destructor would not take itself out of the first one. Single-threaded: not step 48.
+
+> Fixed: `detach()` returns false, and changes nothing, while either of this execution's attachment
+> actuators is dispatching (`is_dispatching()`), as intrinsic_interface's `disconnect_from()` does.
+> Test `execution_attach.detach_from_inside_the_attachers_pass_is_refused`: the detach returns
+> false, the attachment still runs on the next pass, a second attacher is refused, and the detach
+> succeeds once the pass is over. 66 of 66 on Debug, ASan and TSan. `~execution()` has the same
+> refusal when destroyed inside the attacher's pass; a destructor cannot refuse, so that stays with
+> step 48.
