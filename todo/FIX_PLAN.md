@@ -8,8 +8,8 @@ measured and deferred), 36 and 37 landed, and **38 answers the question steps 21
 it to close its own step 5. The
 per-step commits are in the table under **Progress**; this line no longer restates them, because
 that is how it kept drifting.
-**2026-10-05 review:** steps 48 and 49 (group 10) are open, read at `01a4958` from fluxcpp's module
-review.
+**2026-10-05 review:** step 49 is fixed (`66d1815`), step 48 (group 10) is open, read at
+`01a4958` from fluxcpp's module review.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
@@ -228,7 +228,7 @@ of atomic.
 | 47 ✅ | api | the gate: Debug, ASan, TSan, clang-format, make_doc.sh | whole repo | 51/51 on four presets; 0 doc warnings |
 | **Group 10 — from the 2026-10-05 review (open)** |
 | 48 | bug | an attached execution destroyed while its attacher runs it is a use-after-free | `:273-279` (`~execution`), `:907` | CONFIRMED (ASan, TSan) |
-| 49 | bug | `detach()` from inside the attacher's pass reports success while the attachment stays wired | `:624` (`detach`) | CONFIRMED (test) |
+| 49 ✅ | bug | `detach()` from inside the attacher's pass reports success while the attachment stays wired | `:624` (`detach`) | CONFIRMED (test) — fixed `66d1815` |
 
 ---
 
@@ -2066,7 +2066,7 @@ synchronised with a running worker either.
 > thread - a race of its own. The actuator is single-threaded by contract, so the fix stays here:
 > the lock proposed above covers all three.
 
-### Step 49 · `detach()` from inside the attacher's pass
+### Step 49 ✅ · `detach()` from inside the attacher's pass — DONE (`66d1815`)
 `async.hpp:624` (`detach`) · CONFIRMED by test
 
 Since actuator step 27 an actuator refuses removals while it is dispatching. An attached
