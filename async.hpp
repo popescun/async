@@ -990,8 +990,6 @@ class execution {
 
     execute_actions();
 
-    std::println("execution '{}' finishing thread", name);
-
     // Must stay last: ~execution() may free this object the moment it reads false.
     running_ = false;
   }
@@ -1021,8 +1019,6 @@ class execution {
 
     // A last pass for the attachments; this execution's own list is already empty here.
     execute_actions();
-
-    std::println("execution '{}' thread finished", name);
 
     // Must stay last: ~execution() may free this object the moment it reads false.
     running_ = false;
