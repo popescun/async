@@ -259,9 +259,9 @@ class execution {
   /**
    * @brief Destroys the execution, once its worker has left.
    *
-   * The worker is detached and cannot be joined, so this waits on the "running" state instead. It
-   * detaches this execution from whatever attached it first, and returns at once for one that was
-   * never started.
+   * The worker is detached and cannot be joined, so this waits on the "running" state instead, and
+   * returns at once for one that was never started. An attacher holds this execution weakly, so
+   * there is nothing to take back out of it: its next pass finds this gone and drops it.
    *
    * @attention Safe only because `running_` is cleared as the very last thing the worker does:
    * this object may be freed the moment it reads false, so nothing may follow it in execute() or
@@ -271,13 +271,6 @@ class execution {
    * the members already delete the copy operations several times over.
    */
   ~execution() {
-    // Out of the attacher first, before the worker is even asked to stop: from here on nothing
-    // may reach this object, and the actions about to be destroyed are the ones it holds.
-    if (!attachment_lifetime_->attacher.expired()) {
-      attacher_execute_->remove(&action_execute);
-      attacher_stop_->remove(&action_stop);
-    }
-
     {
       std::lock_guard<std::mutex> lock(action_mutex_);
       started_ = false;
@@ -552,12 +545,11 @@ class execution {
    * The attached execution's pending actions are run by this one's worker, and stopping this one
    * stops that one too. Actions of different types can be run on one thread this way.
    *
-   * The attachment is a pointer into \p other; what makes that safe is the record left on the
-   * other side, which ~execution() and \ref detach() use to take it back out.
+   * \p other is held weakly: a pass locks it for the call, so it is never destroyed while this
+   * execution's worker is running it, and one that is gone by the next pass is dropped there.
    *
    * @param other - A std::shared_ptr owning the execution to trigger; requiring one keeps an
-   * unowned execution from being attached at all. Attaching the same execution twice adds it
-   * twice, and one \ref detach() still removes it completely.
+   * unowned execution from being attached at all.
    *
    * @throw invalid_attachment - if \p other is attached already. An execution has at most one
    * attacher, which keeps the graph a forest and the cycle check a walk rather than a search.
@@ -583,23 +575,13 @@ class execution {
       }
     }
 
-    if (!actuator_execute_.is_connected()) {
-      actuator_execute_ = untangle::connect(other->action_execute);
-    } else {
-      actuator_execute_.add(&other->action_execute);
-    }
-
-    if (!actuator_stop_.is_connected()) {
-      actuator_stop_ = untangle::connect(other->action_stop);
-    } else {
-      actuator_stop_.add(&other->action_stop);
-    }
-
-    // What ~execution() needs to take itself back out of these actuators: the link proves this
-    // attacher is still there, and the two pointers are only ever followed while it does.
+    // Bound weakly, as owned actions: a call keeps other alive, a call to one that is gone throws
+    // untangle::invalid_action, and the actuator drops it.
+    std::erase_if(attachments_, [](const auto& entry) { return entry.attached.expired(); });
+    attachments_.push_back({other->attachment_lifetime_,
+                            actuator_execute_.add(untangle::bind(other, &otherT::execute_actions)),
+                            actuator_stop_.add(untangle::bind(other, &otherT::stop))});
     other->attachment_lifetime_->attacher = attachment_lifetime_;
-    other->attacher_execute_ = &actuator_execute_;
-    other->attacher_stop_ = &actuator_stop_;
 
     // An idle worker blocks until it is told otherwise; from now on it has to poll.
     {
@@ -630,19 +612,18 @@ class execution {
       return false;
     }
 
-    // The actuator's own action list is the record of what is attached; nothing else has to keep
-    // one. An action is stored as a pointer, so the attachment is found by identity.
-    const auto& actions = actuator_execute_.actions;
-    if (std::find(actions.begin(), actions.end(), &other.action_execute) == actions.end()) {
+    const auto entry = std::ranges::find_if(attachments_, [&other](const auto& candidate) {
+      return candidate.attached.lock() == other.attachment_lifetime_;
+    });
+    if (entry == attachments_.end()) {
       return false;
     }
 
-    actuator_execute_.remove(&other.action_execute);
-    actuator_stop_.remove(&other.action_stop);
+    actuator_execute_.remove(entry->execute);
+    actuator_stop_.remove(entry->stop);
+    attachments_.erase(entry);
 
     other.attachment_lifetime_->attacher.reset();
-    other.attacher_execute_ = nullptr;
-    other.attacher_stop_ = nullptr;
 
     {
       std::lock_guard<std::mutex> lock(action_mutex_);
@@ -679,8 +660,6 @@ class execution {
 
   /**
    * @brief Connection point that stops this execution. Bound to \ref stop().
-   *
-   * \ref attach() wires it together with \ref action_execute, and \ref detach() unwires both.
    *
    * @attention Wired by the constructor. Assigning to it unwires whatever is connected, silently.
    */
@@ -910,10 +889,16 @@ class execution {
       }
     }
 
-    // Last, and part of the pass: an attachment is only ever reached through action_execute, which
-    // is this function, so whoever drives this execution drives the ones attached to it.
+    // Last, and part of the pass: an attachment is only ever reached through execute_actions(),
+    // which is this function, so whoever drives this execution drives the ones attached to it.
     if (actuator_execute_.is_connected()) {
       actuator_execute_();
+
+      // The pass dropped the last attachment, gone since: the worker can block again.
+      if (!actuator_execute_.is_connected()) {
+        std::lock_guard<std::mutex> lock(action_mutex_);
+        attached_ = false;
+      }
     }
   }
 
@@ -1049,8 +1034,8 @@ class execution {
   /**
    * @brief Whether anything is attached, so the worker has to poll rather than block while idle.
    *
-   * Set by \ref attach(), cleared by \ref detach() once nothing is left. An attached execution
-   * destroyed while attached leaves it set, so the worker goes on polling: needless, not wrong.
+   * Set by \ref attach(), cleared by \ref detach() once nothing is left, and by the pass that drops
+   * the last attachment, destroyed since.
    *
    * @attention Not synchronised: every access is under action_mutex_.
    */
@@ -1067,8 +1052,9 @@ class execution {
    * @brief The actuator type used for attachments: the one type here that does not depend on
    * actionT.
    *
-   * \ref action_execute and \ref action_stop are std::function<void(void)> whatever actionT is,
-   * which is what lets an attacher of any specialisation be named.
+   * An attachment is bound to the other execution's execute_actions() and \ref stop(), both
+   * void(void) whatever its actionT is, which is what lets an execution of any specialisation be
+   * attached.
    */
   using void_actuator = actuator<std::function<void(void)>>;
 
@@ -1089,18 +1075,18 @@ class execution {
   std::shared_ptr<attachment> attachment_lifetime_ = std::make_shared<attachment>();
 
   /**
-   * @brief The attacher's own actuators, the ones holding this execution's two actions.
+   * @brief What this execution has attached: each one's link, and the two actions bound to it.
    *
-   * Not held as an execution*, which would mean this specialisation only: an execution may be
-   * attached by one of any specialisation, and a \ref void_actuator is the same type whatever
-   * actionT is.
-   *
-   * @attention Raw, and safe only in company: followed once, by ~execution(), and only while
-   * `attachment_lifetime_->attacher` has not expired - which is exactly while the attacher, and so
-   * these actuators, are still there.
+   * \ref detach() finds an attachment here by the other execution's link, and removes the two
+   * handles. A link that has expired belongs to an execution destroyed since; \ref attach() prunes
+   * those.
    */
-  void_actuator* attacher_execute_ = nullptr;
-  void_actuator* attacher_stop_ = nullptr;
+  struct attached_entry {
+    std::weak_ptr<attachment> attached;
+    const std::function<void(void)>* execute = nullptr;
+    const std::function<void(void)>* stop = nullptr;
+  };
+  std::vector<attached_entry> attachments_;
 
   // std::vector cannot hold void type; use an arbitrary type e.g. int
   using resultT = std::conditional<std::is_void<typename actionT::result_type>::value, int,

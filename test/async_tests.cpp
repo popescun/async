@@ -1431,9 +1431,9 @@ TEST(execution_binding, calling_a_binding_does_not_copy_the_action) {
 /**
  * @brief An attacher does not reach into an attached execution that has been destroyed.
  *
- * attach() hands the attacher's actuator a pointer into the attached object, so a destroyed
- * attachment has to drop out of its attacher and leave the other attachments working. The dead
- * entry is attached first, so the survivor behind it can only run if the dead one is stepped over.
+ * The attacher holds an attached execution weakly, so a destroyed one has to be dropped by its
+ * next pass and leave the other attachments working. The dead entry is attached first, so the
+ * survivor behind it can only run if the dead one is stepped over.
  *
  * @remark Driven through action_execute() on this thread rather than by a worker, so that a
  * dangling read is attributed to this line by the sanitizer instead of crashing a worker thread.
@@ -1455,7 +1455,7 @@ TEST(execution_attach, does_not_reach_an_attached_execution_that_has_been_destro
     // Attached first, so it is the first entry the actuator walks: the dead entry has to be
     // stepped over for the survivor behind it to run at all.
     attacher->attach(short_lived);
-  }  // short_lived is gone; attacher still points at its action_execute
+  }  // short_lived is gone; its binding in the attacher has nothing left to lock
 
   survivor->add_action([&survivor_ran] { survivor_ran.fetch_add(1, std::memory_order_relaxed); });
   attacher->attach(survivor);
@@ -1469,6 +1469,41 @@ TEST(execution_attach, does_not_reach_an_attached_execution_that_has_been_destro
 
   EXPECT_EQ(survivor_ran.load(), 1)
       << "a live attached execution must still be triggered past a destroyed one";
+}
+
+/**
+ * @brief An attached execution destroyed while its attacher's worker is running it (fix plan step
+ * 48).
+ *
+ * The attacher's worker is inside the attached execution's action when the test thread destroys
+ * it. The attacher must neither run on freed memory nor race the destruction, and keeps working.
+ *
+ * @attention Sanitizer-sensitive: a use-after-free under ASan, a data race under TSan.
+ */
+TEST(execution_attach, an_attached_execution_destroyed_while_its_attacher_runs_it_is_safe) {
+  auto attacher = void_execution::create_instance("attacher");
+  auto attached = void_execution::create_instance("attached");
+  attacher->attach(attached);
+
+  std::atomic_bool inside = {false};
+  attached->add_action([&inside] {
+    inside = true;
+    std::this_thread::sleep_for(100ms);  // the attacher's worker is in here
+  });
+  attacher->start();
+  ASSERT_TRUE(wait_for([&inside] { return inside.load(); }, 2000ms))
+      << "the attacher's worker never ran the attached action";
+
+  attached.reset();  // destroyed while the attacher's worker runs its action
+
+  std::atomic_bool ran = {false};
+  attacher->add_action([&ran] { ran = true; });
+  EXPECT_TRUE(wait_for([&ran] { return ran.load(); }, 2000ms))
+      << "the attacher stopped working after its attachment was destroyed";
+
+  attacher->stop();
+  EXPECT_TRUE(wait_for([&attacher] { return !attacher->is_running(); }, 2000ms))
+      << "the attacher's worker did not stop";
 }
 
 /**
