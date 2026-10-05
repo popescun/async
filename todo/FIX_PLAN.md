@@ -8,7 +8,7 @@ measured and deferred), 36 and 37 landed, and **38 answers the question steps 21
 it to close its own step 5. The
 per-step commits are in the table under **Progress**; this line no longer restates them, because
 that is how it kept drifting.
-**2026-10-05 review:** step 49 is fixed (`66d1815`), step 48 (group 10) is open, read at
+**2026-10-05 review:** steps 48 (`85b0ae0`) and 49 (`66d1815`) are fixed (group 10), read at
 `01a4958` from fluxcpp's module review.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
@@ -226,8 +226,8 @@ of atomic.
 | 45 ✅ | api | results survive a second batch, written under their mutex | `:726-739`, `:868` | CONFIRMED (`{2}` on the POC) |
 | 46 ✅ | api | what the change leaves behind: `<deque>`, docs, allocations | `:13`, `:739`, `:1009` | measured (3.00/action, 61 ns) |
 | 47 ✅ | api | the gate: Debug, ASan, TSan, clang-format, make_doc.sh | whole repo | 51/51 on four presets; 0 doc warnings |
-| **Group 10 — from the 2026-10-05 review (open)** |
-| 48 | bug | an attached execution destroyed while its attacher runs it is a use-after-free | `:273-279` (`~execution`), `:907` | CONFIRMED (ASan, TSan) |
+| **Group 10 — from the 2026-10-05 review (closed)** |
+| 48 ✅ | bug | an attached execution destroyed while its attacher runs it is a use-after-free | `:273-279` (`~execution`), `:907` | CONFIRMED (ASan, TSan) — fixed `85b0ae0` |
 | 49 ✅ | bug | `detach()` from inside the attacher's pass reports success while the attachment stays wired | `:624` (`detach`) | CONFIRMED (test) — fixed `66d1815` |
 
 ---
@@ -2026,12 +2026,12 @@ another still runs it in the same pass. Probed on both headers — `ran=2 batche
 the POC does not move that line, it only moves the mechanism from "pop the next" to "the list grew
 while it was being walked".
 
-## Group 10 — from the 2026-10-05 review (open)
+## Group 10 — from the 2026-10-05 review (closed)
 
 A read of `async.hpp` at `01a4958`, after fluxcpp's plan made an idle worker block (`502650b`) and
 dropped the per-thread prints (`2a06497`).
 
-### Step 48 · an attached execution destroyed while its attacher runs it
+### Step 48 ✅ · an attached execution destroyed while its attacher runs it — DONE (`85b0ae0`)
 `async.hpp:273-279` (`~execution`), `:907` (the attachment pass in `execute_actions`) · CONFIRMED
 by probe (ASan, TSan)
 
@@ -2065,6 +2065,19 @@ synchronised with a running worker either.
 > `dispatching` count the refusal reads belongs to the attacher's worker, read from the destroying
 > thread - a race of its own. The actuator is single-threaded by contract, so the fix stays here:
 > the lock proposed above covers all three.
+
+> Done without the lock - weak bindings instead (decided 2026-10-05). `attach()` already takes a
+> `std::shared_ptr`, so it now binds the other execution's `execute_actions()` and `stop()` weakly,
+> as owned actions (`untangle::bind`, the mechanism intrinsic_interface uses for its receivers): a
+> pass keeps the attached execution alive for the call, and one that is gone is dropped by the next
+> pass (`invalid_action`). `~execution()` no longer reaches into its attacher, so the raw
+> back-pointers `attacher_execute_` and `attacher_stop_` are gone, and with them the cross-thread
+> removal; `detach()` finds an attachment through `attachments_`, by the other execution's link. A
+> pass that drops the last attachment clears `attached_`, so the worker blocks again. Test
+> `execution_attach.an_attached_execution_destroyed_while_its_attacher_runs_it_is_safe`: failed under
+> ASan and TSan, passes; 67 of 67 on Debug, ASan and TSan, the attach tests 20 times under each
+> sanitizer. Still unsupported, as before: `attach()` and `detach()` from another thread while the
+> attacher runs.
 
 ### Step 49 ✅ · `detach()` from inside the attacher's pass — DONE (`66d1815`)
 `async.hpp:624` (`detach`) · CONFIRMED by test
