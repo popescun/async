@@ -14,8 +14,9 @@ that is how it kept drifting.
 public for the executor and was never committed; the executor is moving to per-worker queues that
 call `add_task()` like any caller, so it is reverted. Step 51 is what that design needs here: a worker
 that parks the moment its queue is empty, and a queue lock that blocks in the kernel at once. Both
-cost standalone callers the same. Measured on scratchpad copies; nothing fixed yet. Step 52, also for
-the executor: an execution cannot say how much work is waiting in it.
+cost standalone callers the same. Step 52, also for the executor: an execution cannot say how much
+work is waiting in it. **Both fixed in `11aa5a8`**: 73 of 73 on Debug, ASan and TSan; the executor's
+48 of 48 on all three against it; `doc/refman.pdf` at 49 pages.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
@@ -237,8 +238,8 @@ of atomic.
 | 49 ✅ | bug | `detach()` from inside the attacher's pass reports success while the attachment stays wired | `:624` (`detach`) | CONFIRMED (test) — fixed `66d1815` |
 | **Group 11 — for the executor** |
 | 50 | api | `add_queued_task()` is private, so a caller holding a sealed task re-wraps it | `:796` (`add_queued_task`) | WITHDRAWN — never committed, reverted; see step 51 |
-| 51 | perf | a worker parks the moment its queue is empty, and every add meets it in the kernel | `:764-814` (the two adds), `:990-1018` (`loop`), `:1031-1032` | CONFIRMED (profile, scratchpad variants) — guard tests written, fix pending |
-| 52 | api | an execution cannot say how much work is waiting in it | `:403` (`is_busy`, the nearest) | decided for the executor — tests written, fail to compile |
+| 51 ✅ | perf | a worker parks the moment its queue is empty, and every add meets it in the kernel | `:764-814` (the two adds), `:990-1018` (`loop`), `:1031-1032` | CONFIRMED (profile, scratchpad variants) — fixed `11aa5a8` |
+| 52 ✅ | api | an execution cannot say how much work is waiting in it | `:403` (`is_busy`, the nearest) | decided for the executor — fixed `11aa5a8` |
 
 ---
 
@@ -2139,7 +2140,7 @@ sealing and the worker. The executor is moving to per-worker queues (its `todo/F
 sealed once, here, and the API stays as it was. The change and its two tests
 (`queues_a_sealed_task_as_it_is`, `refuses_an_empty_sealed_task`) are reverted with step 51's work.
 
-### Step 51 · a worker parks the moment its queue is empty, and every add meets it in the kernel — OPEN
+### Step 51 ✅ · a worker parks the moment its queue is empty, and every add meets it in the kernel — DONE
 `async.hpp:764-814` (`add_queued_action`, `add_queued_task`), `:826` (`execute_actions`), `:990-1018`
 (`loop`), `:1031-1032` (`action_mutex_`, `action_cv_`) · CONFIRMED by profile and scratchpad variants,
 2026-10-09
@@ -2202,7 +2203,14 @@ worker has parked), `execution_queue.a_burst_from_several_threads_runs_every_act
 5000 adds; the count and the sum of their values), `execution_queue.stop_reaches_a_parked_and_a_busy_worker`
 (both leave their threads, and work added before `stop()` still runs).
 
-### Step 52 · an execution cannot say how much work is waiting in it — OPEN
+**Landed in `11aa5a8`.** As proposed: `cpu_pause()` and `lock_spinning()` (100 tries, then
+block) at namespace scope; every acquisition of `action_mutex_` goes through it, 13 sites; the
+worker spins `spins_before_parking` (2000) pauses on `work_queued_` before it takes the lock to
+wait; `sleeping_` is set around both waits - the attached worker's 10 ms `wait_for` too, or an add
+would stop waking it early - and an add notifies only when it is set. The speed is measured from
+the executor, with its step 31.
+
+### Step 52 ✅ · an execution cannot say how much work is waiting in it — DONE
 `async.hpp:403` (`is_busy`, the nearest it has) · read-only, 2026-10-09
 
 `is_busy()` says whether anything is queued or running, not how much. The executor's step 31 moves
@@ -2222,3 +2230,6 @@ tasks alike; drops to 0 once the worker has taken them, while `is_busy()` stays 
 `execution_pending.counts_what_waits_behind_a_held_worker` (2 actions and a task behind a held
 action: 3, then 0 once drained), `execution_pending.what_the_worker_took_is_not_pending` (three
 queued before `start()`, taken in one batch: 0 pending while the first runs, `is_busy()` true).
+
+**Landed in `11aa5a8`.** `execution::pending()`: the actions (listed and named) and tasks queued in
+`action_actuator_`, read under the lock. The three cases pass.
