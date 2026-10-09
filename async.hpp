@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <exception>
 #include <functional>
 #include <iterator>
@@ -23,8 +24,44 @@
 #include <utility>
 #include <vector>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 namespace untangle {
 namespace async {
+
+//! Tells the core this is a spin, so it saves power and yields to its sibling thread.
+inline void cpu_pause() noexcept {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+  _mm_pause();
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+  __yield();
+#elif defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield");
+#endif
+}
+
+/**
+ * @brief Locks @p mutex, trying a few times with a CPU pause before it blocks.
+ *
+ * An execution's queue lock is held for a few instructions at a time, by the worker and by every
+ * thread that adds. A std::mutex blocks in the kernel at once on macOS, so each meeting cost a pair
+ * of syscalls; trying first ends most of them in user space. It stays a std::mutex, so the worker
+ * still waits on a std::condition_variable.
+ */
+inline std::unique_lock<std::mutex> lock_spinning(std::mutex& mutex) {
+  constexpr int tries = 100;
+  for (int attempt = 0; attempt < tries; ++attempt) {
+    if (mutex.try_lock()) {
+      return std::unique_lock<std::mutex>(mutex, std::adopt_lock);
+    }
+    cpu_pause();
+  }
+  return std::unique_lock<std::mutex>(mutex);
+}
 /**
  *  @defgroup untangle_functions namespace untangle: functions
  */
@@ -272,7 +309,7 @@ class execution {
    */
   ~execution() {
     {
-      std::lock_guard<std::mutex> lock(action_mutex_);
+      auto lock = lock_spinning(action_mutex_);
       started_ = false;
       stopped_ = true;
     }
@@ -401,8 +438,22 @@ class execution {
    * @return true - actions are queued, or one is running.
    */
   bool is_busy() const {
-    std::lock_guard<std::mutex> lock(action_mutex_);
+    auto lock = lock_spinning(action_mutex_);
     return has_pending_actions_or_tasks() || executing_action_.load();
+  }
+
+  /**
+   * @brief How many actions and tasks are queued and not yet taken by the worker.
+   *
+   * What the worker has taken into the batch it is running is not pending: a worker running its
+   * last action reports 0 here and true from \ref is_busy().
+   *
+   * @remark Advisory, like \ref is_busy(): true the moment it is read.
+   */
+  std::size_t pending() const {
+    auto lock = lock_spinning(action_mutex_);
+    return action_actuator_.actions.size() + action_actuator_.actions_map.size() +
+           action_actuator_.tasks.size();
   }
 
   /**
@@ -439,7 +490,7 @@ class execution {
     wait_thread_to_finish();
     collecting_results_ = false;
     {
-      std::lock_guard<std::mutex> lock(action_mutex_);
+      auto lock = lock_spinning(action_mutex_);
       started_ = true;
       stopped_ = false;
     }
@@ -456,7 +507,7 @@ class execution {
    */
   void stop() {
     {
-      std::lock_guard<std::mutex> lock(action_mutex_);
+      auto lock = lock_spinning(action_mutex_);
       started_ = false;
       stopped_ = true;
     }
@@ -585,7 +636,7 @@ class execution {
 
     // An idle worker blocks until it is told otherwise; from now on it has to poll.
     {
-      std::lock_guard<std::mutex> lock(action_mutex_);
+      auto lock = lock_spinning(action_mutex_);
       attached_ = true;
     }
     action_cv_.notify_all();
@@ -626,7 +677,7 @@ class execution {
     other.attachment_lifetime_->attacher.reset();
 
     {
-      std::lock_guard<std::mutex> lock(action_mutex_);
+      auto lock = lock_spinning(action_mutex_);
       attached_ = actuator_execute_.is_connected();
     }
 
@@ -762,8 +813,9 @@ class execution {
    * @return true - queued; false - the execution is stopped and the callable was dropped.
    */
   bool add_queued_action(queued_action_t action) {
+    bool wake = false;
     {
-      std::lock_guard<std::mutex> lock(action_mutex_);
+      auto lock = lock_spinning(action_mutex_);
 
       // Once stopped, the worker is on its way out and would never reach this action; dropping it
       // here is what keeps it from sitting in the queue looking as though it were pending.
@@ -773,9 +825,14 @@ class execution {
       }
 
       action_actuator_.add(std::move(action));
+      work_queued_.store(true, std::memory_order_release);
+      wake = sleeping_;
     }
 
-    action_cv_.notify_one();
+    // A worker that has not parked finds the work on its own.
+    if (wake) {
+      action_cv_.notify_one();
+    }
     return true;
   }
 
@@ -794,8 +851,9 @@ class execution {
    * @return true - queued; false - the execution is stopped, or the task could not do its job.
    */
   bool add_queued_task(untangle::task_t task) {
+    bool wake = false;
     {
-      std::lock_guard<std::mutex> lock(action_mutex_);
+      auto lock = lock_spinning(action_mutex_);
 
       // As for an action: a stopped worker would never reach it, and a task left in the queue
       // would look pending while being unable to ever notify.
@@ -808,9 +866,14 @@ class execution {
         std::println(stderr, "warning: execution '{}' refused a task that cannot report", name);
         return false;
       }
+      work_queued_.store(true, std::memory_order_release);
+      wake = sleeping_;
     }
 
-    action_cv_.notify_one();
+    // A worker that has not parked finds the work on its own.
+    if (wake) {
+      action_cv_.notify_one();
+    }
     return true;
   }
 
@@ -831,12 +894,13 @@ class execution {
       actuator<queued_action_t> batch;
 
       {
-        std::lock_guard<std::mutex> lock(action_mutex_);
+        auto lock = lock_spinning(action_mutex_);
         if (!has_pending_actions_or_tasks()) {
           break;
         }
 
         batch = std::move(action_actuator_);
+        work_queued_.store(false, std::memory_order_relaxed);
 
         // Under the same lock, so is_busy() sees both or neither.
         executing_action_ = true;
@@ -880,7 +944,7 @@ class execution {
       // takes it.
       bool drained = false;
       {
-        std::lock_guard<std::mutex> lock(action_mutex_);
+        auto lock = lock_spinning(action_mutex_);
         drained = !has_pending_actions_or_tasks();
       }
 
@@ -896,7 +960,7 @@ class execution {
 
       // The pass dropped the last attachment, gone since: the worker can block again.
       if (!actuator_execute_.is_connected()) {
-        std::lock_guard<std::mutex> lock(action_mutex_);
+        auto lock = lock_spinning(action_mutex_);
         attached_ = false;
       }
     }
@@ -950,7 +1014,7 @@ class execution {
     {
       // An action may queue another, so a pass that drained can leave more behind it. That is the
       // next batch, not the end of this one.
-      std::lock_guard<std::mutex> lock(action_mutex_);
+      auto lock = lock_spinning(action_mutex_);
       if (has_pending_actions_or_tasks()) {
         return;
       }
@@ -989,19 +1053,30 @@ class execution {
 
   void loop() {
     for (;;) {
+      // Spins a little before parking, so work added in a burst finds the worker awake: no wake-up
+      // for the adder to pay, and no sleep for the worker.
+      for (int spin = 0;
+           spin < spins_before_parking && !work_queued_.load(std::memory_order_acquire); ++spin) {
+        cpu_pause();
+      }
+
       {
-        std::unique_lock<std::mutex> lock(action_mutex_);
+        auto lock = lock_spinning(action_mutex_);
 
         const auto has_work = [this] { return has_pending_actions_or_tasks() || !started_; };
 
         // Polls only while something is attached: an attached execution has its own list and
         // cannot notify this condition variable. With nothing attached the worker blocks until it
         // has work, is stopped, or attach() wakes it.
+        // Parked in either wait, and under the lock: an add reads it under the same lock, so it
+        // notifies exactly when the worker may be waiting.
+        sleeping_ = true;
         if (attached_) {
           action_cv_.wait_for(lock, std::chrono::milliseconds(10), has_work);
         } else {
           action_cv_.wait(lock, [this, &has_work] { return has_work() || attached_; });
         }
+        sleeping_ = false;
 
         if (!started_ && !has_pending_actions_or_tasks()) {
           break;
@@ -1030,6 +1105,15 @@ class execution {
   // stop() and read by the worker; nothing touches them outside this mutex.
   mutable std::mutex action_mutex_;
   std::condition_variable action_cv_;
+
+  //! Whether the worker is waiting on action_cv_, under action_mutex_: an add notifies only then.
+  bool sleeping_ = false;
+
+  //! Set by an add, cleared when the worker takes the batch: what the worker spins on.
+  std::atomic_bool work_queued_ = {false};
+
+  //! How many CPU pauses an idle worker spins before it parks: a few microseconds.
+  static constexpr int spins_before_parking = 2000;
 
   /**
    * @brief Whether anything is attached, so the worker has to poll rather than block while idle.

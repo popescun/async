@@ -15,6 +15,7 @@
 #include <async.hpp>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -410,6 +411,97 @@ TEST(execution_queue, a_continuous_worker_is_woken_by_an_add_rather_than_by_its_
   exec->stop();
   ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms))
       << "the worker was still running 5s after stop(); the object cannot be destroyed safely";
+}
+
+/**
+ * @brief A worker that has parked is woken by the next add, every time.
+ *
+ * Each round pauses long enough for the worker to stop spinning and park, so every add has to wake
+ * it: a lost wake-up leaves the action unrun.
+ */
+TEST(execution_queue, a_parked_worker_is_woken_by_every_add) {
+  constexpr int rounds = 50;
+
+  untangle::async::execution_poll poll;
+  const auto exec = void_execution::create_instance("parked_worker");
+  poll.add(*exec);
+
+  std::atomic_int ran = {0};
+  exec->start();
+
+  for (int round = 0; round < rounds; ++round) {
+    std::this_thread::sleep_for(5ms);
+    ASSERT_TRUE(exec->add_action([&ran] { ran.fetch_add(1); }));
+    ASSERT_TRUE(wait_for([&ran, round] { return ran.load() == round + 1; }, 1000ms))
+        << "a parked worker missed the add of round " << round;
+  }
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+/**
+ * @brief Adds from several threads at once, faster than the worker drains: each runs once.
+ */
+TEST(execution_queue, a_burst_from_several_threads_runs_every_action_once) {
+  constexpr int threads = 4;
+  constexpr int per_thread = 5000;
+
+  untangle::async::execution_poll poll;
+  const auto exec = void_execution::create_instance("burst");
+  poll.add(*exec);
+
+  std::atomic_int ran = {0};
+  std::atomic_llong sum = {0};
+  exec->start();
+
+  {
+    std::vector<std::jthread> adders;
+    for (int t = 0; t < threads; ++t) {
+      adders.emplace_back([&, t] {
+        for (int i = 0; i < per_thread; ++i) {
+          const long long value = static_cast<long long>(t) * per_thread + i;
+          exec->add_action([&ran, &sum, value] {
+            sum.fetch_add(value);
+            ran.fetch_add(1);
+          });
+        }
+      });
+    }
+  }
+
+  constexpr int total = threads * per_thread;
+  ASSERT_TRUE(wait_for([&ran] { return ran.load() == total; }, 5000ms))
+      << ran.load() << " of " << total << " ran";
+  EXPECT_EQ(sum.load(), static_cast<long long>(total) * (total - 1) / 2)
+      << "an action ran twice, or another not at all";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+/**
+ * @brief stop() reaches a worker that has parked, and one that has just been given work.
+ */
+TEST(execution_queue, stop_reaches_a_parked_and_a_busy_worker) {
+  untangle::async::execution_poll poll;
+  const auto parked = void_execution::create_instance("stop_parked");
+  const auto busy = void_execution::create_instance("stop_busy");
+  poll.add(*parked);
+  poll.add(*busy);
+
+  parked->start();
+  busy->start();
+  std::this_thread::sleep_for(5ms);
+
+  std::atomic_bool ran = {false};
+  ASSERT_TRUE(busy->add_action([&ran] { ran = true; }));
+
+  parked->stop();
+  busy->stop();
+
+  EXPECT_TRUE(wait_until_poll_idle(poll, 2000ms)) << "a stopped worker never left its thread";
+  EXPECT_TRUE(ran.load()) << "work added before stop() was dropped";
 }
 
 /**
@@ -2097,4 +2189,77 @@ TEST(execution_busy, a_continuous_worker_runs_while_idle) {
 
   ASSERT_TRUE(wait_for([&exec] { return !exec->is_running(); }, 2000ms))
       << "the worker did not finish";
+}
+
+//! Nothing is pending in an execution that was never given work.
+TEST(execution_pending, a_fresh_execution_has_nothing_pending) {
+  const auto exec = void_execution::create_instance("pending_fresh");
+
+  EXPECT_EQ(exec->pending(), 0u);
+}
+
+/**
+ * @brief pending() counts what waits behind a held worker, actions and tasks alike.
+ */
+TEST(execution_pending, counts_what_waits_behind_a_held_worker) {
+  untangle::async::execution_poll poll;
+  const auto exec = void_execution::create_instance("pending_queued");
+  poll.add(*exec);
+
+  std::atomic_bool held = {false};
+  std::atomic_bool release = {false};
+  exec->start();
+
+  ASSERT_TRUE(exec->add_action([&held, &release] {
+    held = true;
+    while (!release.load()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  }));
+  ASSERT_TRUE(wait_for([&held] { return held.load(); }, 2000ms)) << "the worker never took it";
+
+  ASSERT_TRUE(exec->add_action([] {}));
+  ASSERT_TRUE(exec->add_action([] {}));
+  ASSERT_TRUE(exec->add_task(std::function<void()>([] {}), std::function<void()>([] {})));
+  EXPECT_EQ(exec->pending(), 3u) << "pending() did not count the queued work";
+
+  release = true;
+  ASSERT_TRUE(wait_for([&exec] { return !exec->is_busy(); }, 2000ms));
+  EXPECT_EQ(exec->pending(), 0u) << "a drained execution still reports pending work";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+/**
+ * @brief What the worker has taken is running, not pending: busy, with nothing pending.
+ */
+TEST(execution_pending, what_the_worker_took_is_not_pending) {
+  untangle::async::execution_poll poll;
+  const auto exec = void_execution::create_instance("pending_taken");
+  poll.add(*exec);
+
+  std::atomic_bool held = {false};
+  std::atomic_bool release = {false};
+
+  // Queued before start, so the worker takes all three in one batch.
+  ASSERT_TRUE(exec->add_action([&held, &release] {
+    held = true;
+    while (!release.load()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  }));
+  ASSERT_TRUE(exec->add_action([] {}));
+  ASSERT_TRUE(exec->add_action([] {}));
+  EXPECT_EQ(exec->pending(), 3u);
+
+  exec->start();
+  ASSERT_TRUE(wait_for([&held] { return held.load(); }, 2000ms)) << "the worker never took it";
+
+  EXPECT_EQ(exec->pending(), 0u) << "work the worker took is still counted as pending";
+  EXPECT_TRUE(exec->is_busy());
+
+  release = true;
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
 }

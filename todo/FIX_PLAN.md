@@ -10,6 +10,12 @@ per-step commits are in the table under **Progress**; this line no longer restat
 that is how it kept drifting.
 **2026-10-05 review:** steps 48 (`85b0ae0`) and 49 (`66d1815`) are fixed (group 10), read at
 `01a4958` from fluxcpp's module review.
+**2026-10-09 — step 50 withdrawn, step 51 opened (group 11).** Step 50 made `add_queued_task()`
+public for the executor and was never committed; the executor is moving to per-worker queues that
+call `add_task()` like any caller, so it is reverted. Step 51 is what that design needs here: a worker
+that parks the moment its queue is empty, and a queue lock that blocks in the kernel at once. Both
+cost standalone callers the same. Measured on scratchpad copies; nothing fixed yet. Step 52, also for
+the executor: an execution cannot say how much work is waiting in it.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
@@ -229,6 +235,10 @@ of atomic.
 | **Group 10 — from the 2026-10-05 review (closed)** |
 | 48 ✅ | bug | an attached execution destroyed while its attacher runs it is a use-after-free | `:273-279` (`~execution`), `:907` | CONFIRMED (ASan, TSan) — fixed `85b0ae0` |
 | 49 ✅ | bug | `detach()` from inside the attacher's pass reports success while the attachment stays wired | `:624` (`detach`) | CONFIRMED (test) — fixed `66d1815` |
+| **Group 11 — for the executor** |
+| 50 | api | `add_queued_task()` is private, so a caller holding a sealed task re-wraps it | `:796` (`add_queued_task`) | WITHDRAWN — never committed, reverted; see step 51 |
+| 51 | perf | a worker parks the moment its queue is empty, and every add meets it in the kernel | `:764-814` (the two adds), `:990-1018` (`loop`), `:1031-1032` | CONFIRMED (profile, scratchpad variants) — guard tests written, fix pending |
+| 52 | api | an execution cannot say how much work is waiting in it | `:403` (`is_busy`, the nearest) | decided for the executor — tests written, fail to compile |
 
 ---
 
@@ -2096,3 +2106,119 @@ and its destructor would not take itself out of the first one. Single-threaded: 
 > succeeds once the pass is over. 66 of 66 on Debug, ASan and TSan. `~execution()` has the same
 > refusal when destroyed inside the attacher's pass; a destructor cannot refuse, so that stays with
 > step 48.
+
+## Group 11 — for the executor
+
+### Step 50 · `add_queued_task()` is private, so a caller holding a sealed task re-wraps it — WITHDRAWN
+`async.hpp:796` (`add_queued_task`), `:502` (`add_action`) · CONFIRMED, 2026-10-09
+
+The executor binds every task with `untangle::bind_task()` at its own door, so what it hands a worker
+is already a sealed `untangle::task_t`. The only public way in is `add_action()`, which binds it a
+second time (`std::bind` into another `std::function`) and stores it as an owned action: three
+allocations, freed on the worker, for a task that needed none of them. `add_queued_task()` takes a
+sealed task as it is, but it is private. Profiled from the executor: with one worker, re-wrapping
+and freeing take about 60% of the worker's time on empty tasks. See the executor's
+`todo/FIX_PLAN.md`, step 30.
+
+**Proposed:** make `add_queued_task()` public, unchanged. It already refuses a stopped execution and
+an empty task, and says so.
+
+**Tests (written first, fail to compile while it is private):**
+`execution_queue.queues_a_sealed_task_as_it_is` - a task sealed by `bind_task()` runs and notifies;
+`execution_queue.refuses_an_empty_sealed_task` - an empty `task_t` is refused.
+
+**Landed 2026-10-09.** `add_queued_task()` moved, unchanged, into `execution`'s public section after
+`add_task()`, which calls it; a remark says why it is public, and its reference to the still-private
+`add_queued_action()` is plain code so doxygen stays clean. 69 of 69 on Debug, ASan and TSan (67 + the
+two cases); `doc/refman.pdf` at 47 pages.
+
+**Withdrawn 2026-10-09, before it was committed.** The question it answered was the wrong one: the
+executor needed a public sealed-task door only because it kept its own queue (`pending_`) between
+sealing and the worker. The executor is moving to per-worker queues (its `todo/FIX_PLAN.md`, step
+31): it picks a worker at submission and calls `execution::add_task()` like any caller, so a task is
+sealed once, here, and the API stays as it was. The change and its two tests
+(`queues_a_sealed_task_as_it_is`, `refuses_an_empty_sealed_task`) are reverted with step 51's work.
+
+### Step 51 · a worker parks the moment its queue is empty, and every add meets it in the kernel — OPEN
+`async.hpp:764-814` (`add_queued_action`, `add_queued_task`), `:826` (`execute_actions`), `:990-1018`
+(`loop`), `:1031-1032` (`action_mutex_`, `action_cv_`) · CONFIRMED by profile and scratchpad variants,
+2026-10-09
+
+**Found from the executor.** With per-worker queues every submit is an `execution::add_task()`, so
+what an add costs is what the pool costs - and a standalone caller pays the same. Profiled on a
+scratchpad copy (one worker, a burst of 1000 empty tasks, Qt-free harness):
+
+- **The submitter** spends 56% of its time waiting for `action_mutex_` in the kernel
+  (`__psynch_mutexwait`) and 16% in `notify_one`.
+- **The worker** is asleep 56% of the time: it drains faster than it is fed, parks on `action_cv_`
+  the moment its queue is empty, and nearly every add has to wake it again. Each pass then takes
+  `action_mutex_` three or four times, against the submitter.
+
+`std::mutex` on macOS blocks in the kernel at once, so each of those meetings is a pair of syscalls,
+as it was for the executor's own lock (its step 28).
+
+**Measured** (scratchpad copies, executor prototyped with per-worker queues; median µs until 1000 empty
+tasks are done, two runs):
+
+| async variant | 1 worker | 2 workers | 4 workers |
+|---|---|---|---|
+| as committed | 103-105 | - | 221-242 |
+| N - `notify_one` only when the worker is parked | 101-103 | - | 231-254 |
+| P - N, and the worker spins ~2000 `yield`s on an atomic "work queued" flag before parking | 60-63 | 196-200 | 308-319 |
+| PS - P, and `action_mutex_` acquired with a `try_lock()` spin before blocking | 61-63 | 168-170 | 149-157 |
+| PS with the executor's counts lock-free (its step 31) | **47-49** | **113-134** | **131-134** |
+
+Dropped on the way: spinning with `std::condition_variable_any` (a lock of its own type) costs more
+than it saves - the condition variable takes an internal mutex on every wait and notify (1 worker 153
+µs); and giving the flag a cache line of its own (`alignas(128)`) made 1 worker worse (131 µs).
+
+**Proposed: PS.**
+- **Spin before parking.** `loop()` spins a bounded number of times (a named constant, ~2000 CPU
+  pauses, a few µs) on an atomic `work_queued_` before it takes the lock to wait. Both adds set it
+  under the lock; `execute_actions()` clears it when it takes the batch.
+- **Notify only a parked worker.** `loop()` sets `sleeping_` under `action_mutex_` before it waits and
+  clears it after; an add reads it under the same lock and calls `notify_one()` only when it was set.
+  The waiter sets the flag under the lock before it releases it in `wait()`, so no wake-up is lost.
+- **Spin before blocking on `action_mutex_`.** A `try_lock()` loop with a CPU pause before `lock()`,
+  for every acquisition. `std::mutex` and `std::condition_variable` stay. The CPU pause is the one
+  `untangle::adaptive_mutex` uses in the executor, written here again: async does not depend on the
+  executor.
+
+**Cost to accept:** a worker that goes idle burns a few µs of CPU before it parks. It matters for a
+battery-powered app only if workers wake many times a second.
+
+**Tests (written first):** these guard correctness, not speed - the speed is shown by the executor's
+`bench/qt_pool_vs_this`. A worker that has parked is woken by an add (after a pause long enough to
+park), many rounds, under TSan; a burst of adds runs every action exactly once; `stop()` still wakes
+a parked worker and a spinning one. The existing
+`a_continuous_worker_is_woken_by_an_add_rather_than_by_its_timeout` keeps its 2 ms limit.
+
+**Done when:** Debug, ASan and TSan are green, and `bench/qt_pool_vs_this` shows the executor at or
+below the prototype's numbers above.
+
+**Tests written 2026-10-09** - guards, passing before the fix, as the speed is the benchmark's to
+show: `execution_queue.a_parked_worker_is_woken_by_every_add` (50 rounds, each pausing 5 ms so the
+worker has parked), `execution_queue.a_burst_from_several_threads_runs_every_action_once` (4 threads x
+5000 adds; the count and the sum of their values), `execution_queue.stop_reaches_a_parked_and_a_busy_worker`
+(both leave their threads, and work added before `stop()` still runs).
+
+### Step 52 · an execution cannot say how much work is waiting in it — OPEN
+`async.hpp:403` (`is_busy`, the nearest it has) · read-only, 2026-10-09
+
+`is_busy()` says whether anything is queued or running, not how much. The executor's step 31 moves
+its queue into the executions (per-worker queues), and its `pending()` - "the queue's depth, not the
+pool's occupancy" - can keep that meaning only if each execution reports its own depth.
+
+**Decided (user, 2026-10-09):** `execution::pending()` - the actions and tasks queued and not yet
+taken by the worker, read under `action_mutex_`. What the worker has taken into its running batch is
+not pending, so a worker running its last task reports 0 and `is_busy()` true, as the executor's
+`pending()` does today. Advisory, like the executor's: true the moment it is read.
+
+**Tests (first):** 0 on a fresh execution; counts what is queued behind a held worker, actions and
+tasks alike; drops to 0 once the worker has taken them, while `is_busy()` stays true.
+
+**Tests written 2026-10-09, failing to compile until `pending()` exists:**
+`execution_pending.a_fresh_execution_has_nothing_pending`,
+`execution_pending.counts_what_waits_behind_a_held_worker` (2 actions and a task behind a held
+action: 3, then 0 once drained), `execution_pending.what_the_worker_took_is_not_pending` (three
+queued before `start()`, taken in one batch: 0 pending while the first runs, `is_busy()` true).
