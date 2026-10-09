@@ -17,9 +17,9 @@ that parks the moment its queue is empty, and a queue lock that blocks in the ke
 cost standalone callers the same. Step 52, also for the executor: an execution cannot say how much
 work is waiting in it. **Both fixed in `11aa5a8`**: 73 of 73 on Debug, ASan and TSan; the executor's
 48 of 48 on all three against it; `doc/refman.pdf` at 49 pages.
-**2026-10-09 — step 53 opened (group 11): the spin before parking costs a single task ~2 µs.**
-Measured from the executor's benchmark; it buys nothing there. Guard test written; nothing changed
-yet.
+**2026-10-09 — step 53 (group 11) done: the spin before parking cost a single task ~2 µs.**
+Measured from the executor's benchmark, where it bought nothing; removed in `be5986c`. 74 of 74 on
+ASan and TSan; the executor's 52 of 52 on all three against it.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
@@ -243,7 +243,7 @@ of atomic.
 | 50 | api | `add_queued_task()` is private, so a caller holding a sealed task re-wraps it | `:796` (`add_queued_task`) | WITHDRAWN — never committed, reverted; see step 51 |
 | 51 ✅ | perf | a worker parks the moment its queue is empty, and every add meets it in the kernel | `:764-814` (the two adds), `:990-1018` (`loop`), `:1031-1032` | CONFIRMED (profile, scratchpad variants) — fixed `11aa5a8` |
 | 52 ✅ | api | an execution cannot say how much work is waiting in it | `:403` (`is_busy`, the nearest) | decided for the executor — fixed `11aa5a8` |
-| 53 | perf | the spin before parking costs a single task ~2 µs and buys nothing on flux-shaped work | `:1056-1061` (`loop`), `:828`, `:869`, `:903`, `:1113-1116` | CONFIRMED (benchmark, spin on and off) |
+| 53 ✅ | perf | the spin before parking costs a single task ~2 µs and buys nothing on flux-shaped work | `:1056-1061` (`loop`), `:828`, `:869`, `:903`, `:1113-1116` | CONFIRMED (benchmark, spin on and off) — fixed `be5986c` |
 
 ---
 
@@ -2238,7 +2238,7 @@ queued before `start()`, taken in one batch: 0 pending while the first runs, `is
 **Landed in `11aa5a8`.** `execution::pending()`: the actions (listed and named) and tasks queued in
 `action_actuator_`, read under the lock. The three cases pass.
 
-### Step 53 · the spin before parking costs a single task ~2 µs and buys nothing on flux-shaped work — OPEN
+### Step 53 ✅ · the spin before parking costs a single task ~2 µs and buys nothing on flux-shaped work — DONE
 `async.hpp:1056-1061` (the spin in `loop`), `:828`, `:869` (the adds set `work_queued_`), `:903` (the
 batch clears it), `:1113-1116` (`work_queued_`, `spins_before_parking`) · CONFIRMED by the executor's
 `bench/qt_pool_vs_this`, 2026-10-09, at `80c81e0`
@@ -2276,3 +2276,18 @@ the instant the last one ran, so adds land while the worker is between draining 
 
 **Done when:** Debug, ASan and TSan are green here and in the executor, and the benchmark shows one
 task with work level with `QThreadPool` and the batches as above.
+
+**Landed in `be5986c`.** The spin at the top of `loop()`, `work_queued_` and
+`spins_before_parking` are gone; `sleeping_` and `lock_spinning()` stay, and `cpu_pause()` with it.
+The guard runs 2000 rounds in 5 ms, the worker now parking on every one. 73 of 73 on Debug, 74 of 74
+on ASan and TSan; the executor's 52 of 52 on all three; `doc/refman.pdf` unchanged - the members
+removed were private. `bench/qt_pool_vs_this`, two runs (median µs):
+
+| | executor | QThreadPool |
+|---|---|---|
+| one 10 µs task, 1 / 4 workers, delivered | 18.0, 14.8 / 18.1, 14.4 | 18.2, 14.9 / 18.2, 14.5 |
+| 1000 empty tasks, 1 worker, delivered | 174, 191 | 308, 285 |
+| 1000 empty tasks, 4 workers, delivered | 494, 411 | 614, 515 |
+| 1000 x 10 µs, 1 / 4 workers, ms | 12.5, 11.1 / 2.93, 3.16 | 12.5, 11.0 / 2.96, 3.16 |
+
+One task with work is now level with `QThreadPool`; the batches stay ahead.
