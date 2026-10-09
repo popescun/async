@@ -441,6 +441,38 @@ TEST(execution_queue, a_parked_worker_is_woken_by_every_add) {
 }
 
 /**
+ * @brief An add that lands as the worker parks is not lost.
+ *
+ * Each round adds the next action the instant the last one ran, so adds keep arriving while the
+ * worker goes from draining to parking - where a wake-up could slip between its check and its wait.
+ */
+TEST(execution_queue, an_add_as_the_worker_parks_is_not_lost) {
+  constexpr int rounds = 2000;
+
+  untangle::async::execution_poll poll;
+  const auto exec = void_execution::create_instance("add_as_it_parks");
+  poll.add(*exec);
+
+  std::atomic_int ran = {0};
+  exec->start();
+
+  for (int round = 0; round < rounds; ++round) {
+    ASSERT_TRUE(exec->add_action([&ran] { ran.fetch_add(1); }));
+
+    // Yields rather than sleeps, so the next add follows within microseconds, while the worker is
+    // still on its way to parking.
+    const auto deadline = std::chrono::steady_clock::now() + 1000ms;
+    while (ran.load() != round + 1 && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    ASSERT_EQ(ran.load(), round + 1) << "the add of round " << round << " was never run";
+  }
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+/**
  * @brief Adds from several threads at once, faster than the worker drains: each runs once.
  */
 TEST(execution_queue, a_burst_from_several_threads_runs_every_action_once) {

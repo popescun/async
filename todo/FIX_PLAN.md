@@ -17,6 +17,9 @@ that parks the moment its queue is empty, and a queue lock that blocks in the ke
 cost standalone callers the same. Step 52, also for the executor: an execution cannot say how much
 work is waiting in it. **Both fixed in `11aa5a8`**: 73 of 73 on Debug, ASan and TSan; the executor's
 48 of 48 on all three against it; `doc/refman.pdf` at 49 pages.
+**2026-10-09 — step 53 opened (group 11): the spin before parking costs a single task ~2 µs.**
+Measured from the executor's benchmark; it buys nothing there. Guard test written; nothing changed
+yet.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
@@ -240,6 +243,7 @@ of atomic.
 | 50 | api | `add_queued_task()` is private, so a caller holding a sealed task re-wraps it | `:796` (`add_queued_task`) | WITHDRAWN — never committed, reverted; see step 51 |
 | 51 ✅ | perf | a worker parks the moment its queue is empty, and every add meets it in the kernel | `:764-814` (the two adds), `:990-1018` (`loop`), `:1031-1032` | CONFIRMED (profile, scratchpad variants) — fixed `11aa5a8` |
 | 52 ✅ | api | an execution cannot say how much work is waiting in it | `:403` (`is_busy`, the nearest) | decided for the executor — fixed `11aa5a8` |
+| 53 | perf | the spin before parking costs a single task ~2 µs and buys nothing on flux-shaped work | `:1056-1061` (`loop`), `:828`, `:869`, `:903`, `:1113-1116` | CONFIRMED (benchmark, spin on and off) |
 
 ---
 
@@ -2233,3 +2237,42 @@ queued before `start()`, taken in one batch: 0 pending while the first runs, `is
 
 **Landed in `11aa5a8`.** `execution::pending()`: the actions (listed and named) and tasks queued in
 `action_actuator_`, read under the lock. The three cases pass.
+
+### Step 53 · the spin before parking costs a single task ~2 µs and buys nothing on flux-shaped work — OPEN
+`async.hpp:1056-1061` (the spin in `loop`), `:828`, `:869` (the adds set `work_queued_`), `:903` (the
+batch clears it), `:1113-1116` (`work_queued_`, `spins_before_parking`) · CONFIRMED by the executor's
+`bench/qt_pool_vs_this`, 2026-10-09, at `80c81e0`
+
+**Found** by the user's question, why one task with work arrived ~2.5 µs later through the executor
+than through `QThreadPool` in every run since step 51. The benchmark built against a copy of this
+header with `spins_before_parking` at 0 and at 2000, two runs each, alternating (median µs):
+
+| | spin off | spin on (2000) | QThreadPool, all runs |
+|---|---|---|---|
+| one 10 µs task, 1 / 4 workers, delivered | 17.5-18.0 / 17.5-24.1 | 19.5-19.7 / 19.5-19.9 | 17.4-18.8 / 17.5-24.5 |
+| 1000 empty tasks, 1 worker, delivered | 206-211 | 182-224 | 280-340 |
+| 1000 empty tasks, 4 workers, delivered | 339-440 | 342-388 | 396-560 |
+| 1000 x 10 µs, 1 / 4 workers, ms | 11.1-12.2 / 2.84-2.98 | 11.1-11.2 / 2.93-2.97 | 11.1-12.3 / 2.83-2.98 |
+
+(The 24 µs at 4 workers is one run in which both pools were slow alike.)
+
+- **The cost is in the work, not the wake-up:** with an empty task the executor is as fast to start
+  as `QThreadPool`; with 10 µs of work, `processed` comes ~1 µs later. Likely, not proven: a core
+  spinning on `yield` is clocked down, and the next work starts slower.
+- **It buys nothing here:** every result is posted to the main thread, which keeps the worker slower
+  than the submitter, so in a burst its queue does not empty and it does not reach the spin. It paid
+  only in the Qt-free harness the step was prototyped with, whose callbacks did nothing (1 worker:
+  61 against 103 µs per 1000 tasks). A flux store answers a presenter on the UI thread: the
+  benchmark's shape, not the harness's.
+
+**Decided (user, 2026-10-09): remove the spin before parking.** `work_queued_` and
+`spins_before_parking` go with it. Step 51's other two changes stay: an add notifies only a parked
+worker (`sleeping_`), and `action_mutex_` is acquired with a spin before it blocks.
+
+**Tests.** The speed is the benchmark's to show. Without the spin a worker parks the moment its queue
+is empty, so the guards are about that moment: step 51's three cases, and a new one,
+`execution_queue.an_add_as_the_worker_parks_is_not_lost` - many rounds, each adding the next action
+the instant the last one ran, so adds land while the worker is between draining and parking.
+
+**Done when:** Debug, ASan and TSan are green here and in the executor, and the benchmark shows one
+task with work level with `QThreadPool` and the batches as above.

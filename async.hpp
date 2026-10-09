@@ -825,7 +825,6 @@ class execution {
       }
 
       action_actuator_.add(std::move(action));
-      work_queued_.store(true, std::memory_order_release);
       wake = sleeping_;
     }
 
@@ -866,7 +865,6 @@ class execution {
         std::println(stderr, "warning: execution '{}' refused a task that cannot report", name);
         return false;
       }
-      work_queued_.store(true, std::memory_order_release);
       wake = sleeping_;
     }
 
@@ -900,7 +898,6 @@ class execution {
         }
 
         batch = std::move(action_actuator_);
-        work_queued_.store(false, std::memory_order_relaxed);
 
         // Under the same lock, so is_busy() sees both or neither.
         executing_action_ = true;
@@ -1053,13 +1050,6 @@ class execution {
 
   void loop() {
     for (;;) {
-      // Spins a little before parking, so work added in a burst finds the worker awake: no wake-up
-      // for the adder to pay, and no sleep for the worker.
-      for (int spin = 0;
-           spin < spins_before_parking && !work_queued_.load(std::memory_order_acquire); ++spin) {
-        cpu_pause();
-      }
-
       {
         auto lock = lock_spinning(action_mutex_);
 
@@ -1108,12 +1098,6 @@ class execution {
 
   //! Whether the worker is waiting on action_cv_, under action_mutex_: an add notifies only then.
   bool sleeping_ = false;
-
-  //! Set by an add, cleared when the worker takes the batch: what the worker spins on.
-  std::atomic_bool work_queued_ = {false};
-
-  //! How many CPU pauses an idle worker spins before it parks: a few microseconds.
-  static constexpr int spins_before_parking = 2000;
 
   /**
    * @brief Whether anything is attached, so the worker has to poll rather than block while idle.
