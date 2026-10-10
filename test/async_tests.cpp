@@ -252,6 +252,107 @@ TEST(execution_queue, queueing_through_a_binding_copies_the_argument_once) {
       << " times on its way through the binding";
 }
 
+namespace {
+
+/**
+ * @brief An action type that is not a std::function, and counts its own copies and moves.
+ *
+ * A std::function relocates what it holds differently on each standard library, so counting
+ * through one would measure the library. An execution runs any callable naming its result_type.
+ */
+struct move_counting_action {
+  using result_type = int;
+
+  move_counting_action() = default;
+  move_counting_action(const move_counting_action&) {
+    copies.fetch_add(1, std::memory_order_relaxed);
+  }
+  move_counting_action(move_counting_action&&) noexcept {
+    moves.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  int operator()(int n) const { return n; }
+
+  static inline std::atomic_int copies = {0};
+  static inline std::atomic_int moves = {0};
+};
+
+using move_counting_execution = untangle::async::execution<move_counting_action>;
+
+//! How many times a task_t moves a callable it is built from: the standard library's share, which
+//! the cases below allow for so that they count only the queue's own moves.
+int moves_to_erase_a_task() {
+  const auto before = move_counting_action::moves.load();
+  untangle::task_t erased = [action = move_counting_action{}] { (void)action(0); };
+  (void)erased;
+  return move_counting_action::moves.load() - before;
+}
+
+}  // namespace
+
+/**
+ * @brief A task's action the caller gives up is moved into the queue once.
+ *
+ * What a pool does with every task it submits. The task is queued and never run.
+ */
+TEST(execution_queue, queueing_a_task_moves_an_action_given_up_once) {
+  auto exec = move_counting_execution::create_instance("task_moves");
+  const int erasure = moves_to_erase_a_task();
+  move_counting_action action;
+
+  const auto copies_before = move_counting_action::copies.load();
+  const auto moves_before = move_counting_action::moves.load();
+
+  EXPECT_TRUE(exec->add_task(std::move(action), 7, std::function<void(int)>([](int) {})));
+
+  EXPECT_EQ(move_counting_action::copies.load() - copies_before, 0)
+      << "an action moved into add_task() was copied";
+  EXPECT_EQ(move_counting_action::moves.load() - moves_before, erasure + 1)
+      << "the action was moved " << move_counting_action::moves.load() - moves_before - erasure
+      << " times on its way into the queue";
+}
+
+/**
+ * @brief A task's action the caller keeps is copied into the queue once, and not moved after.
+ */
+TEST(execution_queue, queueing_a_task_copies_an_action_the_caller_keeps_once) {
+  auto exec = move_counting_execution::create_instance("task_copies");
+  const int erasure = moves_to_erase_a_task();
+  const move_counting_action action;
+
+  const auto copies_before = move_counting_action::copies.load();
+  const auto moves_before = move_counting_action::moves.load();
+
+  EXPECT_TRUE(exec->add_task(action, 7, std::function<void(int)>([](int) {})));
+
+  EXPECT_EQ(move_counting_action::copies.load() - copies_before, 1)
+      << "the queue does not hold one copy of the caller's action";
+  EXPECT_EQ(move_counting_action::moves.load() - moves_before, erasure)
+      << "the copy was moved " << move_counting_action::moves.load() - moves_before - erasure
+      << " times on its way into the queue";
+}
+
+/**
+ * @brief A bare lambda is a task's action too: add_task() makes the execution's action type of it.
+ */
+TEST(execution_queue, runs_a_task_given_a_bare_lambda_as_its_action) {
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("task_bare_lambda");
+  poll.add(*exec);
+
+  std::atomic_int reported = {-1};
+
+  exec->start();
+  ASSERT_TRUE(exec->add_task([](int n) { return n * 2; }, 21,
+                             std::function<void(int)>([&reported](int r) { reported.store(r); })));
+
+  EXPECT_TRUE(wait_for([&reported] { return reported.load() == 42; }, 2000ms))
+      << "a task given a lambda as its action never notified";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
 /**
  * @brief An action queued before run() runs exactly once.
  *

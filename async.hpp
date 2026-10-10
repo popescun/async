@@ -577,7 +577,7 @@ class execution {
    * from. That is what a task is for.
    *
    * @tparam Args - The argument types to bind, of which the last is the callback.
-   * @param action - The action to run.
+   * @param action - The action to run, copied into the task.
    * @param args - The arguments to bind to \p action, followed by the callback to notify.
    *
    * @return true - queued, and this execution's worker will run it and notify the callback.
@@ -586,7 +586,16 @@ class execution {
    * run. **The answer is the whole report** - nothing is thrown and the callback is not invoked.
    */
   template <typename... Args>
-  bool add_task(actionT action, Args&&... args) {
+  bool add_task(const actionT& action, Args&&... args) {
+    return add_queued_task(untangle::bind_task(action, std::forward<Args>(args)...));
+  }
+
+  /**
+   * @brief Queues a task as the overload above does, moving the action into it rather than copying
+   * it. A temporary and a lambda land here.
+   */
+  template <typename... Args>
+  bool add_task(actionT&& action, Args&&... args) {
     return add_queued_task(untangle::bind_task(std::move(action), std::forward<Args>(args)...));
   }
 
