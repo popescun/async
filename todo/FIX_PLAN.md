@@ -88,14 +88,14 @@ remains of the group**, and step 33 joins group 7.
 | `5d4a4ee` | 25 — `add_action()` and both `bind()` lambdas forward |
 | `305b672` | 26 — `\|=` on a bool becomes `\|\|`, and the poll's fold gains a test |
 | `26f91ed` | 36 — `run()` and `start()` wait for a resident worker to leave |
-| *(uncommitted)* | 32 — `finishing_` is gone; `is_running()` is `running_` |
-| *(uncommitted)* | 38 — `on_error` carries what an action threw to the caller |
+| `fbea973` | 32 — `finishing_` is gone; `is_running()` is `running_` |
+| `c3542dc` | 38 — `on_error` carries what an action threw to the caller |
 | `ebb1f1c` (actuator) | 39 — a moved actuator keeps the actions it moved along with |
 | `3761f0e`, `8e1c561` | 40-45 — the presets, and the five guards written before the change |
 | `7e07a51` | 40-45 — the action queue becomes an actuator |
 | `a8b8b47` (actuator) | 42 — an actuator records what its actions throw, and stops printing it |
 | `77ba66a` | 40-45 — the drain lets the actuator invoke its own actions |
-| `050901f`, `3f6c198`, *(uncommitted)* | 46, 47 — the sweep, the measurement and the gate |
+| `050901f`, `3f6c198`, `a8a00ee` | 46, 47 — the sweep, the measurement and the gate |
 
 **NEXT: nothing in group 9.** The action queue is an actuator and the actuator drives it; **39 to 47
 have landed**. The group was raised by the user on 2026-09-23 on the strength of the actuator's
