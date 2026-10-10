@@ -95,7 +95,7 @@ remains of the group**, and step 33 joins group 7.
 | `7e07a51` | 40-45 — the action queue becomes an actuator |
 | `a8b8b47` (actuator) | 42 — an actuator records what its actions throw, and stops printing it |
 | `77ba66a` | 40-45 — the drain lets the actuator invoke its own actions |
-| `050901f`, `3f6c198`, `a8a00ee` | 46, 47 — the sweep, the measurement and the gate |
+| `3f6c198` | 46, 47 — the sweep, the measurement and the gate |
 
 **NEXT: nothing in group 9.** The action queue is an actuator and the actuator drives it; **39 to 47
 have landed**. The group was raised by the user on 2026-09-23 on the strength of the actuator's
