@@ -259,7 +259,7 @@ of atomic.
 | 56 | perf | a parked worker is notified by every add until it wakes | `:828`, `:868`, `:1063-1069` (`loop`) | measured — no time saved, decline recommended |
 | 57 ✅ | perf | a worker takes the queue's lock up to five times per batch | `:887-964`, `:1006-1021`, `:1051-1083` | measured (executor benchmark) — **not taken** |
 | 58 | hygiene | a refused add prints its warning under the queue's lock | `:823`, `:860`, `:865` | read-only — OPEN |
-| 59 | hygiene | `lock_spinning()` explains itself by macOS | `:47-64` | read-only — OPEN |
+| 59 | hygiene | `lock_spinning()` explains itself by macOS | `:47-64` | measured (executor benchmark, spin off): the spin is essential — OPEN, the comment only |
 
 ---
 
@@ -2435,3 +2435,34 @@ can wait on a `std::condition_variable` - and says where it was measured. The ex
 does the same for `adaptive_mutex` and drops its copy of `cpu_pause()` for this one. No behaviour
 changes; the suites are the guards, `doc/refman.pdf` regenerated. A Linux run, which the executor's
 step 19 owes, would show whether the spin pays off there.
+
+**Measured (2026-10-10): what each spin is worth now.** The current code built four ways from a
+scratchpad mirror (`probe/spin`) - async's `lock_spinning()` and the executor's `adaptive_mutex`
+each with their tries at 0, so straight to `std::mutex::lock()` - with the benchmark as committed
+(`260d984`), three runs each in rotation:
+
+| | spinning (committed) | async without | executor without | neither | `QThreadPool` |
+|---|---|---|---|---|---|
+| 4 workers, 1000 empty, delivered | 75.0-79.1 µs | **131.5-166.0** | 72.9-79.8 | **153.8-153.9** | 205.3-339.2 |
+| submit 1000 x 10 µs, 4 workers | 29.1-30.9 µs | **53.6-58.8** | 29.1-30.0 | 34.0-53.6 | 29.6-33.5 |
+| submit mixed, 4 workers | 35.4-48.9 µs | **66.9-97.7** | 40.7-48.6 | **96.0-99.4** | 38.8-49.5 |
+| 1 worker, 1000 empty, delivered per run | 50, 157, 93 µs | 102, 67, 72 | 93, 34, 66 | 66, 45, 46 | 111.9-156.8 |
+| single tasks, real work, mixed delivered | - | level | level | level | - |
+
+- **async's spin is essential:** without it every four-worker case slows down, empty batches 2x -
+  its queue lock is met by the submitter and a worker on every task.
+- **The executor's `adaptive_mutex` buys nothing any more:** without it every case stays in the
+  committed code's ranges. Since the executor's step 31 its `add_task()` never takes the pool's
+  lock; only `wait()` and a drain with a `wait()` counted do, neither on the hot path. The reason
+  for the executor's step 28 went with its `pending_`.
+- **One worker's empty batch does better with neither spinning** (45-66 µs against 50-157, three
+  runs, the noisy case): in its ping-pong the submitter and the worker hand the queue lock to each
+  other task by task, and spinning seems to lengthen each hand-off. Fewer tries in async, rather
+  than none, might keep four workers fast and ease it - a measurement for later, under the rule that
+  no case gets worse.
+- `QThreadPool`'s `QMutex` does not spin at all: one compare-and-swap (`fastTryLock()`, installed
+  `qmutex.h`), then `lockInternal()`, which goes straight to `futexWait()` - or, on macOS, a Mach
+  `semaphore_wait()` (`qmutex.cpp`, `qmutex_mac.cpp`, Qt's 6.8 and 6.11 branches).
+
+**So the spin stays, and this step stays a comment.** It is what keeps four workers fast; the
+executor's own spin goes instead (its step 41).
