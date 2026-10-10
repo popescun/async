@@ -24,6 +24,9 @@ ASan and TSan; the executor's 52 of 52 on all three against it.
 benched against `QThreadPool`). **Step 54** - `add_task()` takes the action by value - is the one the
 benchmark shows: with the executor's step 34 and the actuator's step 30, submitting 15-20% faster. 55
 is optional (a Qt-free gain only), 56 measured and not worth taking, 57 and 58 open.
+**2026-10-10 — step 54 done (`1f8a02d`):** `add_task()` is two overloads, `const actionT&` and
+`actionT&&`, so a task's action is copied or moved into the queue once. 77 of 77 on Debug, ASan and
+TSan; the executor's 55 of 55 on all three against it; `doc/refman.pdf` at 49 pages.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
@@ -248,7 +251,7 @@ of atomic.
 | 51 ✅ | perf | a worker parks the moment its queue is empty, and every add meets it in the kernel | `:764-814` (the two adds), `:990-1018` (`loop`), `:1031-1032` | CONFIRMED (profile, scratchpad variants) — fixed `11aa5a8` |
 | 52 ✅ | api | an execution cannot say how much work is waiting in it | `:403` (`is_busy`, the nearest) | decided for the executor — fixed `11aa5a8` |
 | 53 ✅ | perf | the spin before parking costs a single task ~2 µs and buys nothing on flux-shaped work | `:1056-1061` (`loop`), `:828`, `:869`, `:903`, `:1113-1116` | CONFIRMED (benchmark, spin on and off) — fixed `be5986c` |
-| 54 | perf | `add_task()` takes the action by value, and every layer above and below moves it again | `:589` (`add_task`) | CONFIRMED (executor benchmark, the fix alone) — OPEN |
+| 54 ✅ | perf | `add_task()` takes the action by value, and every layer above and below moves it again | `:589` (`add_task`) | CONFIRMED (tests, executor benchmark) — fixed `1f8a02d` |
 | 55 | perf | the queue's storage is freed with every batch, and the next add allocates it under the lock | `:900` (`execute_actions`), `:852` (`add_queued_task`) | CONFIRMED (Qt-free probe), not in the benchmark — OPEN, optional |
 | 56 | perf | a parked worker is notified by every add until it wakes | `:828`, `:868`, `:1063-1069` (`loop`) | measured — no time saved, decline recommended |
 | 57 | perf | a worker takes the queue's lock up to five times per batch | `:887-964`, `:1006-1021`, `:1051-1083` | read-only, counted by a probe — OPEN, not prototyped |
@@ -2301,7 +2304,7 @@ removed were private. `bench/qt_pool_vs_this`, two runs (median µs):
 
 One task with work is now level with `QThreadPool`; the batches stay ahead.
 
-### Step 54 · `add_task()` takes the action by value, and every layer above and below moves it again — OPEN
+### Step 54 ✅ · `add_task()` takes the action by value, and every layer above and below moves it again — DONE
 `async.hpp:589` (`add_task`) · CONFIRMED by the executor's `bench/qt_pool_vs_this`, 2026-10-10, at
 `b98dfd9`
 
@@ -2322,6 +2325,26 @@ the queue, at most two moves for an rvalue - failing today. Guards: a named `std
 temporary both go in, and an empty one is still refused.
 
 **Order:** after the actuator's step 30; the executor's step 34 follows.
+
+**Tests (written first, 2026-10-10):** `queueing_a_task_moves_an_action_given_up_once` - an action
+handed over with `std::move()`: 0 copies and one move beyond `task_t`'s type erasure - moved twice,
+failing; `queueing_a_task_copies_an_action_the_caller_keeps_once` - a named action: one copy and no
+move beyond the erasure - moved once, failing; `runs_a_task_given_a_bare_lambda_as_its_action` - a
+guard that a lambda is still a task's action, passing. `move_counting_action` is a plain functor, not
+a `std::function`, whose relocations differ between standard libraries; `moves_to_erase_a_task()`
+measures the library's share. With the actuator's step 30 already in, the counts were one lower than
+the actuator's own "before".
+
+**Decided (user, 2026-10-10): two overloads**, `add_task(const actionT&, ...)` and
+`add_task(actionT&&, ...)`, over a forwarding template. A template would deduce a lambda's own type,
+which has no `result_type`, and need a constraint and an explicit conversion to take one; the
+overloads take a lambda by converting it, as the by-value parameter did, and match `add_action()` and
+`add_queued_task()`, which take `actionT` itself.
+
+**Landed in `1f8a02d`.** The `const actionT&` overload keeps the doc comment, its `@param` saying the
+action is copied; the `actionT&&` one has a brief saying it moves, and that temporaries and lambdas
+land there. `add_action()` unchanged. 77 of 77 on Debug, ASan and TSan; the executor's 55 of 55 on all
+three against it; `doc/refman.pdf` at 49 pages, no doxygen warning from the header.
 
 ### Step 55 · the queue's storage is freed with every batch, and the next add allocates it under the lock — OPEN, optional
 `async.hpp:900` (`execute_actions`), `:852` (`add_queued_task`), with the actuator's step 31 · CONFIRMED
