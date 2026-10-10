@@ -259,6 +259,7 @@ of atomic.
 | 56 | perf | a parked worker is notified by every add until it wakes | `:828`, `:868`, `:1063-1069` (`loop`) | measured — no time saved, decline recommended |
 | 57 ✅ | perf | a worker takes the queue's lock up to five times per batch | `:887-964`, `:1006-1021`, `:1051-1083` | measured (executor benchmark) — **not taken** |
 | 58 | hygiene | a refused add prints its warning under the queue's lock | `:823`, `:860`, `:865` | read-only — OPEN |
+| 59 | hygiene | `lock_spinning()` explains itself by macOS | `:47-64` | read-only — OPEN |
 
 ---
 
@@ -2411,3 +2412,26 @@ The measurement is the executor's, its step 38.
 Only a refused add prints, so the hot path pays nothing, but it is I/O under a lock the worker needs.
 **Proposed:** note the refusal under the lock and print after it; the warnings' text unchanged. The
 executor's step 39.
+
+### Step 59 · `lock_spinning()` explains itself by macOS — OPEN, hygiene
+`async.hpp:47-54` (the doc comment), `:55-64` (`lock_spinning`), `:34-45` (`cpu_pause`) · read from
+the code, 2026-10-10 (user: "all implementations in actuator, async, executor should be agnostic of
+the platform")
+
+**The code is portable; the comment is not.** `lock_spinning()` tries `std::mutex::try_lock()` up
+to 100 times with `cpu_pause()` between, then blocks in `lock()` - standard C++, no platform
+`#ifdef`. `cpu_pause()` is conditional on the CPU architecture only - `pause` on x86, `yield` on
+ARM, MSVC's intrinsics, nothing elsewhere - the usual way to write a spin hint, the language having
+none. But the comment's reason is a platform's: "A std::mutex blocks in the kernel at once on
+macOS, so each meeting cost a pair of syscalls". Measured on macOS (step 51). On Linux glibc's
+default mutex does not spin either - a contended one waits on a futex - so it likely pays there too,
+not measured; on Windows `std::mutex` is an SRW lock, which spins a little already, so it likely
+adds less, not measured.
+
+**Proposed:** the comment gives the reason in platform-neutral terms - the lock is held for a few
+instructions by the worker and every thread that adds, a contended `std::mutex` may go to the kernel
+at once, trying first keeps most meetings in user space, and it stays a `std::mutex` so the worker
+can wait on a `std::condition_variable` - and says where it was measured. The executor's step 41
+does the same for `adaptive_mutex` and drops its copy of `cpu_pause()` for this one. No behaviour
+changes; the suites are the guards, `doc/refman.pdf` regenerated. A Linux run, which the executor's
+step 19 owes, would show whether the spin pays off there.
