@@ -27,6 +27,9 @@ is optional (a Qt-free gain only), 56 measured and not worth taking, 57 and 58 o
 **2026-10-10 — step 54 done (`1f8a02d`):** `add_task()` is two overloads, `const actionT&` and
 `actionT&&`, so a task's action is copied or moved into the queue once. 77 of 77 on Debug, ASan and
 TSan; the executor's 55 of 55 on all three against it; `doc/refman.pdf` at 49 pages.
+**2026-10-10 — step 57 measured, not taken** (the executor's step 38): holding the queue's lock
+between batches helped four workers' empty batch and kept one worker's out of its fast mode in every
+run - a regression in one case.
 **Tests:** 46 of 46 green in Debug, under AddressSanitizer and under ThreadSanitizer, measured at
 step 38 on 2026-09-22; `async_smoke_test` exit 0 on all three, 0 TSan warnings; clang-format clean.
 **Docs:** 0 doxygen warnings; `doc/refman.pdf` is 43 pages (was 31), rebuilt with
@@ -254,7 +257,7 @@ of atomic.
 | 54 ✅ | perf | `add_task()` takes the action by value, and every layer above and below moves it again | `:589` (`add_task`) | CONFIRMED (tests, executor benchmark) — fixed `1f8a02d` |
 | 55 | perf | the queue's storage is freed with every batch, and the next add allocates it under the lock | `:900` (`execute_actions`), `:852` (`add_queued_task`) | CONFIRMED (Qt-free probe), not in the benchmark — OPEN, optional |
 | 56 | perf | a parked worker is notified by every add until it wakes | `:828`, `:868`, `:1063-1069` (`loop`) | measured — no time saved, decline recommended |
-| 57 | perf | a worker takes the queue's lock up to five times per batch | `:887-964`, `:1006-1021`, `:1051-1083` | read-only, counted by a probe — OPEN, not prototyped |
+| 57 ✅ | perf | a worker takes the queue's lock up to five times per batch | `:887-964`, `:1006-1021`, `:1051-1083` | measured (executor benchmark) — **not taken** |
 | 58 | hygiene | a refused add prints its warning under the queue's lock | `:823`, `:860`, `:865` | read-only — OPEN |
 
 ---
@@ -2367,7 +2370,7 @@ workers) and saved no time, there or in the benchmark. It would also oblige the 
 a loop of its own, or a spurious wake-up would leave it parked with the flag cleared. **Recommended:
 decline.** The executor's step 36.
 
-### Step 57 · a worker takes the queue's lock up to five times per batch — OPEN, not prototyped
+### Step 57 ✅ · a worker takes the queue's lock up to five times per batch — MEASURED, not taken
 `async.hpp:887-964` (`execute_actions`), `:1006-1021` (`notify_finished`), `:1051-1083` (`loop`) ·
 read from the code, counted by a probe, 2026-10-10
 
@@ -2376,6 +2379,30 @@ same again, at the next iteration's check, and in `loop()` to park; and taking t
 whole actuator under the lock, where an executor's worker has only tasks queued. **Proposed:** one
 drained check, carried into the next iteration; take only what is queued. **Expected:** little, the
 worker side showed nothing in the benchmark. Prototype first. The executor's step 38.
+
+**Prototyped and measured (2026-10-10), not taken.** `execute_actions()` held the queue's lock
+from one batch to the next: after a batch it relocks once, and either takes the next batch under
+that lock or, drained, releases it for `on_finished` - one lock per busy batch instead of two, and
+`notify_finished()`'s second check of what was just checked gone. Scratchpad `probe/s38`. async's
+77 of 77 and the executor's 57 of 57 on Debug and TSan against it. Three runs each, alternating with
+the committed code:
+
+| | committed (`7e7c2b0`) | prototype | `QThreadPool` |
+|---|---|---|---|
+| empty, 4 workers, delivered | 75.9-88.7 µs | **71.1-74.9** | 204.0-218.9 |
+| empty, 1 worker, delivered, per run | 53, 109, 172 µs | **116, 132, 114** | 102.4-115.2 |
+| mixed, 4 workers, submitted | 44.2-47.9 µs | 39.2-43.8 | - |
+| mixed, 1 / 4 workers, delivered | 113.6-115.9 / 34.9-35.6 ms | 115.0-117.0 / 35.4-35.7 | 113.7-116.1 / 32.5-33.4 |
+| single tasks, 1000 x 10 µs | level | level | - |
+
+It wins on four workers' empty batch and loses one worker's: holding the lock between batches lets
+the worker take work as fast as the submitter adds it, so the two meet on every task and the fast
+mode (53 µs) never comes. A regression by the rule that no case may get worse; the mixed batch, 1-2
+ms either way in ranges that overlap, gives nothing back. **Not taken**, as steps 36 and 37.
+
+(A first run of these tests seemed to hang one async case for 608 and 900 s: the Mac was asleep, lid
+closed, `pmset -g log`. Rerun awake under `caffeinate -i`, every case passed.)
+The measurement is the executor's, its step 38.
 
 ### Step 58 · a refused add prints its warning under the queue's lock — OPEN
 `async.hpp:823` (`add_queued_action`), `:860`, `:865` (`add_queued_task`) · read from the code,
