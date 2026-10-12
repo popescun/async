@@ -46,12 +46,6 @@
       }
     }
   ],
-  "buildPresets": [
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "asan", "configurePreset": "asan" },
-    { "name": "tsan", "configurePreset": "tsan" }
-  ],
   "testPresets": [
     {
       "name": "debug",
