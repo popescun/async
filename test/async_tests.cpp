@@ -283,7 +283,10 @@ using move_counting_execution = untangle::async::execution<move_counting_action>
 //! the cases below allow for so that they count only the queue's own moves.
 int moves_to_erase_a_task() {
   const auto before = move_counting_action::moves.load();
-  untangle::task_t erased = [action = move_counting_action{}] { (void)action(0); };
+  untangle::task_t erased = [action = move_counting_action{}] {
+    (void)action(0);
+    return true;
+  };
   (void)erased;
   return move_counting_action::moves.load() - before;
 }

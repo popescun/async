@@ -74,6 +74,7 @@ while entries run, not about ownership, and tasks need it for the same reason.
 | 5 | the suite gains the queued-callback cases — landed with step 1 | `test/async_tests.cpp` | ✅ 8 cases |
 | 6 ✅ | what a queued task promises — the reference and `README.md` | `:203-207`, `:493-497`, `:683-689`, `:706-710` | transcription, nothing open — **DONE** (`3bfead5`) |
 | 7 ✅ | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **DONE** (`3bfead5`, `a6ef912`) |
+| 8 | follows the actuator's `task_t`, now `std::function<bool()>` (actuator step 10) | `test/async_tests.cpp:286` | the one test building a `task_t` from a `void` lambda — OPEN |
 
 ### Step 1 ✅ · the door, the drain and the predicate — DONE
 
@@ -247,6 +248,14 @@ terms.
 > hash three times: two amends rewrote the commit the plan was citing, and each rewrite left a dozen
 > citations pointing at a commit no branch reached. A plan's own update belongs in a **later**
 > commit, and the number belongs in that one.
+
+### Step 8 · `task_t` returns `bool` — OPEN
+
+Added 2026-10-30. The actuator's step 10 (`7aae536`) made `untangle::task_t` a
+`std::function<bool()>`. async only forwards tasks - `add_task()` binds one and
+`add_queued_task()` queues it - so `async.hpp` needs no change. One test builds a `task_t` straight
+from a lambda returning `void`, `moves_to_erase_a_task()`, which no longer compiles: it returns
+`true` now, and still counts the same moves. The actuator pin is already bumped (`8749ce0`).
 
 ## What is no longer a risk
 
