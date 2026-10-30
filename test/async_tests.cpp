@@ -1030,6 +1030,75 @@ TEST(execution_queue, a_queued_task_makes_the_execution_busy) {
   EXPECT_TRUE(exec->is_busy()) << "a queued task left the execution looking idle";
 }
 
+// --- ready-made tasks ----------------------------------------------------------------------------
+// add_queued_task() queues an untangle::task_t already built, whatever the execution's action type:
+// what a pool above needs to run its own code on a worker, as an executor's ordered queue does.
+// See todo/FEATURE_PLAN.md step 9.
+
+TEST(execution_queue, runs_a_ready_made_task_of_another_signature) {
+  // The execution runs int(int) actions; the task takes nothing and is still run.
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("ready_made_task");
+  poll.add(*exec);
+
+  std::atomic_bool ran = {false};
+
+  exec->start();
+  ASSERT_TRUE(exec->add_queued_task([&ran] {
+    ran = true;
+    return true;
+  }));
+
+  EXPECT_TRUE(wait_for([&ran] { return ran.load(); }, 2000ms)) << "a ready-made task never ran";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
+TEST(execution_queue, refuses_a_ready_made_task_when_stopped) {
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("ready_made_after_stop");
+  poll.add(*exec);
+
+  exec->start();
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+
+  std::atomic_bool ran = {false};
+  EXPECT_FALSE(exec->add_queued_task([&ran] {
+    ran = true;
+    return true;
+  })) << "a stopped execution took a ready-made task it can never run";
+  EXPECT_FALSE(ran.load());
+}
+
+TEST(execution_queue, refuses_an_empty_ready_made_task) {
+  auto exec = int_ret_execution::create_instance("empty_ready_made");
+
+  EXPECT_FALSE(exec->add_queued_task(untangle::task_t{})) << "an empty task was queued";
+  EXPECT_FALSE(exec->is_busy()) << "a refused task left the execution looking busy";
+}
+
+TEST(execution_queue, a_ready_made_task_that_throws_reaches_on_error) {
+  untangle::async::execution_poll poll;
+  auto exec = int_ret_execution::create_instance("throwing_ready_made");
+  poll.add(*exec);
+
+  std::atomic_int reported_errors = {0};
+  exec->on_error = [&reported_errors](std::exception_ptr) {
+    reported_errors.fetch_add(1, std::memory_order_relaxed);
+  };
+
+  exec->start();
+  ASSERT_TRUE(exec->add_queued_task([]() -> bool { throw std::runtime_error("task failed"); }));
+
+  EXPECT_TRUE(wait_for([&reported_errors] { return reported_errors.load() == 1; }, 2000ms))
+      << "what the ready-made task threw never reached on_error";
+
+  exec->stop();
+  ASSERT_TRUE(wait_until_poll_idle(poll, 5000ms));
+}
+
 TEST(execution_queue, an_action_that_throws_does_not_kill_the_worker) {
   auto exec = void_execution::create_instance("throwing_action");
 

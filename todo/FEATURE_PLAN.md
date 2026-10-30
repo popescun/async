@@ -257,6 +257,15 @@ Added 2026-10-30. The actuator's step 10 (`7aae536`) made `untangle::task_t` a
 from a lambda returning `void`, `moves_to_erase_a_task()`, which no longer compiles: it returns
 `true` now, and still counts the same moves. The actuator pin is already bumped (`8749ce0`).
 
+### Step 9 · `add_queued_task()` public — OPEN
+
+Added 2026-10-30. The executor's ordered queues run as a drain loop: one task on a worker runs the
+queue's tasks in turn. That drain is the pool's own code, not the execution's action type, so the
+pool needs to queue a ready-made `untangle::task_t`, which `add_queued_task()` already does in
+private. Made public and documented as a door for a pool built on executions, the way `executor`
+uses it. Four cases: it runs a task of another signature, refuses when stopped, refuses an empty
+task, and hands a throw to `on_error`.
+
 ## What is no longer a risk
 
 An earlier draft carried a step marked *the one that can send the chain back*:

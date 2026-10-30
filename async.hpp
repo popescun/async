@@ -600,6 +600,45 @@ class execution {
   }
 
   /**
+   * @brief Queues a ready-made task, whatever this execution's action type, and says whether it was
+   * taken. What \ref add_task() does once it has bound one.
+   *
+   * Meant for a pool built on executions, such as untangle::executor: its own code - an ordered
+   * queue's drain, which runs that queue's tasks in turn - is not of the action type, so
+   * \ref add_task() cannot queue it.
+   *
+   * A task that throws goes to \ref on_error, as a failing action does.
+   *
+   * @param task - The task to run: it does its job when called, and answers whether it did.
+   * @return true - queued; false - the execution is stopped, or \p task is empty.
+   */
+  bool add_queued_task(untangle::task_t task) {
+    bool wake = false;
+    {
+      auto lock = lock_spinning(action_mutex_);
+
+      // As for an action: a stopped worker would never reach it, and a task left in the queue
+      // would look pending while being unable to ever notify.
+      if (stopped_) {
+        std::println(stderr, "warning: execution '{}' is stopped, task not added", name);
+        return false;
+      }
+
+      if (!action_actuator_.add_task(std::move(task))) {
+        std::println(stderr, "warning: execution '{}' refused a task that cannot report", name);
+        return false;
+      }
+      wake = sleeping_;
+    }
+
+    // A worker that has not parked finds the work on its own.
+    if (wake) {
+      action_cv_.notify_one();
+    }
+    return true;
+  }
+
+  /**
    * @brief Attaches another execution, so that this one triggers it.
    *
    * The attached execution's pending actions are run by this one's worker, and stopping this one
@@ -834,46 +873,6 @@ class execution {
       }
 
       action_actuator_.add(std::move(action));
-      wake = sleeping_;
-    }
-
-    // A worker that has not parked finds the work on its own.
-    if (wake) {
-      action_cv_.notify_one();
-    }
-    return true;
-  }
-
-  /**
-   * @brief Queues a task already built by untangle::bind_task(), and says whether it was taken.
-   *
-   * What \ref add_task() does once it has built one. It mirrors \ref add_queued_action(), with one
-   * refusal more: the actuator turns away an empty task - one untangle::bind_task() built from an
-   * action or a callback that was itself empty - and that answer is passed straight back rather
-   * than swallowed here.
-   *
-   * @remark The type no longer names the result. A untangle::task_t notifies the callback
-   * untangle::bind_task() sealed inside it, so one nullary signature carries the tasks of every
-   * execution whatever their action returns.
-   *
-   * @return true - queued; false - the execution is stopped, or the task could not do its job.
-   */
-  bool add_queued_task(untangle::task_t task) {
-    bool wake = false;
-    {
-      auto lock = lock_spinning(action_mutex_);
-
-      // As for an action: a stopped worker would never reach it, and a task left in the queue
-      // would look pending while being unable to ever notify.
-      if (stopped_) {
-        std::println(stderr, "warning: execution '{}' is stopped, task not added", name);
-        return false;
-      }
-
-      if (!action_actuator_.add_task(std::move(task))) {
-        std::println(stderr, "warning: execution '{}' refused a task that cannot report", name);
-        return false;
-      }
       wake = sleeping_;
     }
 
